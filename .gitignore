@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+.Python
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Env files (allow .env.example)
+.env
+.env.*
+!.env.example
+
+# Secrets
+secrets/
+
+# Local DBs / snapshots
+*.db
+*.sqlite
+*.sqlite3
+data/snapshots/
+
+# Testing / typing / linting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
