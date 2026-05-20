@@ -36,7 +36,7 @@ dev = [
 tradeflow = "main:main"
 
 [tool.setuptools.packages.find]
-include = ["config*", "comms*", "data*", "strategy*", "features*", "execution*", "risk*", "backtest*", "scripts*"]
+include = ["config*", "comms*", "data*", "strategy*", "features*", "execution*", "risk*", "backtest*", "scripts*", "src*"]
 exclude = ["tests*", "docs*", "supabase*"]
 
 [tool.black]
