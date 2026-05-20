@@ -1,0 +1,48 @@
+# TradeFlow Phase 1 — IB Gateway paper-mode container.
+#
+# Image: gnzsnz/ib-gateway (community, env-driven config, runs IBC under the hood).
+# Pinned to ":stable" channel — IB Gateway 10.45.1f / IBC 3.23.0 as of 2026-05-20.
+# Bump intentionally. Do NOT use ":latest" — it tracks the IB Gateway latest channel
+# which can ship breaking changes from IBKR mid-week.
+#
+# Loopback bind on 127.0.0.1:4002 — the gateway must not be reachable from outside
+# the VPS. Future orchestrator containers connect through the docker network at
+# host `ib-gateway:4002`, not via the published port.
+#
+# Internal port mapping per the gnzsnz README:
+#   container 4004 (paper via socat) -> host 4002
+#   container 4003 (live   via socat) -> host 4001  (not exposed in paper-only PR 2)
+
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: tradeflow-ib-gateway
+    restart: unless-stopped
+    env_file:
+      - ${TRADEFLOW_SECRETS_DIR:-/home/tradeflow/.tradeflow-secrets}/.env
+    environment:
+      # Map TradeFlow IBKR_* secrets to the gnzsnz image's canonical TWS_* names.
+      TWS_USERID: ${IBKR_USERNAME}
+      TWS_PASSWORD: ${IBKR_PASSWORD}
+      TRADING_MODE: paper
+      TWOFA_TIMEOUT_ACTION: ${TWOFA_TIMEOUT_ACTION:-exit}
+      RELOGIN_AFTER_TWOFA_TIMEOUT: ${RELOGIN_AFTER_TWOFA_TIMEOUT:-yes}
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:59 PM}
+      TIME_ZONE: ${TIME_ZONE:-Etc/UTC}
+      READ_ONLY_API: ${READ_ONLY_API:-no}
+      BYPASS_WARNING: ${BYPASS_WARNING:-yes}
+      EXISTING_SESSION_DETECTED_ACTION: primary
+    ports:
+      - "127.0.0.1:4002:4004"
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/4004' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    networks:
+      - tradeflow-net
+
+networks:
+  tradeflow-net:
+    driver: bridge
