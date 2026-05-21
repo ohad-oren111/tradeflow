@@ -89,3 +89,84 @@ class SupabaseClient:
 
     async def close(self) -> None:
         await self._http.aclose()
+
+    # ----------------------------------------------------------- lifecycles API
+    # Additive helpers introduced in PR #9 for the state machine. Existing
+    # method signatures above are unchanged.
+
+    async def insert_lifecycle(self, row: dict[str, Any]) -> list[dict[str, Any]]:
+        """Insert a row into ``lifecycles`` and return the inserted representation."""
+        url = f"{self._base}/lifecycles"
+        LOGGER.info("[supabase_client] insert lifecycles — symbol=%s", row.get("symbol"))
+        r = await self._http.post(url, json=row, headers={"Prefer": "return=representation"})
+        r.raise_for_status()
+        return r.json()
+
+    async def update_lifecycle(
+        self,
+        lifecycle_id: str,
+        updates: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """PATCH a single ``lifecycles`` row by ``lifecycle_id``."""
+        url = f"{self._base}/lifecycles"
+        params = {"lifecycle_id": f"eq.{lifecycle_id}"}
+        LOGGER.info(
+            "[supabase_client] update lifecycles — id=%s keys=%s",
+            lifecycle_id,
+            sorted(updates.keys()),
+        )
+        r = await self._http.patch(
+            url,
+            json=updates,
+            params=params,
+            headers={"Prefer": "return=representation"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def select_lifecycles_non_closed(self) -> list[dict[str, Any]]:
+        """Return all lifecycles with state != 'CLOSED'."""
+        url = f"{self._base}/lifecycles"
+        params = {"select": "*", "state": "neq.CLOSED"}
+        LOGGER.debug("[supabase_client] select lifecycles non_closed")
+        r = await self._http.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
+
+    async def select_lifecycles_non_closed_for(
+        self,
+        symbol: str,
+        strategy: str,
+    ) -> list[dict[str, Any]]:
+        """Return non-CLOSED lifecycles for a given (symbol, strategy) pair.
+
+        Used by the state machine's create_lifecycle probe — enforces the
+        "at most one non-CLOSED per (symbol, strategy)" invariant in code.
+        """
+        url = f"{self._base}/lifecycles"
+        params = {
+            "select": "*",
+            "symbol": f"eq.{symbol}",
+            "strategy": f"eq.{strategy}",
+            "state": "neq.CLOSED",
+        }
+        LOGGER.debug(
+            "[supabase_client] select lifecycles non_closed — symbol=%s strategy=%s",
+            symbol,
+            strategy,
+        )
+        r = await self._http.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
+
+    async def insert_lifecycle_event(self, row: dict[str, Any]) -> list[dict[str, Any]]:
+        """Append a row to the ``lifecycle_events`` audit trail."""
+        url = f"{self._base}/lifecycle_events"
+        LOGGER.info(
+            "[supabase_client] insert lifecycle_events — id=%s to_state=%s",
+            row.get("lifecycle_id"),
+            row.get("to_state"),
+        )
+        r = await self._http.post(url, json=row, headers={"Prefer": "return=representation"})
+        r.raise_for_status()
+        return r.json()

@@ -14,11 +14,13 @@ import asyncio
 import logging
 import signal
 import time
+from datetime import UTC, datetime
 from types import FrameType
 from typing import Any
 
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
+from src.state_machine import Lifecycle, State, StateMachine
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,11 +35,13 @@ class Orchestrator:
         *,
         paper_account: str,
         healthcheck_interval: float = 60.0,
+        state_machine: StateMachine | None = None,
     ) -> None:
         self._ib = ib
         self._db = db
         self._paper_account = paper_account
         self._healthcheck_interval = healthcheck_interval
+        self._sm: StateMachine = state_machine or StateMachine(db=db, ib=ib)
         self._stop_event: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._started_at: float | None = None
@@ -104,6 +108,57 @@ class Orchestrator:
             self._account_prefix(self._paper_account),
             net_liq,
         )
+        await self._recover_state()
+
+    async def _recover_state(self) -> None:
+        """Load non-CLOSED lifecycles and reconcile with broker reality.
+
+        One-shot at startup. Uses read-only IB API calls (positions, openTrades)
+        — safe under IBC Read-Only API mode (§0.5.123). Applies any transitions
+        that the state machine deems necessary based on broker drift.
+        """
+        lifecycles = await self._sm.load_non_closed()
+        LOGGER.info("[ORCH] state: recovery_loaded — count=%s", len(lifecycles))
+        transitions_applied = 0
+        for lc in lifecycles:
+            target = await self._sm.boot_time_broker_check(lc)
+            if target is None:
+                continue
+            field_updates = await self._broker_field_updates_for(lc, target)
+            await self._sm.transition(
+                lc,
+                target,
+                reason="boot_time_broker_check",
+                payload={"prior_state": lc.state},
+                **field_updates,
+            )
+            LOGGER.info(
+                "[ORCH] state: recovery_transition — id=%s from=%s to=%s",
+                lc.lifecycle_id,
+                lc.state,
+                target.value,
+            )
+            transitions_applied += 1
+        LOGGER.info(
+            "[ORCH] state: recovery_complete — transitions_applied=%s",
+            transitions_applied,
+        )
+
+    async def _broker_field_updates_for(
+        self, lifecycle: Lifecycle, target: State
+    ) -> dict[str, Any]:
+        # Best-effort re-bind to broker reality on ENTERING → ACTIVE drift.
+        # entry_filled_at uses wall-clock; reqExecutions probe for exact fill
+        # timestamp lands in PR #10 reconciliation.
+        if State(lifecycle.state) is State.ENTERING and target is State.ACTIVE:
+            positions = await self._ib.get_positions()
+            qty, avg_cost = _broker_qty_and_avg_cost(positions, lifecycle.symbol)
+            return {
+                "entry_qty": qty,
+                "entry_price": avg_cost,
+                "entry_filled_at": datetime.now(UTC).isoformat(),
+            }
+        return {}
 
     async def _healthcheck_once(self) -> None:
         ib_time = await self._ib._ib.reqCurrentTimeAsync()
@@ -182,3 +237,30 @@ class Orchestrator:
             return ib_time.strftime("%Y-%m-%dT%H:%M:%SZ")
         except AttributeError:
             return str(ib_time)
+
+
+def _broker_qty_and_avg_cost(positions: list[Any], symbol: str) -> tuple[int, float]:
+    """Return (qty, avg_cost) for the matching position; (0, 0.0) if missing.
+
+    avgCost is coerced defensively — recovery must not crash on a mock or a
+    None value; falls back to 0.0 and lets the next-tick reconciliation probe
+    correct the price.
+    """
+    for pos in positions:
+        contract = getattr(pos, "contract", None)
+        if contract is None:
+            continue
+        local = getattr(contract, "localSymbol", None)
+        base = getattr(contract, "symbol", None)
+        if symbol not in {local, base}:
+            continue
+        try:
+            qty = int(getattr(pos, "position", 0))
+        except (TypeError, ValueError):
+            qty = 0
+        try:
+            avg_cost = float(getattr(pos, "avgCost", 0.0))
+        except (TypeError, ValueError):
+            avg_cost = 0.0
+        return qty, avg_cost
+    return 0, 0.0
