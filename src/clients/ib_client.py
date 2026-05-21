@@ -1,17 +1,21 @@
 """Async wrapper around ib_async.IB for TradeFlow.
 
 Phase 1 PR 2 scope: connect/disconnect lifecycle and read-only state probes.
-No order placement, no strategy, no reconcile logic — those land in PR 3+.
+PR #10 additively layers order placement (place_order / cancel_order) and the
+bar subscription helper. Existing method signatures are unchanged.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
-from ib_async import IB, PortfolioItem, Position, Trade
+from ib_async import IB, BarDataList, Contract, Order, PortfolioItem, Position, Trade
 
 LOGGER = logging.getLogger(__name__)
+
+BarCallback = Callable[[dict], Awaitable[None]] | Callable[[dict], None]
 
 
 class IBClient:
@@ -89,3 +93,104 @@ class IBClient:
         trades = self._ib.openTrades()
         LOGGER.info("[ib_client] open_trades — count=%s", len(trades))
         return trades
+
+    # ---------------------------------------------------------- order placement
+    # PR #10 additions. ``IB.placeOrder`` and ``IB.cancelOrder`` are sync in
+    # ib_async; we wrap them in async methods so callers can ``await`` uniformly
+    # and the test suite can mock at this boundary instead of the raw IB.
+
+    async def place_order(self, contract: Contract, order: Order) -> Trade:
+        """Submit ``order`` for ``contract``. Returns the ``Trade`` immediately;
+        fills arrive via the ``execDetailsEvent`` / ``fillEvent`` callbacks the
+        orchestrator wires after connect().
+        """
+        if not self.is_connected:
+            raise RuntimeError("not connected — call connect() first")
+        trade = self._ib.placeOrder(contract, order)
+        LOGGER.info(
+            "[ib_client] place_order — symbol=%s action=%s qty=%s type=%s order_id=%s",
+            getattr(contract, "localSymbol", None) or getattr(contract, "symbol", "?"),
+            order.action,
+            order.totalQuantity,
+            order.orderType,
+            getattr(trade.order, "orderId", "?"),
+        )
+        return trade
+
+    async def cancel_order(self, order: Order) -> None:
+        """Cancel a working ``order``. Idempotent broker-side."""
+        if not self.is_connected:
+            raise RuntimeError("not connected — call connect() first")
+        order_id = getattr(order, "orderId", None)
+        LOGGER.info("[ib_client] cancel_order — order_id=%s", order_id)
+        self._ib.cancelOrder(order)
+
+    async def subscribe_bars(
+        self,
+        contract: Contract,
+        *,
+        bar_size: str = "1 min",
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+        duration: str = "1 D",
+        on_new_bar: BarCallback | None = None,
+    ) -> BarDataList:
+        """Subscribe to live bars via reqHistoricalDataAsync(keepUpToDate=True).
+
+        ``on_new_bar`` (if provided) is invoked for each new bar with a dict
+        ``{time, open, high, low, close, volume}``. Sync callbacks are
+        permitted; async callbacks are scheduled as tasks. Returns the
+        ``BarDataList`` so the caller can attach additional callbacks if needed.
+        """
+        if not self.is_connected:
+            raise RuntimeError("not connected — call connect() first")
+        bars = await self._ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime="",
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow=what_to_show,
+            useRTH=use_rth,
+            formatDate=2,
+            keepUpToDate=True,
+        )
+        LOGGER.info(
+            "[ib_client] subscribe_bars — symbol=%s bar_size=%s seeded=%s",
+            getattr(contract, "localSymbol", None) or getattr(contract, "symbol", "?"),
+            bar_size,
+            len(bars),
+        )
+        if on_new_bar is not None:
+            _wire_bar_callback(bars, on_new_bar)
+        return bars
+
+
+def _wire_bar_callback(bars: BarDataList, on_new_bar: BarCallback) -> None:
+    """Attach ``on_new_bar`` to ``bars.updateEvent``, supporting both sync and async forms."""
+    import asyncio
+    import inspect
+
+    is_coro = inspect.iscoroutinefunction(on_new_bar)
+
+    def _adapter(bars_obj: BarDataList, has_new_bar: bool) -> None:
+        if not has_new_bar or not bars_obj:
+            return
+        last = bars_obj[-1]
+        payload: dict[str, Any] = {
+            "time": getattr(last, "date", None),
+            "open": getattr(last, "open", None),
+            "high": getattr(last, "high", None),
+            "low": getattr(last, "low", None),
+            "close": getattr(last, "close", None),
+            "volume": getattr(last, "volume", None),
+        }
+        result = on_new_bar(payload)
+        if is_coro and result is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(result)
+            except RuntimeError:
+                # No running loop (rare; shouldn't happen under the orchestrator).
+                LOGGER.warning("[ib_client] on_new_bar coroutine discarded — no loop")
+
+    bars.updateEvent += _adapter
