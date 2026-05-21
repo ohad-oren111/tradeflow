@@ -28,6 +28,38 @@ Write the symptom verbatim before doing anything else. Do not rephrase in a way 
 
 Why this matters: 2026-04-19, `docker logs | grep` showed doubled lines suggesting two loops running. Raw file showed one. Doubling was a streaming artifact. Same session nearly escalated "SOL is churning real capital through fees" — `fetch_open_orders` confirmed 0 open orders, zero capital impact.
 
+### Step 2.5 — Instrument at every component boundary in multi-layer systems
+
+When the system has more than one process / container / API / library between the user-visible symptom and the source of truth, do not guess which layer is failing. Instrument each boundary and run once to see which layer breaks.
+
+TradeFlow has at least 4 layers between "trade should fire" and "fill confirmed at broker": Python orchestrator → `ib_async` client → IB Gateway container → IBKR API. A failure at any one of them surfaces as the same symptom: "no fill." Same pattern in Botty: orchestrator → ccxt client → Binance API.
+
+Add one probe per boundary before proposing any fix:
+
+```bash
+# Layer 1: orchestrator process — did the strategy decide to trade?
+docker logs tradeflow-bot --since 10m > /tmp/orch.log
+grep -E 'decision|signal|action' /tmp/orch.log | tail -20
+
+# Layer 2: client library — did ib_async accept and send the order?
+# (Look for the order ack line, not just the placeOrder call)
+grep -E 'orderStatus|placeOrder|reqId' /tmp/orch.log | tail -20
+
+# Layer 3: IB Gateway container — was the gateway logged in and connected?
+docker logs ibgateway --since 10m | grep -iE 'connected|disconnected|authenticated|error' | tail -20
+
+# Layer 4: IBKR API — did the broker see the order at all?
+python3 -c "from ib_async import IB; ib=IB(); ib.connect('127.0.0.1',7497,clientId=99); print('Trades:', ib.trades()); print('Fills:', ib.fills()); ib.disconnect()"
+```
+
+The earliest layer where evidence disagrees with the next is where the bug lives. Fix at that layer, not at the symptom layer.
+
+Common multi-layer traps in this codebase:
+
+- **TradeFlow**: IBC Read-Only API was ON in the gateway (operational debt from Session 4). Orchestrator placed orders, ib_async returned no error, gateway silently dropped them. Symptom: "no fill." Real layer: Layer 3.
+- **TradeFlow**: `.env` line 17 trips `bash source` but `python-dotenv` handles it. Symptom in shell scripts: env var missing. In Python: fine. Layer mismatch.
+- **Botty**: ccxt rate limit auto-throttled silently; orchestrator thought order was placed. Symptom: "deploy succeeded, no fill." Real layer: Layer 2 (silent throttle).
+
 ### Step 3 — Read raw logs end-to-end, not greps
 
 Read:
@@ -166,6 +198,22 @@ Prediction that would have confirmed it: [X]
 Actual observation: [Y]
 Therefore: previous diagnosis is wrong. Re-reading from scratch. Not retrofitting.
 ```
+
+## Rationalization rejection table
+
+If you catch yourself thinking the excuse, run the reality instead. These are the failure modes that have actually shipped wrong fixes:
+
+| Excuse | Reality |
+|---|---|
+| "Issue is simple, no need to probe" | Simple-looking issues have non-simple causes (the 59s audio bug, the doubled grep lines, the silent throttle). Probe is fast anyway. |
+| "Emergency, no time for the loop" | The loop IS the fast path. Thrashing takes longer. |
+| "Just try this fix and see" | First fix sets the diagnostic frame. Get it right at step 1. |
+| "I'll write the probe after I see if the fix works" | Then you can't distinguish "fix worked" from "symptom moved." Probe first. |
+| "I see the problem already" | Seeing a symptom is not naming a cause. Put it in HYPOTHESIZED until probed. |
+| "Reference docs are long, I'll skim" | The bug is usually in the part you skipped. Read the relevant section completely. |
+| "One more try, I think I see it now" (after 2 fails) | Twice-wrong rule. Stop. Hand off. (Three-times-wrong → use `architecture-question-gate`.) |
+| "Pattern matches the last bug, same fix" | Verify the pattern actually matches at the source of truth. Copy-paste diagnoses ship copy-paste bugs. |
+| "Aggregated logs are good enough" | They never are. Raw file or it didn't happen. |
 
 ## Examples
 
