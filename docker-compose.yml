@@ -52,8 +52,15 @@ services:
     env_file:
       - ${TRADEFLOW_SECRETS_DIR:-/home/tradeflow/.tradeflow-secrets}/.env
     environment:
-      IBKR_HOST: ${IBKR_HOST:-ib-gateway}
-      IBKR_PORT: ${IBKR_PORT:-4004}
+      # Container-routing constants — must NOT be interpolated from .env. The
+      # host-side .env carries IBKR_HOST=127.0.0.1 / IBKR_PORT=4002 for HOST
+      # scripts (probes, smoke tests run on the VPS itself); inside the docker
+      # network the orchestrator must dial the service name `ib-gateway` on the
+      # container-internal port 4004 (the host-mapped 4002 is not visible here).
+      # `${IBKR_HOST:-ib-gateway}` was a trap — the `:-default` never fires
+      # because the variable IS set in .env, just to the host-side value.
+      IBKR_HOST: ib-gateway
+      IBKR_PORT: "4004"
       ORCH_HEALTHCHECK_INTERVAL_SEC: ${ORCH_HEALTHCHECK_INTERVAL_SEC:-60}
       ORCH_LOG_LEVEL: ${ORCH_LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
