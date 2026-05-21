@@ -43,6 +43,25 @@ services:
     networks:
       - tradeflow-net
 
+  tradeflow-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tradeflow-app
+    restart: unless-stopped
+    env_file:
+      - ${TRADEFLOW_SECRETS_DIR:-/home/tradeflow/.tradeflow-secrets}/.env
+    environment:
+      IBKR_HOST: ${IBKR_HOST:-ib-gateway}
+      IBKR_PORT: ${IBKR_PORT:-4004}
+      ORCH_HEALTHCHECK_INTERVAL_SEC: ${ORCH_HEALTHCHECK_INTERVAL_SEC:-60}
+      ORCH_LOG_LEVEL: ${ORCH_LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      - ib-gateway
+    networks:
+      - tradeflow-net
+
 networks:
   tradeflow-net:
     driver: bridge

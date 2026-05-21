@@ -1,32 +1,67 @@
-"""TradeFlow CLI entry point."""
+"""TradeFlow entry point — boots the orchestrator from env, runs to SIGTERM.
 
-import argparse
+Loads `.env` via `python-dotenv` (NOT bash `source` — §0.5.110 trap on .env
+values containing whitespace). Constructs `IBClient` + `SupabaseClient` from
+env vars, hands them to `Orchestrator`, runs the event loop.
+
+PR #8 scope: wiring only. No trading logic, no order placement.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
 import sys
+
+from dotenv import load_dotenv
+
+from src.clients.ib_client import IBClient
+from src.clients.supabase_client import SupabaseClient
+from src.orchestrator import Orchestrator
+
+LOGGER = logging.getLogger("tradeflow.main")
+
+
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"required env var {name} is unset or empty")
+    return value
+
+
+def _build_orchestrator_from_env() -> Orchestrator:
+    host = os.environ.get("IBKR_HOST", "127.0.0.1")
+    port = int(os.environ.get("IBKR_PORT", "4002"))
+    client_id = int(os.environ.get("IBKR_CLIENT_ID", "1"))
+    paper_account = _require_env("IBKR_PAPER_ACCOUNT")
+    supabase_url = _require_env("SUPABASE_URL")
+    supabase_key = _require_env("SUPABASE_SERVICE_ROLE")
+    interval = float(os.environ.get("ORCH_HEALTHCHECK_INTERVAL_SEC", "60"))
+
+    ib = IBClient(host=host, port=port, client_id=client_id)
+    db = SupabaseClient(url=supabase_url, key=supabase_key)
+    return Orchestrator(
+        ib,
+        db,
+        paper_account=paper_account,
+        healthcheck_interval=interval,
+    )
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        prog="tradeflow", description="Autonomous MNQ futures trading bot."
+    logging.basicConfig(
+        level=os.environ.get("ORCH_LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    parser.add_argument(
-        "--paper", action="store_true", default=True, help="Paper trading mode (default)"
-    )
-    parser.add_argument(
-        "--live", action="store_true", help="Live trading mode (requires explicit opt-in)"
-    )
-    parser.add_argument("--backtest", action="store_true", help="Run backtest mode")
-    args = parser.parse_args()
-
-    if args.live:
-        print("Live mode is not yet implemented (Phase 7).", file=sys.stderr)
-        return 1
-    if args.backtest:
-        print("Backtest mode is not yet implemented (Phase 6).", file=sys.stderr)
-        return 1
-    # Paper mode default — also not implemented in Phase 0, just confirms the scaffold parses
-    print("TradeFlow Phase 0 scaffold. Paper trading loop lands in Phase 3 PR 6+.")
-    return 0
+    env_file = os.environ.get("ENV_FILE")
+    if env_file:
+        load_dotenv(env_file)
+    else:
+        load_dotenv()
+    orch = _build_orchestrator_from_env()
+    return asyncio.run(orch.run())
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
