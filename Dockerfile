@@ -18,4 +18,14 @@ COPY src ./src
 COPY config ./config
 COPY main.py ./main.py
 
+# PR #12 — PID-1 liveness probe so `docker ps` reports (healthy)/(unhealthy)
+# instead of just `Up <time>`. The orchestrator runs as PID 1 (no init wrapper),
+# so a Python kernel + a /proc/1 cmdline check is sufficient to catch the
+# process-died case. procps/pgrep is not in python:3.11-slim by default; we
+# stay slim by using stdlib only. Stronger liveness (asyncio-loop heartbeat,
+# IB-Gateway round-trip) is a PR #13+ follow-up.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD python -c "import sys, pathlib; sys.exit(0 if 'main.py' in pathlib.Path('/proc/1/cmdline').read_text() else 1)" \
+    || exit 1
+
 CMD ["python", "main.py"]

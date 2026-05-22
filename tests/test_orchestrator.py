@@ -198,3 +198,87 @@ async def test_signal_handler_noop_before_run():
     mock_db = _make_mock_db()
     orch = Orchestrator(mock_ib, mock_db, paper_account="DUQ1234567", healthcheck_interval=10.0)
     orch._handle_signal(signal.SIGTERM, None)  # must not raise
+
+
+# ============================================================================
+# PR #12 — halt API (raise_halt / clear_halt / is_halted / halt_raised_at)
+# ============================================================================
+
+
+def _make_orch_for_halt_tests() -> Orchestrator:
+    return Orchestrator(
+        _make_mock_ib(),
+        _make_mock_db(),
+        paper_account="DUQ1234567",
+        healthcheck_interval=10.0,
+    )
+
+
+def test_raise_halt_sets_flag_and_timestamp(caplog):
+    caplog.set_level(logging.WARNING)
+    orch = _make_orch_for_halt_tests()
+
+    assert orch.is_halted() is False
+    assert orch.halt_raised_at() is None
+
+    orch.raise_halt("MNQM6")
+
+    assert orch.is_halted() is True
+    raised = orch.halt_raised_at()
+    assert raised is not None
+    # Timestamp must be tz-aware and recent.
+    from datetime import UTC, datetime, timedelta
+
+    assert raised.tzinfo is not None
+    assert datetime.now(UTC) - raised < timedelta(seconds=5)
+    assert any("[ORCH] halt_raised" in r.getMessage() for r in caplog.records)
+
+
+def test_clear_halt_resets_flag_and_timestamp(caplog):
+    caplog.set_level(logging.INFO)
+    orch = _make_orch_for_halt_tests()
+    orch.raise_halt("ESM6")
+    assert orch.is_halted() is True
+
+    orch.clear_halt(reason="operator ack via supabase")
+
+    assert orch.is_halted() is False
+    assert orch.halt_raised_at() is None
+    assert any("[ORCH] halt_cleared" in r.getMessage() for r in caplog.records)
+
+
+def test_clear_halt_when_not_halted_is_noop():
+    orch = _make_orch_for_halt_tests()
+    assert orch.is_halted() is False
+
+    orch.clear_halt(reason="should be a no-op")  # must not raise
+
+    assert orch.is_halted() is False
+    assert orch.halt_raised_at() is None
+
+
+def test_raise_halt_twice_is_idempotent_keeps_first_timestamp(caplog):
+    caplog.set_level(logging.INFO)
+    orch = _make_orch_for_halt_tests()
+    orch.raise_halt("MNQM6")
+    first_ts = orch.halt_raised_at()
+    assert first_ts is not None
+
+    orch.raise_halt("MNQM6")  # second call must NOT bump the timestamp
+
+    assert orch.halt_raised_at() == first_ts
+    assert any("halt_already_raised" in r.getMessage() for r in caplog.records)
+
+
+async def test_handle_trade_signal_drops_when_halted(caplog):
+    caplog.set_level(logging.WARNING)
+    orch = _make_orch_for_halt_tests()
+    orch.raise_halt("MNQM6")
+
+    sig = MagicMock(name="Signal")
+    sig.direction = "LONG"
+    sig.instrument = "MNQM6"
+    await orch._handle_trade_signal(sig)
+
+    # Router should NOT have been asked to place an entry while halted.
+    assert any("signal: dropped" in r.getMessage() for r in caplog.records)

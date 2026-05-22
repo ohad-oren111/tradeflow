@@ -20,13 +20,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
-from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from pathlib import Path
+from typing import Any, Protocol
 
 from config.instruments import MNQ
 from src.clients.ib_client import IBClient
+from src.clients.supabase_client import SupabaseClient
 from src.execution.dirty_set import DirtySet
 from src.state_machine import (
     Direction,
@@ -38,6 +39,22 @@ from src.state_machine import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+class HaltCoordinator(Protocol):
+    """Subset of ``Orchestrator`` the reconciler needs to raise + clear halts.
+
+    Defined as a Protocol to avoid an import cycle with ``src.orchestrator``;
+    tests pass a ``MagicMock`` that implements these four methods.
+    """
+
+    def raise_halt(self, symbol: str | None = None) -> None: ...
+    def clear_halt(self, reason: str = "") -> None: ...
+    def is_halted(self) -> bool: ...
+    def halt_raised_at(self) -> datetime | None: ...
+
+
+DEFAULT_HALT_ACK_FILE = Path("/tmp/halt_clear")
 
 
 class ReconcileAction(StrEnum):
@@ -59,17 +76,21 @@ class Reconciler:
         ib: IBClient,
         sm: StateMachine,
         dirty_set: DirtySet,
-        halt_callback: Callable[[str], None],
+        db: SupabaseClient,
+        orchestrator: HaltCoordinator,
         *,
         dirty_drain_interval_sec: float = 30.0,
         full_scan_interval_sec: float = 300.0,
+        halt_ack_file_path: Path = DEFAULT_HALT_ACK_FILE,
     ) -> None:
         self._ib = ib
         self._sm = sm
         self._dirty_set = dirty_set
-        self._halt_callback = halt_callback
+        self._db = db
+        self._orchestrator = orchestrator
         self._dirty_drain_interval_sec = dirty_drain_interval_sec
         self._full_scan_interval_sec = full_scan_interval_sec
+        self._halt_ack_file_path = halt_ack_file_path
 
     # --------------------------------------------------------------- per-lifecycle
 
@@ -362,7 +383,7 @@ class Reconciler:
                 symbol,
                 qty,
             )
-            self._halt_callback(f"foreign_position:{symbol}")
+            self._orchestrator.raise_halt(symbol)
             counts[ReconcileAction.FOREIGN_POSITION] += 1
 
         LOGGER.info(
@@ -371,6 +392,46 @@ class Reconciler:
             dict(counts),
         )
         return dict(counts)
+
+    # ---------------------------------------------------------------- halt-ack
+    # PR #12 — poll Supabase first (primary), file flag second (fallback when
+    # the network is down or the table doesn't exist). Cheap when not halted:
+    # one boolean check + early return.
+
+    async def _poll_halt_ack(self) -> None:
+        """If currently halted, check Supabase + file-flag for a fresh ack."""
+        if not self._orchestrator.is_halted():
+            return
+        raised_at = self._orchestrator.halt_raised_at()
+        if raised_at is None:
+            return
+        try:
+            ack = await self._db.get_newest_halt_ack(since=raised_at)
+        except Exception as exc:
+            LOGGER.warning("[RECON] halt_ack_poll_failed: %r — falling back to file flag", exc)
+            file_ack_ts = self._read_file_ack_mtime()
+            if file_ack_ts is not None and file_ack_ts > raised_at:
+                LOGGER.info(
+                    "[RECON] halt_acked: source=file_flag mtime=%s",
+                    file_ack_ts.isoformat(),
+                )
+                self._orchestrator.clear_halt(reason=f"file-flag mtime={file_ack_ts.isoformat()}")
+            return
+        if ack is not None:
+            LOGGER.info(
+                "[RECON] halt_acked: source=supabase acked_at=%s note=%s",
+                ack["acked_at"],
+                ack.get("note"),
+            )
+            self._orchestrator.clear_halt(
+                reason=f"supabase ack acked_at={ack['acked_at']} note={ack.get('note')}"
+            )
+
+    def _read_file_ack_mtime(self) -> datetime | None:
+        path = self._halt_ack_file_path
+        if not path.exists():
+            return None
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
 
     # ------------------------------------------------------------------- run loop
 
@@ -406,6 +467,15 @@ class Reconciler:
             except Exception as exc:
                 LOGGER.error(
                     "[RECON] tick: drain_error — type=%s msg=%s",
+                    type(exc).__name__,
+                    exc,
+                )
+
+            try:
+                await self._poll_halt_ack()
+            except Exception as exc:
+                LOGGER.error(
+                    "[RECON] tick: halt_ack_error — type=%s msg=%s",
                     type(exc).__name__,
                     exc,
                 )
