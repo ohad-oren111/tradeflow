@@ -15,6 +15,7 @@ COPY pyproject.toml requirements.txt ./
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY src ./src
+COPY config ./config
 COPY main.py ./main.py
 
 CMD ["python", "main.py"]
