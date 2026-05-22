@@ -484,6 +484,19 @@ class Orchestrator:
                 name="tradeflow-telegram-command",
             )
             self._background_tasks.append(cmd_task)
+        # PR #18 — dashboard server. Failure here must not bring down the
+        # orchestrator (e.g. missing DASHBOARD_USERNAME/PASSWORD env vars).
+        # load_credentials() is called synchronously so missing-env-var fails
+        # fast here (before scheduling the task), surfacing as launch_failed.
+        try:
+            from dashboard.server import load_credentials, run_uvicorn
+
+            load_credentials()
+            dash_task = asyncio.create_task(run_uvicorn(self), name="tradeflow-dashboard")
+            self._background_tasks.append(dash_task)
+            LOGGER.info("[ORCH] dashboard: task_launched")
+        except Exception:
+            LOGGER.exception("[ORCH] dashboard: launch_failed — continuing without dashboard")
 
     async def _broker_field_updates_for(
         self, lifecycle: Lifecycle, target: State
