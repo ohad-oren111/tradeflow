@@ -17,7 +17,10 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY src ./src
 COPY config ./config
 COPY comms ./comms
+COPY dashboard ./dashboard
 COPY main.py ./main.py
+
+EXPOSE 8080
 
 # PR #12 — PID-1 liveness probe so `docker ps` reports (healthy)/(unhealthy)
 # instead of just `Up <time>`. The orchestrator runs as PID 1 (no init wrapper),

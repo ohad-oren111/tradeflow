@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-3">
+  <div class="col-12">
+    <div id="panel-status" hx-get="/panel/status" hx-trigger="every 10s, load" hx-swap="innerHTML">
+      <div class="card"><div class="card-body text-muted">loading status…</div></div>
+    </div>
+  </div>
+  <div class="col-12 col-lg-6">
+    <div id="panel-account" hx-get="/panel/account" hx-trigger="every 10s, load" hx-swap="innerHTML">
+      <div class="card"><div class="card-body text-muted">loading account…</div></div>
+    </div>
+  </div>
+  <div class="col-12 col-lg-6">
+    <div id="panel-positions" hx-get="/panel/positions" hx-trigger="every 10s, load" hx-swap="innerHTML">
+      <div class="card"><div class="card-body text-muted">loading positions…</div></div>
+    </div>
+  </div>
+  <div class="col-12">
+    <div id="panel-working-orders" hx-get="/panel/working_orders" hx-trigger="every 10s, load" hx-swap="innerHTML">
+      <div class="card"><div class="card-body text-muted">loading working orders…</div></div>
+    </div>
+  </div>
+</div>
+{% endblock %}

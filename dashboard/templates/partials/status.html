@@ -1,0 +1,41 @@
+<div class="card">
+  <div class="card-header py-2"><strong>Bot status</strong></div>
+  <div class="card-body py-2">
+    {% if errors.status %}
+      <div class="alert alert-warning py-2 mb-2">Panel error: {{ errors.status }}</div>
+    {% endif %}
+    {% if panel %}
+      <dl class="row mb-0 small">
+        <dt class="col-5 col-md-4">halted</dt>
+        <dd class="col-7 col-md-8">
+          {% if panel.halted %}
+            <span class="badge bg-danger">YES</span>
+            {% if panel.halt_raised_at %}
+              <span class="text-muted">raised {{ panel.halt_raised_at.strftime("%Y-%m-%d %H:%M:%S UTC") }}</span>
+            {% endif %}
+          {% else %}
+            <span class="badge bg-success">no</span>
+          {% endif %}
+        </dd>
+        <dt class="col-5 col-md-4">paper_mode</dt>
+        <dd class="col-7 col-md-8">{{ "yes" if panel.paper_mode else "no" }}</dd>
+        <dt class="col-5 col-md-4">account</dt>
+        <dd class="col-7 col-md-8">{{ panel.account }}</dd>
+        <dt class="col-5 col-md-4">front_month</dt>
+        <dd class="col-7 col-md-8">{{ panel.front_month_symbol }}</dd>
+        <dt class="col-5 col-md-4">server_version</dt>
+        <dd class="col-7 col-md-8">{{ panel.server_version if panel.server_version else "unknown" }}</dd>
+        <dt class="col-5 col-md-4">last_heartbeat_at</dt>
+        <dd class="col-7 col-md-8">
+          {% if panel.last_heartbeat_at %}
+            {{ panel.last_heartbeat_at.strftime("%Y-%m-%d %H:%M:%S UTC") }}
+          {% else %}
+            <span class="text-muted">n/a</span>
+          {% endif %}
+        </dd>
+      </dl>
+    {% elif not errors.status %}
+      <div class="text-muted">no status</div>
+    {% endif %}
+  </div>
+</div>

@@ -94,6 +94,26 @@ class IBClient:
         LOGGER.info("[ib_client] open_trades — count=%s", len(trades))
         return trades
 
+    async def get_account_summary(self, account: str = "") -> dict[str, float]:
+        """Return NetLiquidation / AvailableFunds / BuyingPower keyed by tag."""
+        if not self.is_connected:
+            raise RuntimeError("not connected — call connect() first")
+        items = await self._ib.accountSummaryAsync(account)
+        wanted = {"NetLiquidation", "AvailableFunds", "BuyingPower"}
+        out: dict[str, float] = {}
+        for item in items:
+            tag = getattr(item, "tag", None)
+            if tag in wanted:
+                try:
+                    out[tag] = float(getattr(item, "value", "") or 0.0)
+                except (TypeError, ValueError):
+                    LOGGER.warning(
+                        "[ib_client] account_summary: parse_failed — tag=%s value=%s",
+                        tag,
+                        getattr(item, "value", None),
+                    )
+        return out
+
     # ---------------------------------------------------------- order placement
     # PR #10 additions. ``IB.placeOrder`` and ``IB.cancelOrder`` are sync in
     # ib_async; we wrap them in async methods so callers can ``await`` uniformly

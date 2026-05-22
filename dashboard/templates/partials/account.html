@@ -1,0 +1,40 @@
+<div class="card">
+  <div class="card-header py-2"><strong>Account snapshot</strong></div>
+  <div class="card-body py-2">
+    {% if errors.account %}
+      <div class="alert alert-warning py-2 mb-2">Panel error: {{ errors.account }}</div>
+    {% endif %}
+    {% if panel %}
+      <dl class="row mb-0 small">
+        <dt class="col-6">net_liquidation</dt>
+        <dd class="col-6">
+          {% if panel.net_liquidation is not none %}
+            ${{ "%.2f"|format(panel.net_liquidation) }}
+          {% else %}
+            <span class="text-muted">n/a</span>
+          {% endif %}
+        </dd>
+        <dt class="col-6">available_funds</dt>
+        <dd class="col-6">
+          {% if panel.available_funds is not none %}
+            ${{ "%.2f"|format(panel.available_funds) }}
+          {% else %}
+            <span class="text-muted">n/a</span>
+          {% endif %}
+        </dd>
+        <dt class="col-6">buying_power</dt>
+        <dd class="col-6">
+          {% if panel.buying_power is not none %}
+            ${{ "%.2f"|format(panel.buying_power) }}
+          {% else %}
+            <span class="text-muted">n/a</span>
+          {% endif %}
+        </dd>
+        <dt class="col-6 text-muted">fetched_at</dt>
+        <dd class="col-6 text-muted">{{ panel.fetched_at.strftime("%H:%M:%S UTC") }}</dd>
+      </dl>
+    {% elif not errors.account %}
+      <div class="text-muted">no account data</div>
+    {% endif %}
+  </div>
+</div>
