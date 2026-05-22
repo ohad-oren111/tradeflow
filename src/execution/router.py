@@ -170,6 +170,17 @@ class OrderRouter:
         self._by_order_id[parent_order_id] = lc
         self._by_order_id[tp_order_id] = lc
         self._mark_dirty(lc.lifecycle_id)
+        # PR #14 — operator alert (Telegram picks this up via the [ALERT] log handler).
+        LOGGER.info(
+            "[ALERT] entry_placed: symbol=%s direction=%s qty=%s target=%.2f stop=%.2f "
+            "lifecycle_id=%s",
+            signal.instrument,
+            direction.value,
+            qty,
+            signal.target_price,
+            signal.stop_price,
+            lc.lifecycle_id,
+        )
         return lc
 
     async def _close_pre_active(self, lc: Lifecycle, signal: Signal) -> None:
@@ -348,6 +359,17 @@ class OrderRouter:
             lc.lifecycle_id,
             reason.value,
             pnl_net,
+        )
+        # PR #14 — operator alert sibling line.
+        LOGGER.info(
+            "[ALERT] exit_filled: symbol=%s qty=%s exit_price=%.2f pnl_net=%.2f "
+            "exit_reason=%s lifecycle_id=%s",
+            lc.symbol,
+            fill_qty,
+            fill_price,
+            pnl_net,
+            reason.value,
+            lc.lifecycle_id,
         )
 
     # ----------------------------------------------------------------- cancel

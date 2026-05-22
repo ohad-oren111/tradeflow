@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import time
 from datetime import UTC, datetime
@@ -22,6 +23,7 @@ from typing import Any
 
 from ib_async import Contract, Future
 
+from comms.telegram import TelegramAlerter
 from config.instruments import MNQ
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
@@ -83,6 +85,9 @@ class Orchestrator:
             db=db,
             orchestrator=self,
         )
+        # PR #14 — optional Telegram alerter + command bot. Disabled when env
+        # vars are absent so unit tests and pre-activation runs don't crash.
+        self._telegram: TelegramAlerter | None = _build_telegram_if_configured(self, db=db)
         self._background_tasks: list[asyncio.Task[Any]] = []
         self._bars: Any = None
 
@@ -294,6 +299,8 @@ class Orchestrator:
             "[ORCH] halt_raised: symbol=%s — halting new entries",
             symbol or "<unknown>",
         )
+        # PR #14 — sibling alert line for Telegram subsystem.
+        LOGGER.info("[ALERT] halt_raised: symbol=%s", symbol or "<unknown>")
 
     def clear_halt(self, reason: str = "") -> None:
         """Clear the global halt — resume new entries, log ``reason`` at INFO.
@@ -309,6 +316,47 @@ class Orchestrator:
             "[ORCH] halt_cleared: reason=%s — resuming new entries",
             reason or "<no reason>",
         )
+        # PR #14 — sibling alert line for Telegram subsystem.
+        LOGGER.info("[ALERT] halt_acked: reason=%s", reason or "<no reason>")
+
+    async def get_broker_status_summary(self) -> dict[str, Any]:
+        """Read-only broker snapshot for the ``/status`` telegram command.
+
+        Pulls from broker (per §0.5.123 / §0.5.98) — never reads lifecycles
+        as the source of truth. Returns small primitives so the alerter can
+        format them without further IBKR knowledge.
+        """
+        positions = await self._ib.get_positions()
+        open_trades = await self._ib.get_open_trades()
+        summary: dict[str, Any] = {
+            "positions": [
+                {
+                    "symbol": getattr(getattr(p, "contract", None), "localSymbol", "?"),
+                    "qty": getattr(p, "position", 0),
+                    "avg_cost": getattr(p, "avgCost", 0.0),
+                }
+                for p in positions
+            ],
+            "open_trades_count": len(open_trades),
+            "account": self._account_prefix(self._paper_account),
+        }
+        try:
+            account_summary = await self._ib._ib.accountSummaryAsync(self._paper_account)
+            net_liq = self._extract_net_liquidation(account_summary)
+            summary["net_liq"] = net_liq or "?"
+        except Exception as exc:
+            LOGGER.warning("[ORCH] status_net_liq_failed: %r", exc)
+            summary["net_liq"] = "?"
+        return summary
+
+    async def insert_halt_ack(self, note: str) -> dict[str, Any]:
+        """Thin pass-through to :meth:`SupabaseClient.insert_halt_ack`.
+
+        Exists on Orchestrator so the telegram :class:`OperatorCoordinator`
+        Protocol stays orchestrator-shaped — comms code never imports
+        ``src.clients.*`` directly.
+        """
+        return await self._db.insert_halt_ack(note=note)
 
     def is_halted(self) -> bool:
         """Return whether the global halt is currently raised."""
@@ -332,6 +380,19 @@ class Orchestrator:
         )
         self._background_tasks.append(recon_task)
         LOGGER.info("[RECON] task_launched — name=tradeflow-reconciler")
+        # PR #14 — telegram subsystem (optional; only when env vars are set).
+        if self._telegram is not None and self._loop is not None:
+            self._telegram.install_handler(self._loop, logging.getLogger())
+            alert_task = asyncio.create_task(
+                self._telegram.alert_loop(self._stop_event),
+                name="tradeflow-telegram-alert",
+            )
+            self._background_tasks.append(alert_task)
+            cmd_task = asyncio.create_task(
+                self._telegram.command_loop(self._stop_event),
+                name="tradeflow-telegram-command",
+            )
+            self._background_tasks.append(cmd_task)
 
     async def _broker_field_updates_for(
         self, lifecycle: Lifecycle, target: State
@@ -447,6 +508,37 @@ class Orchestrator:
             return ib_time.strftime("%Y-%m-%dT%H:%M:%SZ")
         except AttributeError:
             return str(ib_time)
+
+
+def _build_telegram_if_configured(
+    orchestrator: Orchestrator, *, db: SupabaseClient
+) -> TelegramAlerter | None:
+    """Construct a :class:`TelegramAlerter` if both env vars are set; else None.
+
+    PR #14 — operator opts in by adding ``TELEGRAM_BOT_TOKEN`` +
+    ``TELEGRAM_OPERATOR_CHAT_ID`` to ``~/.tradeflow-secrets/.env``. Until those
+    land, the orchestrator boots without telegram and logs the disable line so
+    the absence is visible in ``docker logs``.
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id_raw = os.environ.get("TELEGRAM_OPERATOR_CHAT_ID", "").strip()
+    if not token or not chat_id_raw:
+        LOGGER.info("[ORCH] telegram_disabled: env vars not set")
+        return None
+    try:
+        chat_id = int(chat_id_raw)
+    except ValueError:
+        LOGGER.warning(
+            "[ORCH] telegram_disabled: TELEGRAM_OPERATOR_CHAT_ID not int — value=%r",
+            chat_id_raw,
+        )
+        return None
+    LOGGER.info("[ORCH] telegram_enabled: chat_id=%s", chat_id)
+    # db is unused inside this helper but accepted so future flavors (e.g. a
+    # direct SupabaseClient handle for /ack) can wire in without refactoring
+    # the caller. Today the alerter goes through the orchestrator coordinator.
+    _ = db
+    return TelegramAlerter(bot_token=token, operator_chat_id=chat_id, coordinator=orchestrator)
 
 
 def _build_contract(instrument: str) -> Contract:
