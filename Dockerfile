@@ -16,6 +16,7 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY src ./src
 COPY config ./config
+COPY comms ./comms
 COPY main.py ./main.py
 
 # PR #12 — PID-1 liveness probe so `docker ps` reports (healthy)/(unhealthy)

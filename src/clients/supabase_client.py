@@ -177,6 +177,25 @@ class SupabaseClient:
     # orchestrator is halted; operator INSERTs (via Supabase dashboard SQL
     # editor or scripts/ack_halt.sh in a future PR) clear the halt.
 
+    async def insert_halt_ack(self, note: str) -> dict[str, Any]:
+        """Insert one row into ``halt_acks``. ``acked_at`` is server-default now().
+
+        Returns the inserted row (with ``halt_ack_id``, ``acked_at``, ``note``).
+        Used by the ``/ack`` telegram command (PR #14) to clear a halt without
+        an operator opening the Supabase dashboard SQL editor.
+        """
+        url = f"{self._base}/halt_acks"
+        row = {"note": note}
+        LOGGER.info("[supabase_client] insert halt_acks — note=%r", note)
+        r = await self._http.post(
+            url,
+            json=row,
+            headers={"Prefer": "return=representation"},
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if isinstance(rows, list) and rows else rows
+
     async def get_newest_halt_ack(self, since: datetime) -> dict[str, Any] | None:
         """Return the newest ``halt_acks`` row with ``acked_at > since``, or None.
 

@@ -76,6 +76,8 @@ class EodForceClose:
         lifecycles = await self._sm.load_non_closed()
         if not lifecycles:
             LOGGER.info("[EOD] fire: no_open_lifecycles")
+            # PR #14 — emit even a zero-work EOD so operator sees the daily heartbeat.
+            LOGGER.info("[ALERT] eod_complete: closed=0 remaining=0")
             return 0
 
         processed = 0
@@ -91,6 +93,11 @@ class EodForceClose:
                     exc,
                 )
         LOGGER.info("[EOD] fire: complete — processed=%s", processed)
+        # PR #14 — operator alert; remaining is the count of lifecycles fire_once
+        # could NOT close (errors caught above). Computed from the in-memory list
+        # to avoid a second load_non_closed DB round-trip per fire.
+        remaining = max(0, len(lifecycles) - processed)
+        LOGGER.info("[ALERT] eod_complete: closed=%d remaining=%d", processed, remaining)
         return processed
 
     async def _close_one(self, lc: Lifecycle) -> None:
