@@ -11,6 +11,7 @@ PR 3+ when there is an actual caller for them.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -170,3 +171,36 @@ class SupabaseClient:
         r = await self._http.post(url, json=row, headers={"Prefer": "return=representation"})
         r.raise_for_status()
         return r.json()
+
+    # ------------------------------------------------------------- halt_acks API
+    # PR #12 — halt-ack poll. Reconciler queries this each drain tick when the
+    # orchestrator is halted; operator INSERTs (via Supabase dashboard SQL
+    # editor or scripts/ack_halt.sh in a future PR) clear the halt.
+
+    async def get_newest_halt_ack(self, since: datetime) -> dict[str, Any] | None:
+        """Return the newest ``halt_acks`` row with ``acked_at > since``, or None.
+
+        Returns the row dict (``halt_ack_id``, ``acked_at``, ``note``) or None
+        when no qualifying row exists. Tolerates the table being absent (404):
+        logs DEBUG and returns None so the reconciler falls back to the file
+        flag without raising. Other HTTP / network errors are re-raised so the
+        caller can fall back deliberately rather than silently masking outages.
+        """
+        iso = since.astimezone(UTC).isoformat()
+        url = f"{self._base}/halt_acks"
+        params = {
+            "select": "halt_ack_id,acked_at,note",
+            "acked_at": f"gt.{iso}",
+            "order": "acked_at.desc",
+            "limit": "1",
+        }
+        LOGGER.debug("[supabase_client] get_newest_halt_ack — since=%s", iso)
+        r = await self._http.get(url, params=params)
+        if r.status_code == 404:
+            LOGGER.debug("[supabase_client] halt_acks: table missing — 404 (migration not applied)")
+            return None
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return None
+        return rows[0]

@@ -64,8 +64,11 @@ class Orchestrator:
         self._contract: Contract = _build_contract(instrument)
         self._strategy = Sma100BounceStrategy(instrument)
         # PR #11 — dirty set + halt flag + reconciler wired before any orders fly.
+        # PR #12 — halt flag is now ack-able via raise_halt/clear_halt; the
+        # reconciler holds an orchestrator handle so it can poll halt_acks.
         self._dirty_set = DirtySet()
         self._halt_new_entries = False
+        self._halt_raised_at: datetime | None = None
         self._router = OrderRouter(
             ib=ib,
             sm=self._sm,
@@ -77,7 +80,8 @@ class Orchestrator:
             ib=ib,
             sm=self._sm,
             dirty_set=self._dirty_set,
-            halt_callback=self._halt,
+            db=db,
+            orchestrator=self,
         )
         self._background_tasks: list[asyncio.Task[Any]] = []
         self._bars: Any = None
@@ -251,9 +255,10 @@ class Orchestrator:
         asyncio.run_coroutine_threadsafe(self._handle_trade_signal(signal_or_none), self._loop)
 
     async def _handle_trade_signal(self, signal: Signal) -> None:
-        # PR #11 — drop new entries while the halt flag is set (foreign position
-        # detected; restart clears the flag — see PR #12 for the ack mechanism).
-        if self._halt_new_entries:
+        # PR #12 — drop new entries while halted (foreign-position detection
+        # by Reconciler raises the flag; operator clears via Supabase halt_acks
+        # row or /tmp/halt_clear file flag).
+        if self.is_halted():
             LOGGER.warning(
                 "[ORCH] signal: dropped — halt_new_entries=True signal=%s",
                 signal.direction,
@@ -269,10 +274,49 @@ class Orchestrator:
                 exc,
             )
 
-    def _halt(self, reason: str) -> None:
-        """Reconciler halt callback — flips the new-entry kill switch."""
+    # ------------------------------------------------------------- halt API
+    # PR #12 — public halt coordinator surface consumed by Reconciler.
+    # _halt_new_entries remains the in-memory boolean source of truth;
+    # _halt_raised_at is the timestamp the ack poll compares against.
+
+    def raise_halt(self, symbol: str | None = None) -> None:
+        """Raise the global halt — block new entries, stamp ``_halt_raised_at``.
+
+        Idempotent: calling twice in a row only logs once at INFO for the second
+        call so the operator sees one warning per distinct halt event.
+        """
+        if self._halt_new_entries:
+            LOGGER.info("[ORCH] halt_already_raised: symbol=%s — no-op", symbol or "<unknown>")
+            return
         self._halt_new_entries = True
-        LOGGER.warning("[ORCH] halt: new_entries_disabled — reason=%s", reason)
+        self._halt_raised_at = datetime.now(UTC)
+        LOGGER.warning(
+            "[ORCH] halt_raised: symbol=%s — halting new entries",
+            symbol or "<unknown>",
+        )
+
+    def clear_halt(self, reason: str = "") -> None:
+        """Clear the global halt — resume new entries, log ``reason`` at INFO.
+
+        No-op if not currently halted. Always resets ``_halt_raised_at`` to None
+        so a subsequent ``halt_raised_at()`` returns None.
+        """
+        if not self._halt_new_entries:
+            return
+        self._halt_new_entries = False
+        self._halt_raised_at = None
+        LOGGER.info(
+            "[ORCH] halt_cleared: reason=%s — resuming new entries",
+            reason or "<no reason>",
+        )
+
+    def is_halted(self) -> bool:
+        """Return whether the global halt is currently raised."""
+        return self._halt_new_entries
+
+    def halt_raised_at(self) -> datetime | None:
+        """Return the timestamp the current halt was raised, or None if clear."""
+        return self._halt_raised_at
 
     def _launch_background_tasks(self) -> None:
         assert self._stop_event is not None

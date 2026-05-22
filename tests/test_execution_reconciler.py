@@ -2,14 +2,18 @@
 
 Each conflict-matrix row from the PR #11 brief has a dedicated test; foreign
 position detection, idempotency under InvariantViolationError, and the
-asyncio loop are covered separately.
+asyncio loop are covered separately. PR #12 adds halt-ack poll coverage in
+the trailing block (Supabase primary + file-flag fallback paths).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,6 +21,7 @@ import pytest
 
 from config.instruments import MNQ
 from src.clients.ib_client import IBClient
+from src.clients.supabase_client import SupabaseClient
 from src.execution.dirty_set import DirtySet
 from src.execution.reconciler import (
     ReconcileAction,
@@ -115,28 +120,62 @@ def _make_mock_sm(non_closed: list[Lifecycle] | None = None) -> MagicMock:
     return sm
 
 
+def _make_mock_orchestrator(halted: bool = False) -> MagicMock:
+    """Mock HaltCoordinator: raise_halt/clear_halt/is_halted/halt_raised_at.
+
+    ``halted`` toggles the initial state. ``raise_halt`` is a MagicMock so
+    foreign-position tests can assert it was called; legacy tests that used
+    ``halt.assert_called_once()`` keep working by asserting on ``.raise_halt``.
+    """
+    orch = MagicMock(name="orchestrator")
+    orch.is_halted = MagicMock(return_value=halted)
+    orch.halt_raised_at = MagicMock(return_value=None)
+    orch.raise_halt = MagicMock()
+    orch.clear_halt = MagicMock()
+    return orch
+
+
+def _make_mock_db() -> AsyncMock:
+    db = AsyncMock(spec=SupabaseClient)
+    db.get_newest_halt_ack = AsyncMock(return_value=None)
+    return db
+
+
 def _build_reconciler(
     *,
     ib: AsyncMock | None = None,
     sm: MagicMock | None = None,
     dirty_set: DirtySet | None = None,
-    halt: MagicMock | None = None,
+    db: AsyncMock | None = None,
+    orchestrator: MagicMock | None = None,
+    halt_ack_file_path: Path | None = None,
     dirty_interval: float = 0.01,
     full_interval: float = 0.02,
 ) -> tuple[Reconciler, AsyncMock, MagicMock, DirtySet, MagicMock]:
     ib = ib or _make_mock_ib()
     sm = sm or _make_mock_sm()
     dirty_set = dirty_set if dirty_set is not None else DirtySet()
-    halt = halt or MagicMock(name="halt_callback")
+    db = db or _make_mock_db()
+    orchestrator = orchestrator or _make_mock_orchestrator()
+    # PR #12 — when no explicit file path is supplied, point at a per-test path
+    # under /tmp that almost certainly does not exist. Tests that exercise the
+    # file-flag fallback pass their own ``tmp_path / "halt_clear"``.
+    if halt_ack_file_path is None:
+        halt_ack_file_path = Path(f"/tmp/halt_clear_test_{uuid.uuid4()}")
     rec = Reconciler(
         ib=ib,
         sm=sm,
         dirty_set=dirty_set,
-        halt_callback=halt,
+        db=db,
+        orchestrator=orchestrator,
         dirty_drain_interval_sec=dirty_interval,
         full_scan_interval_sec=full_interval,
+        halt_ack_file_path=halt_ack_file_path,
     )
-    return rec, ib, sm, dirty_set, halt
+    # 5-tuple shape preserved for callers; ``orchestrator`` replaces the
+    # pre-PR-12 ``halt`` MagicMock — the .raise_halt attribute carries the
+    # call assertions the legacy tests used.
+    return rec, ib, sm, dirty_set, orchestrator
 
 
 # ========================================================================
@@ -374,12 +413,12 @@ async def test_full_scan_detects_foreign_position_and_calls_halt_callback(caplog
     sm = _make_mock_sm(non_closed=[])
     # Broker has a position on a symbol the bot has no lifecycle for.
     ib = _make_mock_ib(portfolio=[_make_portfolio_item(symbol="ESM6", qty=1)])
-    halt = MagicMock(name="halt_callback")
-    rec, _ib, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm, halt=halt)
+    orch = _make_mock_orchestrator()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, sm=sm, orchestrator=orch)
 
     counts = await rec.full_scan()
 
-    halt.assert_called_once()
+    orch.raise_halt.assert_called_once_with("ESM6")
     assert counts.get(ReconcileAction.FOREIGN_POSITION) == 1
     assert any("foreign_position" in r.getMessage() for r in caplog.records)
 
@@ -392,12 +431,12 @@ async def test_full_scan_no_foreign_position_does_not_call_halt():
         positions=[_make_position()],
         open_trades=[_make_open_trade(1003), _make_open_trade(1002)],
     )
-    halt = MagicMock(name="halt_callback")
-    rec, _ib, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm, halt=halt)
+    orch = _make_mock_orchestrator()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, sm=sm, orchestrator=orch)
 
     counts = await rec.full_scan()
 
-    halt.assert_not_called()
+    orch.raise_halt.assert_not_called()
     assert ReconcileAction.FOREIGN_POSITION not in counts
 
 
@@ -617,3 +656,139 @@ async def test_full_scan_processes_each_non_closed_lifecycle():
 
     # lc1 ACTIVE w/ position → NOOP. lc2 ENTERING w/ order still open → NOOP. Two NOOPs.
     assert counts.get(ReconcileAction.NOOP, 0) == 2
+
+
+# ========================================================================
+# PR #12 — halt-ack poll
+# ========================================================================
+
+
+def _halted_at(raised_at: datetime) -> MagicMock:
+    """Mock orchestrator that reports is_halted=True with the supplied timestamp."""
+    orch = _make_mock_orchestrator(halted=True)
+    orch.halt_raised_at = MagicMock(return_value=raised_at)
+    return orch
+
+
+async def test_poll_halt_ack_no_op_when_not_halted():
+    db = _make_mock_db()
+    orch = _make_mock_orchestrator(halted=False)
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(db=db, orchestrator=orch)
+
+    await rec._poll_halt_ack()
+
+    db.get_newest_halt_ack.assert_not_awaited()
+    orch.clear_halt.assert_not_called()
+
+
+async def test_poll_halt_ack_supabase_success_newer_ack_clears_halt(caplog):
+    caplog.set_level(logging.INFO)
+    raised_at = datetime.now(UTC) - timedelta(minutes=5)
+    ack_ts = (raised_at + timedelta(seconds=10)).isoformat()
+    db = _make_mock_db()
+    db.get_newest_halt_ack = AsyncMock(
+        return_value={"halt_ack_id": "abc", "acked_at": ack_ts, "note": "operator-ok"}
+    )
+    orch = _halted_at(raised_at)
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(db=db, orchestrator=orch)
+
+    await rec._poll_halt_ack()
+
+    db.get_newest_halt_ack.assert_awaited_once()
+    orch.clear_halt.assert_called_once()
+    clear_args = orch.clear_halt.call_args
+    assert "supabase ack" in clear_args.kwargs.get(
+        "reason", clear_args.args[0] if clear_args.args else ""
+    )
+    assert any("halt_acked: source=supabase" in r.getMessage() for r in caplog.records)
+
+
+async def test_poll_halt_ack_supabase_returns_no_newer_ack_keeps_halt():
+    raised_at = datetime.now(UTC) - timedelta(minutes=5)
+    db = _make_mock_db()
+    db.get_newest_halt_ack = AsyncMock(return_value=None)
+    orch = _halted_at(raised_at)
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(db=db, orchestrator=orch)
+
+    await rec._poll_halt_ack()
+
+    db.get_newest_halt_ack.assert_awaited_once()
+    orch.clear_halt.assert_not_called()
+
+
+async def test_poll_halt_ack_supabase_fails_file_flag_fresh_clears_halt(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    raised_at = datetime.now(UTC) - timedelta(minutes=5)
+    flag_path = tmp_path / "halt_clear"
+    flag_path.touch()
+    # mtime = raised_at + 5s → fresh
+    fresh_ts = (raised_at + timedelta(seconds=5)).timestamp()
+    os.utime(flag_path, (fresh_ts, fresh_ts))
+
+    db = _make_mock_db()
+    db.get_newest_halt_ack = AsyncMock(side_effect=RuntimeError("network down"))
+    orch = _halted_at(raised_at)
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(
+        db=db, orchestrator=orch, halt_ack_file_path=flag_path
+    )
+
+    await rec._poll_halt_ack()
+
+    orch.clear_halt.assert_called_once()
+    assert "file-flag" in orch.clear_halt.call_args.kwargs["reason"]
+    assert any("halt_acked: source=file_flag" in r.getMessage() for r in caplog.records)
+
+
+async def test_poll_halt_ack_supabase_fails_file_flag_stale_keeps_halt(tmp_path):
+    raised_at = datetime.now(UTC) - timedelta(minutes=5)
+    flag_path = tmp_path / "halt_clear"
+    flag_path.touch()
+    # mtime = raised_at - 5s → stale (older than halt)
+    stale_ts = (raised_at - timedelta(seconds=5)).timestamp()
+    os.utime(flag_path, (stale_ts, stale_ts))
+
+    db = _make_mock_db()
+    db.get_newest_halt_ack = AsyncMock(side_effect=RuntimeError("network down"))
+    orch = _halted_at(raised_at)
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(
+        db=db, orchestrator=orch, halt_ack_file_path=flag_path
+    )
+
+    await rec._poll_halt_ack()
+
+    orch.clear_halt.assert_not_called()
+
+
+async def test_poll_halt_ack_supabase_fails_file_flag_absent_keeps_halt(tmp_path, caplog):
+    caplog.set_level(logging.WARNING)
+    raised_at = datetime.now(UTC) - timedelta(minutes=5)
+    flag_path = tmp_path / "halt_clear"  # not created → absent
+    assert not flag_path.exists()
+
+    db = _make_mock_db()
+    db.get_newest_halt_ack = AsyncMock(side_effect=RuntimeError("network down"))
+    orch = _halted_at(raised_at)
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(
+        db=db, orchestrator=orch, halt_ack_file_path=flag_path
+    )
+
+    await rec._poll_halt_ack()
+
+    orch.clear_halt.assert_not_called()
+    assert any("halt_ack_poll_failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_poll_halt_ack_supabase_returns_ack_older_than_raise_no_clear():
+    # If the DB ever returns a stale ack (e.g. since= was wrong), reconciler
+    # must still clear when get_newest_halt_ack returns a row — by contract
+    # get_newest_halt_ack only returns rows with acked_at > since. The test
+    # here covers the "no row returned" path which is the semantic equivalent.
+    raised_at = datetime.now(UTC)
+    db = _make_mock_db()
+    db.get_newest_halt_ack = AsyncMock(return_value=None)
+    orch = _halted_at(raised_at)
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(db=db, orchestrator=orch)
+
+    await rec._poll_halt_ack()
+
+    orch.clear_halt.assert_not_called()
