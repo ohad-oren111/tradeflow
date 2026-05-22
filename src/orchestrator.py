@@ -17,6 +17,7 @@ import logging
 import os
 import signal
 import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import FrameType
 from typing import Any
@@ -30,9 +31,26 @@ from src.clients.supabase_client import SupabaseClient
 from src.execution.dirty_set import DirtySet
 from src.execution.force_close import EodForceClose
 from src.execution.reconciler import Reconciler
-from src.execution.router import OrderRouter
+from src.execution.router import CloseResult, OrderRouter
 from src.state_machine import Lifecycle, State, StateMachine
 from src.strategy import STRATEGY_NAME, Signal, Sma100BounceStrategy
+
+
+@dataclass
+class FlattenResult:
+    """Aggregate outcome of :meth:`Orchestrator.flatten_all`."""
+
+    requested_symbols: list[str] = field(default_factory=list)
+    closed: list[CloseResult] = field(default_factory=list)
+
+
+@dataclass
+class ExitResult:
+    """Outcome of :meth:`Orchestrator.exit_symbol`."""
+
+    symbol: str
+    result: CloseResult
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -357,6 +375,79 @@ class Orchestrator:
         ``src.clients.*`` directly.
         """
         return await self._db.insert_halt_ack(note=note)
+
+    # ----------------------------------------------------- manual close (PR #16)
+
+    async def flatten_all(self) -> FlattenResult:
+        """Close every non-CLOSED lifecycle at MKT. Operator-initiated.
+
+        Lifecycle-driven enumeration mirrors :class:`EodForceClose` rather than
+        querying the broker, so a foreign position with no DB lifecycle is NOT
+        flattened by this path — the operator must still SSH for that edge case
+        (and the reconciler will already have raised a halt). One ``[ALERT]
+        flatten_requested`` precedes the per-symbol :meth:`close_position`
+        calls; one ``[ALERT] flatten_complete`` follows. Errors per-symbol are
+        caught so partial flatten is reported in the result.
+        """
+        lifecycles = await self._sm.load_non_closed()
+        symbols = [lc.symbol for lc in lifecycles]
+        LOGGER.info(
+            "[ALERT] flatten_requested: symbols=%s count=%d",
+            ",".join(symbols) if symbols else "<none>",
+            len(symbols),
+        )
+        results: list[CloseResult] = []
+        for symbol in symbols:
+            try:
+                res = await self._router.close_position(symbol, reason="manual_flatten")
+                results.append(res)
+            except Exception as exc:
+                LOGGER.error(
+                    "[ORCH] flatten_all: close_error — symbol=%s type=%s msg=%s",
+                    symbol,
+                    type(exc).__name__,
+                    exc,
+                )
+                results.append(
+                    CloseResult(
+                        closed=False,
+                        symbol=symbol,
+                        status="error",
+                        close_reason="manual_flatten",
+                    )
+                )
+        closed_count = sum(1 for r in results if r.closed)
+        LOGGER.info(
+            "[ALERT] flatten_complete: closed=%d total=%d",
+            closed_count,
+            len(symbols),
+        )
+        return FlattenResult(requested_symbols=symbols, closed=results)
+
+    async def exit_symbol(self, symbol: str) -> ExitResult:
+        """Close one non-CLOSED lifecycle matching ``symbol`` at MKT.
+
+        Single ``[ALERT] exit_requested`` precedes the close; the
+        ``[ALERT] exit_complete`` line is emitted by
+        :meth:`OrderRouter.close_position` itself (do not double-log here).
+        """
+        LOGGER.info("[ALERT] exit_requested: symbol=%s", symbol)
+        try:
+            result = await self._router.close_position(symbol, reason="manual_exit_symbol")
+        except Exception as exc:
+            LOGGER.error(
+                "[ORCH] exit_symbol: close_error — symbol=%s type=%s msg=%s",
+                symbol,
+                type(exc).__name__,
+                exc,
+            )
+            result = CloseResult(
+                closed=False,
+                symbol=symbol,
+                status="error",
+                close_reason="manual_exit_symbol",
+            )
+        return ExitResult(symbol=symbol, result=result)
 
     def is_halted(self) -> bool:
         """Return whether the global halt is currently raised."""
