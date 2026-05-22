@@ -282,3 +282,166 @@ async def test_handle_trade_signal_drops_when_halted(caplog):
 
     # Router should NOT have been asked to place an entry while halted.
     assert any("signal: dropped" in r.getMessage() for r in caplog.records)
+
+
+# ============================================================================
+# PR #16 — flatten_all / exit_symbol
+# ============================================================================
+
+
+def _make_orch_for_close_tests() -> Orchestrator:
+    """Fresh orchestrator with router + sm replaced by mocks at the boundary."""
+    from src.execution.router import OrderRouter
+    from src.state_machine import StateMachine
+
+    orch = Orchestrator(
+        _make_mock_ib(),
+        _make_mock_db(),
+        paper_account="DUQ1234567",
+        healthcheck_interval=10.0,
+    )
+    # Replace router and state machine with mocks so we can assert at the
+    # close_position boundary without exercising real IB / DB code paths.
+    orch._router = MagicMock(spec=OrderRouter)
+    orch._router.close_position = AsyncMock()
+    orch._sm = MagicMock(spec=StateMachine)
+    orch._sm.load_non_closed = AsyncMock(return_value=[])
+    return orch
+
+
+def _make_mock_lifecycle(symbol: str = "MNQM6"):
+    """Lifecycle stub for load_non_closed return values."""
+    lc = MagicMock(name=f"Lifecycle<{symbol}>")
+    lc.symbol = symbol
+    return lc
+
+
+async def test_flatten_all_with_no_positions_returns_empty_result(caplog):
+    caplog.set_level(logging.INFO)
+    orch = _make_orch_for_close_tests()
+    orch._sm.load_non_closed = AsyncMock(return_value=[])  # exactly one call expected
+
+    result = await orch.flatten_all()
+
+    assert result.requested_symbols == []
+    assert result.closed == []
+    orch._router.close_position.assert_not_awaited()
+    complete_logs = [r for r in caplog.records if "[ALERT] flatten_complete" in r.getMessage()]
+    assert len(complete_logs) == 1
+    assert "closed=0 total=0" in complete_logs[0].getMessage()
+
+
+async def test_flatten_all_calls_close_position_per_symbol(caplog):
+    caplog.set_level(logging.INFO)
+    from src.execution.router import CloseResult
+
+    orch = _make_orch_for_close_tests()
+    orch._sm.load_non_closed = AsyncMock(
+        return_value=[_make_mock_lifecycle("MNQM6"), _make_mock_lifecycle("ESM6")]
+    )
+    # Two close_position calls expected — one per symbol.
+    orch._router.close_position = AsyncMock(
+        side_effect=[
+            CloseResult(
+                closed=True,
+                symbol="MNQM6",
+                status="exit_submitted",
+                close_reason="manual_flatten",
+            ),
+            CloseResult(
+                closed=True,
+                symbol="ESM6",
+                status="exit_submitted",
+                close_reason="manual_flatten",
+            ),
+        ]
+    )
+
+    result = await orch.flatten_all()
+
+    assert result.requested_symbols == ["MNQM6", "ESM6"]
+    assert len(result.closed) == 2
+    assert orch._router.close_position.await_count == 2
+    # All close_position calls carry reason="manual_flatten".
+    for call in orch._router.close_position.await_args_list:
+        assert call.kwargs.get("reason") == "manual_flatten"
+    complete_logs = [r for r in caplog.records if "[ALERT] flatten_complete" in r.getMessage()]
+    assert len(complete_logs) == 1
+    assert "closed=2 total=2" in complete_logs[0].getMessage()
+
+
+async def test_exit_symbol_with_no_position_returns_close_result_no_position():
+    from src.execution.router import CloseResult
+
+    orch = _make_orch_for_close_tests()
+    orch._router.close_position = AsyncMock(
+        return_value=CloseResult(
+            closed=False,
+            symbol="MNQM6",
+            status="no_position",
+            close_reason="manual_exit_symbol",
+        )
+    )
+
+    result = await orch.exit_symbol("MNQM6")
+
+    assert result.symbol == "MNQM6"
+    assert result.result.closed is False
+    assert result.result.status == "no_position"
+    orch._router.close_position.assert_awaited_once_with("MNQM6", reason="manual_exit_symbol")
+
+
+async def test_exit_symbol_happy_path_emits_alert(caplog):
+    caplog.set_level(logging.INFO)
+    from src.execution.router import CloseResult
+
+    orch = _make_orch_for_close_tests()
+    orch._router.close_position = AsyncMock(
+        return_value=CloseResult(
+            closed=True,
+            symbol="MNQM6",
+            status="exit_submitted",
+            close_reason="manual_exit_symbol",
+        )
+    )
+
+    await orch.exit_symbol("MNQM6")
+
+    requested_logs = [r for r in caplog.records if "[ALERT] exit_requested" in r.getMessage()]
+    assert len(requested_logs) == 1
+    assert "symbol=MNQM6" in requested_logs[0].getMessage()
+    # exit_symbol must NOT double-log [ALERT] exit_complete — that's the
+    # router's job (and not captured here because the router is mocked).
+
+
+async def test_flatten_all_continues_if_one_close_fails(caplog):
+    caplog.set_level(logging.ERROR)
+    from src.execution.router import CloseResult
+
+    orch = _make_orch_for_close_tests()
+    orch._sm.load_non_closed = AsyncMock(
+        return_value=[_make_mock_lifecycle("MNQM6"), _make_mock_lifecycle("ESM6")]
+    )
+    # First raises, second returns OK. Exactly two calls expected.
+    orch._router.close_position = AsyncMock(
+        side_effect=[
+            RuntimeError("place_order failed"),
+            CloseResult(
+                closed=True,
+                symbol="ESM6",
+                status="exit_submitted",
+                close_reason="manual_flatten",
+            ),
+        ]
+    )
+
+    result = await orch.flatten_all()
+
+    assert orch._router.close_position.await_count == 2
+    assert len(result.closed) == 2
+    # First lifecycle reflected as error, second as closed=True.
+    assert result.closed[0].closed is False
+    assert result.closed[0].status == "error"
+    assert result.closed[1].closed is True
+    error_logs = [r for r in caplog.records if "[ORCH] flatten_all: close_error" in r.getMessage()]
+    assert len(error_logs) == 1

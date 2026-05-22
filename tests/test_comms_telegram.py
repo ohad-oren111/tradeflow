@@ -42,6 +42,8 @@ def _make_coordinator(
     raised_at: datetime | None = None,
     status_summary: dict | None = None,
     insert_ack_row: dict | None = None,
+    flatten_result: object | None = None,
+    exit_result: object | None = None,
 ) -> MagicMock:
     c = MagicMock(name="coordinator")
     c.is_halted = MagicMock(return_value=halted)
@@ -60,7 +62,35 @@ def _make_coordinator(
     c.insert_halt_ack = AsyncMock(
         return_value=insert_ack_row or {"halt_ack_id": "abcd1234efgh", "acked_at": "now"}
     )
+    # PR #16 — manual close commands. Tests that need specific values inject
+    # them; otherwise a benign empty-flatten / no-position-exit is returned.
+    c.flatten_all = AsyncMock(
+        return_value=flatten_result if flatten_result is not None else _default_flatten_result()
+    )
+    c.exit_symbol = AsyncMock(
+        return_value=exit_result if exit_result is not None else _default_exit_result("MNQM6")
+    )
     return c
+
+
+def _default_flatten_result():
+    """Empty FlattenResult; importable without dragging Orchestrator into test deps."""
+    from src.orchestrator import FlattenResult
+
+    return FlattenResult(requested_symbols=[], closed=[])
+
+
+def _default_exit_result(symbol: str):
+    """No-position ExitResult for ``symbol``."""
+    from src.execution.router import CloseResult
+    from src.orchestrator import ExitResult
+
+    return ExitResult(
+        symbol=symbol,
+        result=CloseResult(
+            closed=False, symbol=symbol, status="no_position", close_reason="manual_exit_symbol"
+        ),
+    )
 
 
 def _build_alerter(
@@ -394,6 +424,283 @@ def test_format_alert_strips_prefix_and_decorates():
     assert formatted.startswith("🤖 TradeFlow — ")
     assert ALERT_PREFIX not in formatted
     assert "entry_placed" in formatted
+
+
+# ============================================================================
+# PR #16 — /flatten /exit /confirm
+# ============================================================================
+
+
+def _make_close_result(
+    *,
+    closed: bool = True,
+    symbol: str = "MNQM6",
+    status: str = "exit_submitted",
+    close_reason: str = "manual_exit_symbol",
+    pnl: float | None = None,
+):
+    from src.execution.router import CloseResult
+
+    return CloseResult(
+        closed=closed,
+        symbol=symbol,
+        status=status,
+        close_reason=close_reason,
+        pnl=pnl,
+    )
+
+
+def _make_flatten_result(symbols: list[str], close_results: list):
+    from src.orchestrator import FlattenResult
+
+    return FlattenResult(requested_symbols=list(symbols), closed=list(close_results))
+
+
+def _make_exit_result(symbol: str, close_result):
+    from src.orchestrator import ExitResult
+
+    return ExitResult(symbol=symbol, result=close_result)
+
+
+async def test_handle_flatten_stages_pending_action_and_replies():
+    http = _make_mock_http()
+    http.post.return_value = _fake_resp(status_code=200)
+    coord = _make_coordinator()
+    alerter, _http, _c = _build_alerter(http=http, coordinator=coord)
+
+    assert alerter._pending_action is None
+    await alerter._handle_flatten("")
+
+    assert alerter._pending_action is not None
+    assert alerter._pending_action.kind == "flatten"
+    assert alerter._pending_action.symbol is None
+    sent_text = http.post.call_args.kwargs["json"]["text"]
+    assert "Flatten ALL" in sent_text
+    assert "/confirm within 60s" in sent_text
+    coord.flatten_all.assert_not_awaited()
+
+
+async def test_handle_exit_parses_symbol_and_stages():
+    http = _make_mock_http()
+    http.post.return_value = _fake_resp(status_code=200)
+    coord = _make_coordinator()
+    alerter, _http, _c = _build_alerter(http=http, coordinator=coord)
+
+    await alerter._handle_exit("mnqm6")  # lowercase — should be uppercased
+
+    assert alerter._pending_action is not None
+    assert alerter._pending_action.kind == "exit"
+    assert alerter._pending_action.symbol == "MNQM6"
+    sent_text = http.post.call_args.kwargs["json"]["text"]
+    assert "Exit MNQM6 staged" in sent_text
+    coord.exit_symbol.assert_not_awaited()
+
+
+async def test_handle_exit_rejects_missing_symbol():
+    http = _make_mock_http()
+    http.post.return_value = _fake_resp(status_code=200)
+    coord = _make_coordinator()
+    alerter, _http, _c = _build_alerter(http=http, coordinator=coord)
+
+    await alerter._handle_exit("")
+
+    assert alerter._pending_action is None
+    sent_text = http.post.call_args.kwargs["json"]["text"]
+    assert "Usage: /exit SYMBOL" in sent_text
+    coord.exit_symbol.assert_not_awaited()
+
+
+async def test_handle_confirm_no_pending_replies_no_action():
+    http = _make_mock_http()
+    http.post.return_value = _fake_resp(status_code=200)
+    coord = _make_coordinator()
+    alerter, _http, _c = _build_alerter(http=http, coordinator=coord)
+
+    assert alerter._pending_action is None
+    await alerter._handle_confirm("")
+
+    sent_text = http.post.call_args.kwargs["json"]["text"]
+    assert sent_text == "No pending action."
+    coord.flatten_all.assert_not_awaited()
+    coord.exit_symbol.assert_not_awaited()
+
+
+async def test_handle_confirm_expired_clears_and_replies():
+    http = _make_mock_http()
+    http.post.return_value = _fake_resp(status_code=200)
+    coord = _make_coordinator()
+    alerter, _http, _c = _build_alerter(http=http, coordinator=coord)
+
+    # Stage an exit, then back-date its timestamp to 65s ago.
+    from datetime import timedelta
+
+    from comms.telegram import PendingAction
+
+    alerter._pending_action = PendingAction(
+        kind="exit",
+        symbol="MNQM6",
+        requested_at=datetime.now(UTC) - timedelta(seconds=65),
+    )
+
+    await alerter._handle_confirm("")
+
+    assert alerter._pending_action is None
+    sent_text = http.post.call_args.kwargs["json"]["text"]
+    assert "expired" in sent_text
+    coord.exit_symbol.assert_not_awaited()
+
+
+async def test_handle_confirm_flatten_dispatches_and_clears():
+    http = _make_mock_http()
+    http.post.return_value = _fake_resp(status_code=200)
+    flatten_res = _make_flatten_result(
+        ["MNQM6"],
+        [_make_close_result(closed=True, status="exit_submitted", close_reason="manual_flatten")],
+    )
+    coord = _make_coordinator(flatten_result=flatten_res)
+    alerter, _http, _c = _build_alerter(http=http, coordinator=coord)
+
+    from comms.telegram import PendingAction
+
+    alerter._pending_action = PendingAction(
+        kind="flatten",
+        symbol=None,
+        requested_at=datetime.now(UTC),
+    )
+
+    await alerter._handle_confirm("")
+
+    coord.flatten_all.assert_awaited_once_with()
+    coord.exit_symbol.assert_not_awaited()
+    assert alerter._pending_action is None
+    sent_text = http.post.call_args.kwargs["json"]["text"]
+    assert "Flatten complete" in sent_text
+    assert "MNQM6" in sent_text
+
+
+async def test_handle_confirm_exit_dispatches_with_symbol():
+    http = _make_mock_http()
+    http.post.return_value = _fake_resp(status_code=200)
+    exit_res = _make_exit_result(
+        "MNQM6",
+        _make_close_result(closed=True, status="exit_submitted", close_reason="manual_exit_symbol"),
+    )
+    coord = _make_coordinator(exit_result=exit_res)
+    alerter, _http, _c = _build_alerter(http=http, coordinator=coord)
+
+    from comms.telegram import PendingAction
+
+    alerter._pending_action = PendingAction(
+        kind="exit",
+        symbol="MNQM6",
+        requested_at=datetime.now(UTC),
+    )
+
+    await alerter._handle_confirm("")
+
+    coord.exit_symbol.assert_awaited_once_with("MNQM6")
+    coord.flatten_all.assert_not_awaited()
+    assert alerter._pending_action is None
+    sent_text = http.post.call_args.kwargs["json"]["text"]
+    assert "Exit MNQM6" in sent_text
+
+
+async def test_handle_confirm_idempotent_double_call_no_op():
+    http = _make_mock_http()
+    http.post.return_value = _fake_resp(status_code=200)
+    flatten_res = _make_flatten_result([], [])  # empty positions
+    coord = _make_coordinator(flatten_result=flatten_res)
+    alerter, _http, _c = _build_alerter(http=http, coordinator=coord)
+
+    from comms.telegram import PendingAction
+
+    alerter._pending_action = PendingAction(
+        kind="flatten",
+        symbol=None,
+        requested_at=datetime.now(UTC),
+    )
+
+    await alerter._handle_confirm("")  # first confirm — dispatches flatten_all
+    await alerter._handle_confirm("")  # second confirm — no-op
+
+    coord.flatten_all.assert_awaited_once_with()
+    # Second reply must be "No pending action."
+    last_text = http.post.call_args_list[-1].kwargs["json"]["text"]
+    assert last_text == "No pending action."
+
+
+async def test_handle_flatten_overwrites_previous_pending_exit():
+    http = _make_mock_http()
+    http.post.return_value = _fake_resp(status_code=200)
+    flatten_res = _make_flatten_result([], [])
+    coord = _make_coordinator(flatten_result=flatten_res)
+    alerter, _http, _c = _build_alerter(http=http, coordinator=coord)
+
+    await alerter._handle_exit("MNQM6")
+    assert alerter._pending_action is not None
+    assert alerter._pending_action.kind == "exit"
+
+    await alerter._handle_flatten("")
+    assert alerter._pending_action is not None
+    assert alerter._pending_action.kind == "flatten"
+    assert alerter._pending_action.symbol is None
+
+    await alerter._handle_confirm("")
+    coord.flatten_all.assert_awaited_once_with()
+    coord.exit_symbol.assert_not_awaited()
+
+
+async def test_unauthorized_chat_id_cannot_stage_flatten(caplog):
+    caplog.set_level(logging.WARNING)
+    http = _make_mock_http()
+    http.post.return_value = _fake_resp(status_code=200)
+    coord = _make_coordinator()
+    alerter, _http, _c = _build_alerter(http=http, coordinator=coord, chat_id=12345)
+
+    update = {
+        "update_id": 1,
+        "message": {"chat": {"id": 99999}, "text": "/flatten"},
+    }
+    await alerter._handle_update(update)
+
+    assert alerter._pending_action is None
+    coord.flatten_all.assert_not_awaited()
+    sent_text = http.post.call_args.kwargs["json"]["text"]
+    assert sent_text == "Unauthorized."
+    assert any("unauthorized_command" in r.getMessage() for r in caplog.records)
+
+
+async def test_no_parse_mode_in_any_new_reply():
+    """Regression guard for §0.5.143: no Telegram reply may set parse_mode."""
+    http = _make_mock_http()
+    http.post.return_value = _fake_resp(status_code=200)
+    flatten_res = _make_flatten_result(
+        ["MNQM6"],
+        [_make_close_result(closed=True, status="exit_submitted", close_reason="manual_flatten")],
+    )
+    exit_res = _make_exit_result(
+        "MNQM6",
+        _make_close_result(closed=True, status="exit_submitted", close_reason="manual_exit_symbol"),
+    )
+    coord = _make_coordinator(flatten_result=flatten_res, exit_result=exit_res)
+    alerter, _http, _c = _build_alerter(http=http, coordinator=coord)
+
+    # Exercise every new handler at least once.
+    await alerter._handle_flatten("")
+    await alerter._handle_exit("MNQM6")
+    await alerter._handle_exit("")  # usage path
+    await alerter._handle_confirm("")  # confirm the exit
+    await alerter._handle_flatten("")  # re-stage
+    await alerter._handle_confirm("")  # confirm the flatten
+    await alerter._handle_confirm("")  # no pending
+
+    for call in http.post.call_args_list:
+        assert "parse_mode" not in call.kwargs.get(
+            "json", {}
+        ), f"parse_mode leaked into Telegram payload: {call.kwargs.get('json')}"
+        assert (
+            "parse_mode" not in call.kwargs
+        ), f"parse_mode passed as kwarg to http.post: {call.kwargs}"
 
 
 # Allow pytest to pick up the async tests without explicit marker (asyncio_mode=auto).

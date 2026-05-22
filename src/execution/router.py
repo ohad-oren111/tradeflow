@@ -13,10 +13,11 @@ The protective STP is placed inside the parent fillEvent handler so §0.5.T5
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from ib_async import Contract, Trade
+from ib_async import Contract, Order, Trade
 
 from config.instruments import MNQ
 from src.clients.ib_client import IBClient
@@ -33,6 +34,24 @@ from src.state_machine import (
 from src.strategy import Signal
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class CloseResult:
+    """Outcome of a single :meth:`OrderRouter.close_position` call.
+
+    For ``status="exit_submitted"`` the fill is still in flight; ``pnl`` and
+    ``fill_price`` arrive later via the existing ``[ALERT] exit_filled`` line
+    from :meth:`OrderRouter._handle_exit_fill`. Pre-active synthesised closes
+    return ``pnl=0.0`` because no broker fill occurs.
+    """
+
+    closed: bool
+    symbol: str
+    status: str  # "no_position" | "pre_active_closed" | "exit_submitted" | "already_exiting"
+    close_reason: str | None = None
+    pnl: float | None = None
+    fill_price: float | None = None
 
 
 class OrderRouter:
@@ -57,6 +76,9 @@ class OrderRouter:
         self._contracts: dict[str, Contract] = {}
         # order_ids whose fill should be attributed to EOD (vs natural TP/STOP).
         self._eod_orders: set[int] = set()
+        # PR #16 — order_ids whose fill should be attributed to a manual close
+        # (operator-initiated /flatten or /exit). Routed via ExitReason.MANUAL.
+        self._manual_orders: set[int] = set()
         # PR #11 — opt-in dirty set so the reconciler can re-check lifecycles
         # touched by recent events. None when run in isolation (e.g. unit tests
         # that don't care about reconciliation).
@@ -96,6 +118,16 @@ class OrderRouter:
         self._by_order_id[order_id] = lifecycle
         self._by_lifecycle_id[lifecycle.lifecycle_id] = lifecycle
         self._eod_orders.add(order_id)
+
+    def register_manual_exit(self, lifecycle: Lifecycle, order_id: int) -> None:
+        """PR #16 — sibling of :meth:`register_eod_exit` for operator-initiated closes.
+
+        Routes the forthcoming fill via ``ExitReason.MANUAL`` so the lifecycle
+        row's ``exit_reason`` ends up as MANUAL (not EOD / TARGET / STOP).
+        """
+        self._by_order_id[order_id] = lifecycle
+        self._by_lifecycle_id[lifecycle.lifecycle_id] = lifecycle
+        self._manual_orders.add(order_id)
 
     # ----------------------------------------------------------------- placement
 
@@ -245,6 +277,8 @@ class OrderRouter:
         try:
             if order_id in self._eod_orders:
                 await self._handle_exit_fill(lc, trade, ExitReason.EOD)
+            elif order_id in self._manual_orders:
+                await self._handle_exit_fill(lc, trade, ExitReason.MANUAL)
             elif order_id == lc.entry_order_id:
                 await self._handle_parent_fill(lc, trade)
             elif order_id == lc.target_order_id:
@@ -406,6 +440,180 @@ class OrderRouter:
                     exc,
                 )
 
+    # ----------------------------------------------------- manual close (PR #16)
+
+    async def close_position(self, symbol: str, reason: str) -> CloseResult:
+        """Close a single non-CLOSED lifecycle matching ``symbol``.
+
+        Mirrors :meth:`EodForceClose._close_one` but parameterised by ``reason``
+        (a free-form close discriminator e.g. ``manual_flatten`` /
+        ``manual_exit_symbol``). ACTIVE positions are closed asynchronously —
+        the MKT exit lands via the existing fill-event path which emits
+        ``[ALERT] exit_filled`` with the realized PnL.
+
+        Returns a :class:`CloseResult` summarising what was done; raises only on
+        truly unexpected errors (caught + logged at the caller in
+        :class:`Orchestrator`).
+        """
+        lifecycles = await self._sm.load_non_closed()
+        matches = [lc for lc in lifecycles if lc.symbol == symbol]
+        if not matches:
+            LOGGER.info(
+                "[EXEC] %s: close_skipped — no_position close_reason=%s",
+                symbol,
+                reason,
+            )
+            LOGGER.info(
+                "[ALERT] exit_complete: symbol=%s status=no_position close_reason=%s",
+                symbol,
+                reason,
+            )
+            return CloseResult(
+                closed=False, symbol=symbol, status="no_position", close_reason=reason
+            )
+        if len(matches) > 1:
+            LOGGER.warning(
+                "[EXEC] %s: multiple_non_closed_lifecycles — count=%d (acting on first)",
+                symbol,
+                len(matches),
+            )
+        lc = matches[0]
+        contract = self._contracts.get(lc.lifecycle_id)
+        if contract is None:
+            LOGGER.error(
+                "[EXEC] %s: close_no_contract — lifecycle=%s",
+                symbol,
+                lc.lifecycle_id,
+            )
+            return CloseResult(
+                closed=False, symbol=symbol, status="no_contract_cached", close_reason=reason
+            )
+
+        await self.cancel_all_for(lc)
+        current = State(lc.state)
+
+        if current in (State.IDLE, State.ENTERING):
+            await self._close_pre_active_manual(lc, reason)
+            LOGGER.info(
+                "[ALERT] exit_complete: symbol=%s status=pre_active_closed close_reason=%s",
+                symbol,
+                reason,
+            )
+            return CloseResult(
+                closed=True,
+                symbol=symbol,
+                status="pre_active_closed",
+                close_reason=reason,
+                pnl=0.0,
+                fill_price=0.0,
+            )
+
+        if current is State.ACTIVE:
+            qty = lc.entry_qty or 0
+            if qty <= 0:
+                LOGGER.warning(
+                    "[EXEC] %s: active_with_zero_qty — lifecycle=%s skipping market exit",
+                    symbol,
+                    lc.lifecycle_id,
+                )
+                LOGGER.info(
+                    "[ALERT] exit_complete: symbol=%s status=zero_qty close_reason=%s",
+                    symbol,
+                    reason,
+                )
+                return CloseResult(
+                    closed=False, symbol=symbol, status="zero_qty", close_reason=reason
+                )
+            order = _build_market_exit(Direction(lc.direction), qty)
+            trade = await self._ib.place_order(contract, order)
+            exit_order_id = self._order_id_of(trade)
+            LOGGER.info(
+                "[EXEC] %s: place_market_exit_manual — lifecycle=%s qty=%s order=%s "
+                "close_reason=%s",
+                symbol,
+                lc.lifecycle_id,
+                qty,
+                exit_order_id,
+                reason,
+            )
+            lc = await self._sm.transition(
+                lc,
+                State.EXITING,
+                reason="manual_close",
+                payload={"order_id": exit_order_id, "close_reason": reason},
+                exit_order_id=exit_order_id,
+            )
+            self.register_manual_exit(lc, exit_order_id)
+            LOGGER.info(
+                "[ALERT] exit_complete: symbol=%s status=exit_submitted close_reason=%s",
+                symbol,
+                reason,
+            )
+            return CloseResult(
+                closed=True,
+                symbol=symbol,
+                status="exit_submitted",
+                close_reason=reason,
+            )
+
+        # current is State.EXITING — already in flight; cancel above is enough.
+        LOGGER.info(
+            "[EXEC] %s: close_already_exiting — lifecycle=%s no-op",
+            symbol,
+            lc.lifecycle_id,
+        )
+        LOGGER.info(
+            "[ALERT] exit_complete: symbol=%s status=already_exiting close_reason=%s",
+            symbol,
+            reason,
+        )
+        return CloseResult(
+            closed=True, symbol=symbol, status="already_exiting", close_reason=reason
+        )
+
+    async def _close_pre_active_manual(self, lc: Lifecycle, reason: str) -> None:
+        """Synthesise a CLOSED row for an IDLE/ENTERING lifecycle with no fill.
+
+        Mirrors :meth:`EodForceClose._close_pre_active` field-for-field but with
+        ``exit_reason=MANUAL`` and ``close_reason`` carried in the event payload
+        for discrimination. The state-machine invariant matrix requires every
+        ``_EXIT_FIELDS`` + ``_PNL_FIELDS`` on CLOSED transition — synth zeros.
+        """
+        now = datetime.now(UTC).isoformat()
+        current = State(lc.state)
+        updates: dict[str, Any] = {
+            "entry_qty": lc.entry_qty or 0,
+            "entry_price": lc.entry_price or 0.0,
+            "entry_filled_at": lc.entry_filled_at or now,
+            "exit_qty": 0,
+            "exit_price": 0.0,
+            "exit_filled_at": now,
+            "exit_reason": ExitReason.MANUAL.value,
+            "commission_total": 0.0,
+            "pnl_gross": 0.0,
+            "pnl_net": 0.0,
+        }
+        if current is State.IDLE:
+            updates["entry_order_id"] = lc.entry_order_id or 0
+            updates["exit_order_id"] = lc.entry_order_id or 0
+        else:
+            updates["exit_order_id"] = lc.entry_order_id or 0
+        try:
+            await self._sm.transition(
+                lc,
+                State.CLOSED,
+                reason="manual_pre_active",
+                payload={"close_reason": reason},
+                **updates,
+            )
+        except InvariantViolationError as exc:
+            LOGGER.warning(
+                "[EXEC] %s: pre_active_invariant — lifecycle=%s msg=%s",
+                lc.symbol,
+                lc.lifecycle_id,
+                exc,
+            )
+
     # ----------------------------------------------------------------- helpers
 
     @staticmethod
@@ -467,3 +675,19 @@ class _OrderIdRef:
     """Minimal duck-type for ``IB.cancelOrder``. ``orderId`` is the only field read."""
 
     orderId: int = 0  # noqa: N815 — IB-API attribute name, must match ib_async
+
+
+def _build_market_exit(direction: Direction, qty: int) -> Order:
+    """Build a DAY MKT order that flat-closes a ``direction`` position of size ``qty``.
+
+    Duplicates :func:`src.execution.force_close._build_market_exit` deliberately
+    — force_close.py is in MUST-NOT-MODIFY scope for PR #16 and the helper is
+    private. Keep both in sync.
+    """
+    o = Order()
+    o.action = "SELL" if direction is Direction.LONG else "BUY"
+    o.totalQuantity = qty
+    o.orderType = "MKT"
+    o.tif = "DAY"
+    o.transmit = True
+    return o

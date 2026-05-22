@@ -23,10 +23,14 @@ import logging
 import re
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
+
+if TYPE_CHECKING:
+    from src.orchestrator import ExitResult, FlattenResult
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,6 +41,17 @@ TELEGRAM_API = "https://api.telegram.org"
 LONG_POLL_TIMEOUT_SEC = 30
 RETRY_BACKOFF_BASE_SEC = 2.0
 RETRY_BACKOFF_MAX_SEC = 60.0
+# PR #16 — staged operator action expires after this many seconds without /confirm.
+PENDING_ACTION_TTL_SEC = 60.0
+
+
+@dataclass
+class PendingAction:
+    """A /flatten or /exit awaiting operator /confirm. Single-slot, in-memory."""
+
+    kind: str  # "flatten" | "exit"
+    symbol: str | None  # None for flatten; uppercase symbol for exit
+    requested_at: datetime  # tz-aware UTC
 
 
 class OperatorCoordinator(Protocol):
@@ -53,6 +68,10 @@ class OperatorCoordinator(Protocol):
     def clear_halt(self, reason: str = "") -> None: ...
     async def get_broker_status_summary(self) -> dict[str, Any]: ...
     async def insert_halt_ack(self, note: str) -> dict[str, Any]: ...
+
+    # PR #16 — manual close commands.
+    async def flatten_all(self) -> FlattenResult: ...
+    async def exit_symbol(self, symbol: str) -> ExitResult: ...
 
 
 class TelegramAlertHandler(logging.Handler):
@@ -114,6 +133,9 @@ class TelegramAlerter:
         self._recent: deque[tuple[str, float]] = deque(maxlen=200)
         self._update_offset = 0
         self._handler: TelegramAlertHandler | None = None
+        # PR #16 — single-slot pending action awaiting /confirm. Lost on restart;
+        # operator can re-issue. Subsequent /flatten or /exit overwrites freely.
+        self._pending_action: PendingAction | None = None
 
     @property
     def queue(self) -> asyncio.Queue[str]:
@@ -272,10 +294,17 @@ class TelegramAlerter:
                 await self._handle_halt(rest)
             elif cmd == "/ack":
                 await self._handle_ack(rest)
+            elif cmd == "/flatten":
+                await self._handle_flatten(rest)
+            elif cmd == "/exit":
+                await self._handle_exit(rest)
+            elif cmd == "/confirm":
+                await self._handle_confirm(rest)
             else:
                 await self._send(
                     f"Unknown command: {cmd}\n"
-                    "Available: /status, /halt SYMBOL [reason], /ack [reason]"
+                    "Available: /status, /halt SYMBOL [reason], /ack [reason], "
+                    "/flatten, /exit SYMBOL, /confirm"
                 )
         except Exception as exc:
             LOGGER.exception("[telegram] command_handler_failed: cmd=%s", cmd)
@@ -316,6 +345,88 @@ class TelegramAlerter:
         row = await self._coordinator.insert_halt_ack(note=note)
         ack_id = str(row.get("halt_ack_id", "?"))[:8]
         await self._send(f"Ack inserted (halt_ack_id={ack_id}…). Reconciler will clear within 30s.")
+
+    # ----------------------------------------------------- manual close (PR #16)
+
+    async def _handle_flatten(self, rest: str) -> None:
+        del rest  # /flatten takes no args; trailing text ignored.
+        self._pending_action = PendingAction(
+            kind="flatten",
+            symbol=None,
+            requested_at=datetime.now(UTC),
+        )
+        await self._send(
+            "Flatten ALL positions staged.\n"
+            "Reply /confirm within 60s to execute.\n"
+            "Any other command overwrites or expires this."
+        )
+
+    async def _handle_exit(self, rest: str) -> None:
+        parts = rest.strip().split()
+        if not parts:
+            await self._send("Usage: /exit SYMBOL\nExample: /exit MNQM6")
+            return
+        symbol = parts[0].upper()
+        self._pending_action = PendingAction(
+            kind="exit",
+            symbol=symbol,
+            requested_at=datetime.now(UTC),
+        )
+        await self._send(
+            f"Exit {symbol} staged.\n"
+            "Reply /confirm within 60s to execute.\n"
+            "Any other command overwrites or expires this."
+        )
+
+    async def _handle_confirm(self, rest: str) -> None:
+        del rest  # /confirm takes no args.
+        pending = self._pending_action
+        if pending is None:
+            await self._send("No pending action.")
+            return
+        age = (datetime.now(UTC) - pending.requested_at).total_seconds()
+        if age > PENDING_ACTION_TTL_SEC:
+            self._pending_action = None
+            await self._send(
+                f"Pending action expired ({int(age)}s old). Re-issue /flatten or /exit."
+            )
+            return
+        # Clear BEFORE dispatch so a double /confirm is a no-op even if the
+        # coordinator call is slow. Idempotency by construction.
+        self._pending_action = None
+        if pending.kind == "flatten":
+            result = await self._coordinator.flatten_all()
+            await self._send(self._format_flatten_result(result))
+        else:  # "exit"
+            assert pending.symbol is not None
+            result = await self._coordinator.exit_symbol(pending.symbol)
+            await self._send(self._format_exit_result(result))
+
+    @staticmethod
+    def _format_flatten_result(result: FlattenResult) -> str:
+        closed_count = sum(1 for c in result.closed if c.closed)
+        lines = [
+            f"Flatten complete: {closed_count} closed / "
+            f"{len(result.requested_symbols)} requested"
+        ]
+        for c in result.closed:
+            if c.closed:
+                if c.pnl is not None:
+                    lines.append(f"  {c.symbol}: {c.status} pnl=${c.pnl:.2f}")
+                else:
+                    lines.append(f"  {c.symbol}: {c.status}")
+            else:
+                lines.append(f"  {c.symbol}: skipped ({c.status})")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_exit_result(result: ExitResult) -> str:
+        c = result.result
+        if not c.closed:
+            return f"Exit {result.symbol} skipped: {c.status}"
+        if c.pnl is not None:
+            return f"Exit {result.symbol} {c.status}: pnl=${c.pnl:.2f}"
+        return f"Exit {result.symbol} {c.status}"
 
     async def aclose(self) -> None:
         await self._http.aclose()
