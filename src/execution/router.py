@@ -21,6 +21,7 @@ from ib_async import Contract, Trade
 from config.instruments import MNQ
 from src.clients.ib_client import IBClient
 from src.execution.bracket import build_bracket, build_protective_stop
+from src.execution.dirty_set import DirtySet
 from src.state_machine import (
     Direction,
     ExitReason,
@@ -43,6 +44,7 @@ class OrderRouter:
         sm: StateMachine,
         *,
         strategy_name: str,
+        dirty_set: DirtySet | None = None,
     ) -> None:
         self._ib = ib
         self._sm = sm
@@ -55,6 +57,14 @@ class OrderRouter:
         self._contracts: dict[str, Contract] = {}
         # order_ids whose fill should be attributed to EOD (vs natural TP/STOP).
         self._eod_orders: set[int] = set()
+        # PR #11 — opt-in dirty set so the reconciler can re-check lifecycles
+        # touched by recent events. None when run in isolation (e.g. unit tests
+        # that don't care about reconciliation).
+        self._dirty_set = dirty_set
+
+    def _mark_dirty(self, lifecycle_id: str) -> None:
+        if self._dirty_set is not None:
+            self._dirty_set.add(lifecycle_id)
 
     # -------------------------------------------------------------- registration
 
@@ -159,6 +169,7 @@ class OrderRouter:
         self._contracts[lc.lifecycle_id] = contract
         self._by_order_id[parent_order_id] = lc
         self._by_order_id[tp_order_id] = lc
+        self._mark_dirty(lc.lifecycle_id)
         return lc
 
     async def _close_pre_active(self, lc: Lifecycle, signal: Signal) -> None:
@@ -284,6 +295,7 @@ class OrderRouter:
 
         self._by_lifecycle_id[lc.lifecycle_id] = lc
         self._by_order_id[stp_order_id] = lc
+        self._mark_dirty(lc.lifecycle_id)
 
     async def _handle_exit_fill(
         self,
@@ -328,6 +340,7 @@ class OrderRouter:
             pnl_net=pnl_net,
         )
         self._by_lifecycle_id[lc.lifecycle_id] = lc
+        self._mark_dirty(lc.lifecycle_id)
 
         LOGGER.info(
             "[EXEC] %s: trade_closed — lifecycle=%s reason=%s pnl_net=%.2f",

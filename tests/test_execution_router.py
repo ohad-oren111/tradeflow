@@ -11,6 +11,7 @@ import pytest
 
 from config.instruments import MNQ
 from src.clients.ib_client import IBClient
+from src.execution.dirty_set import DirtySet
 from src.execution.router import OrderRouter
 from src.state_machine import (
     Direction,
@@ -372,3 +373,77 @@ def test_register_recovered_indexes_by_every_non_null_order_id():
     assert router._by_order_id[active_lc.entry_order_id] is active_lc  # type: ignore[index]
     assert router._by_order_id[active_lc.target_order_id] is active_lc  # type: ignore[index]
     assert router._by_order_id[active_lc.stop_order_id] is active_lc  # type: ignore[index]
+
+
+# ---------------------------------------------------------------- dirty_set hook
+
+
+async def test_place_entry_marks_lifecycle_dirty():
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    idle_lc = _make_lifecycle(State.IDLE)
+    entering_lc = _make_lifecycle(State.ENTERING)
+    sm.create_lifecycle.return_value = idle_lc
+    sm.transition.return_value = entering_lc
+    ib.place_order = AsyncMock(side_effect=[_make_trade(2001), _make_trade(2002)])
+
+    dirty = DirtySet()
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME, dirty_set=dirty)
+    await router.place_entry(_make_signal(), _make_contract())
+
+    assert entering_lc.lifecycle_id in dirty
+
+
+async def test_on_fill_parent_marks_lifecycle_dirty():
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    entering_lc = _make_lifecycle(State.ENTERING)
+    active_lc = _make_lifecycle(State.ACTIVE)
+    sm.transition.return_value = active_lc
+    ib.place_order = AsyncMock(return_value=_make_trade(3001))
+
+    dirty = DirtySet()
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME, dirty_set=dirty)
+    router._by_order_id[entering_lc.entry_order_id] = entering_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[entering_lc.lifecycle_id] = entering_lc
+    router._contracts[entering_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(entering_lc.entry_order_id, qty=2, price=17500.5)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    assert active_lc.lifecycle_id in dirty
+
+
+async def test_on_fill_exit_marks_lifecycle_dirty():
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    active_lc = _make_lifecycle(State.ACTIVE)
+    exiting_lc = _make_lifecycle(State.EXITING)
+    closed_lc = _make_lifecycle(State.CLOSED)
+    sm.transition = AsyncMock(side_effect=[exiting_lc, closed_lc])
+
+    dirty = DirtySet()
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME, dirty_set=dirty)
+    router._by_order_id[active_lc.target_order_id] = active_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[active_lc.lifecycle_id] = active_lc
+    router._contracts[active_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(active_lc.target_order_id, qty=2, price=17600.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    assert closed_lc.lifecycle_id in dirty
+
+
+async def test_router_without_dirty_set_is_safe_to_use():
+    """Back-compat: omit dirty_set → no-op _mark_dirty, no crash."""
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    idle_lc = _make_lifecycle(State.IDLE)
+    entering_lc = _make_lifecycle(State.ENTERING)
+    sm.create_lifecycle.return_value = idle_lc
+    sm.transition.return_value = entering_lc
+    ib.place_order = AsyncMock(side_effect=[_make_trade(2001), _make_trade(2002)])
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)  # no dirty_set
+    lc = await router.place_entry(_make_signal(), _make_contract())  # must not raise
+    assert lc is entering_lc
