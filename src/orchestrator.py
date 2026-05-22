@@ -25,7 +25,9 @@ from ib_async import Contract, Future
 from config.instruments import MNQ
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
+from src.execution.dirty_set import DirtySet
 from src.execution.force_close import EodForceClose
+from src.execution.reconciler import Reconciler
 from src.execution.router import OrderRouter
 from src.state_machine import Lifecycle, State, StateMachine
 from src.strategy import STRATEGY_NAME, Signal, Sma100BounceStrategy
@@ -61,8 +63,22 @@ class Orchestrator:
         self._enable_strategy = enable_strategy
         self._contract: Contract = _build_contract(instrument)
         self._strategy = Sma100BounceStrategy(instrument)
-        self._router = OrderRouter(ib=ib, sm=self._sm, strategy_name=STRATEGY_NAME)
+        # PR #11 — dirty set + halt flag + reconciler wired before any orders fly.
+        self._dirty_set = DirtySet()
+        self._halt_new_entries = False
+        self._router = OrderRouter(
+            ib=ib,
+            sm=self._sm,
+            strategy_name=STRATEGY_NAME,
+            dirty_set=self._dirty_set,
+        )
         self._eod = EodForceClose(self._router, self._sm, contract=self._contract)
+        self._reconciler = Reconciler(
+            ib=ib,
+            sm=self._sm,
+            dirty_set=self._dirty_set,
+            halt_callback=self._halt,
+        )
         self._background_tasks: list[asyncio.Task[Any]] = []
         self._bars: Any = None
 
@@ -232,9 +248,17 @@ class Orchestrator:
             return
         if self._loop is None:
             return
-        asyncio.run_coroutine_threadsafe(self._handle_signal(signal_or_none), self._loop)
+        asyncio.run_coroutine_threadsafe(self._handle_trade_signal(signal_or_none), self._loop)
 
-    async def _handle_signal(self, signal: Signal) -> None:
+    async def _handle_trade_signal(self, signal: Signal) -> None:
+        # PR #11 — drop new entries while the halt flag is set (foreign position
+        # detected; restart clears the flag — see PR #12 for the ack mechanism).
+        if self._halt_new_entries:
+            LOGGER.warning(
+                "[ORCH] signal: dropped — halt_new_entries=True signal=%s",
+                signal.direction,
+            )
+            return
         try:
             await self._router.place_entry(signal, self._contract)
         except Exception as exc:
@@ -245,6 +269,11 @@ class Orchestrator:
                 exc,
             )
 
+    def _halt(self, reason: str) -> None:
+        """Reconciler halt callback — flips the new-entry kill switch."""
+        self._halt_new_entries = True
+        LOGGER.warning("[ORCH] halt: new_entries_disabled — reason=%s", reason)
+
     def _launch_background_tasks(self) -> None:
         assert self._stop_event is not None
         eod_task = asyncio.create_task(
@@ -253,6 +282,12 @@ class Orchestrator:
         )
         self._background_tasks.append(eod_task)
         LOGGER.info("[EOD] task_launched — name=tradeflow-eod-force-close")
+        recon_task = asyncio.create_task(
+            self._reconciler.run_until_stopped(self._stop_event),
+            name="tradeflow-reconciler",
+        )
+        self._background_tasks.append(recon_task)
+        LOGGER.info("[RECON] task_launched — name=tradeflow-reconciler")
 
     async def _broker_field_updates_for(
         self, lifecycle: Lifecycle, target: State
