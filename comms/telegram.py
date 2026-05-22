@@ -156,7 +156,6 @@ class TelegramAlerter:
                 json={
                     "chat_id": self._operator_chat_id,
                     "text": text,
-                    "parse_mode": "Markdown",
                 },
             )
             if r.status_code == 200:
@@ -178,7 +177,10 @@ class TelegramAlerter:
     @staticmethod
     def _format_alert(msg: str) -> str:
         body = msg.replace(f"{ALERT_PREFIX} ", "", 1)
-        return f"🤖 *TradeFlow* — {body}"
+        # PR #15 — plain text only; legacy Markdown italicizes `_word_` and eats
+        # underscores in Python identifiers like `open_trades` / `net_liq`. See
+        # handoff §0.5.143.
+        return f"🤖 TradeFlow — {body}"
 
     async def alert_loop(self, stop_event: asyncio.Event) -> None:
         """Drain the alert queue → POST to Telegram. Runs until ``stop_event``."""
@@ -285,7 +287,7 @@ class TelegramAlerter:
         summary = await self._coordinator.get_broker_status_summary()
         halted = self._coordinator.is_halted()
         raised = self._coordinator.halt_raised_at()
-        lines = ["*Status*", f"halted: {'YES' if halted else 'no'}"]
+        lines = ["Status", f"halted: {'YES' if halted else 'no'}"]
         if halted and raised is not None:
             age = datetime.now(UTC) - raised
             lines.append(f"halt_raised_at: {raised.isoformat()} (age={age})")
