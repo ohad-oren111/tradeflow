@@ -391,7 +391,7 @@ async def test_poll_updates_returns_empty_on_ok_false():
 
 def test_format_alert_strips_prefix_and_decorates():
     formatted = TelegramAlerter._format_alert("[ALERT] entry_placed: symbol=MNQM6 qty=2")
-    assert formatted.startswith("🤖 *TradeFlow* — ")
+    assert formatted.startswith("🤖 TradeFlow — ")
     assert ALERT_PREFIX not in formatted
     assert "entry_placed" in formatted
 
