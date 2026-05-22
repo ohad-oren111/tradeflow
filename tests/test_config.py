@@ -18,16 +18,19 @@ def test_mnq_spec_matches_architecture_brief_v3() -> None:
 
 
 def test_risk_params_match_kickoff_section_3() -> None:
-    """Kickoff §3 — SMA100-bounce strategy parameters."""
+    """Kickoff §3 — MA50/MA100 bounce + ADX filter strategy parameters."""
     assert RISK.ma_fast == 50
     assert RISK.ma_slow == 100
-    assert RISK.touch_buffer_pts == 5.0
-    assert RISK.min_gap_pts == 2.0
-    assert RISK.sl_points == 75.0
-    assert RISK.trail_offset_pts == 150.0
+    assert RISK.ma_touch_buffer_pts == 5.0
+    assert RISK.ma_min_gap_pts == 2.0
+    assert RISK.stop_loss_pts == 75.0
+    assert RISK.take_profit_pts == 150.0
     assert RISK.cooldown_bars == 10
     assert RISK.contracts_per_trade == 2
     assert RISK.max_simultaneous_positions == 5
+    assert RISK.adx_period == 14
+    assert RISK.adx_min_threshold == 20.0
+    assert RISK.session_edge_no_trade_minutes == 5
 
 
 def test_kill_switch_thresholds() -> None:
@@ -42,6 +45,6 @@ def test_risk_per_trade_dollar_math() -> None:
     """75pt SL × $0.50/tick × 4 ticks/pt × 2 contracts = $300 max loss per trade.
     Verifies the tick math against §3 of v0 architecture brief."""
     ticks_per_point = 1.0 / MNQ.tick_size  # 4 ticks/pt
-    max_loss_per_contract = RISK.sl_points * ticks_per_point * MNQ.tick_value_usd
+    max_loss_per_contract = RISK.stop_loss_pts * ticks_per_point * MNQ.tick_value_usd
     max_loss_per_trade = max_loss_per_contract * RISK.contracts_per_trade
     assert max_loss_per_trade == 300.0
