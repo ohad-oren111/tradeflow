@@ -50,12 +50,15 @@ run_cmd() {
 echo "[CLEANUP] start: ts=$(date -u +%FT%TZ) dry_run=$DRY_RUN"
 
 # 1. /tmp files older than 7 days
+# Tolerate find returning non-zero from permission-denied directories
+# (e.g. systemd-private-*) — those are SKIPPED, not part of our cleanup scope.
+# The trailing `|| true` keeps set -e + pipefail happy on partial-permission /tmp.
 if path_is_allowed "/tmp"; then
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        count=$(find /tmp -mindepth 1 -mtime +7 2>/dev/null | wc -l)
+        count=$( { find /tmp -mindepth 1 -mtime +7 2>/dev/null || true; } | wc -l)
         echo "[CLEANUP] tmp: dry-run — would delete $count files in /tmp older than 7 days"
     else
-        deleted=$(find /tmp -mindepth 1 -mtime +7 -print -delete 2>/dev/null | wc -l)
+        deleted=$( { find /tmp -mindepth 1 -mtime +7 -print -delete 2>/dev/null || true; } | wc -l)
         echo "[CLEANUP] tmp: deleted $deleted files in /tmp older than 7 days"
     fi
 else
@@ -95,12 +98,16 @@ if path_is_allowed "$LOG_DIR"; then
         fi
     done
 
-    # Delete rotated logs older than 30 days
+    # Delete rotated logs older than 30 days — same pipefail-tolerant pattern
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        old_count=$(find "$LOG_DIR" -maxdepth 1 -name 'watchdog.log.*' -mtime +30 2>/dev/null | wc -l)
+        old_count=$(
+            { find "$LOG_DIR" -maxdepth 1 -name 'watchdog.log.*' -mtime +30 2>/dev/null || true; } | wc -l
+        )
         echo "[CLEANUP] log_rotate: dry-run — would delete $old_count rotated logs older than 30 days"
     else
-        old_deleted=$(find "$LOG_DIR" -maxdepth 1 -name 'watchdog.log.*' -mtime +30 -print -delete 2>/dev/null | wc -l)
+        old_deleted=$(
+            { find "$LOG_DIR" -maxdepth 1 -name 'watchdog.log.*' -mtime +30 -print -delete 2>/dev/null || true; } | wc -l
+        )
         echo "[CLEANUP] log_rotate: deleted $old_deleted rotated logs older than 30 days"
     fi
 else
