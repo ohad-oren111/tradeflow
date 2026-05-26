@@ -47,9 +47,32 @@ else
     esac
 fi
 
+# Detect an explicit python3.11+ binary that has ensurepip + venv. Avoid the
+# unversioned `python3`: on Ubuntu 22.04 that points to python3.10 which is
+# missing `ensurepip` from the system venv module, so `python3 -m venv` fails.
+# Order is descending preference — newer interpreter wins when present.
+detect_venv_python() {
+    local candidate
+    for candidate in python3.13 python3.12 python3.11; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            if "$candidate" -c 'import ensurepip, venv' >/dev/null 2>&1; then
+                echo "$candidate"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
 if [[ "$needs_venv" -eq 1 ]]; then
+    if ! venv_python=$(detect_venv_python); then
+        echo "[INSTALL] guard: no python3.11+ with ensurepip+venv found." >&2
+        echo "[INSTALL] guard: install with 'sudo apt install python3.11-venv'" >&2
+        exit 1
+    fi
     rm -rf "$VENV_DIR"
-    python3 -m venv "$VENV_DIR"
+    echo "[INSTALL] venv: creating with $venv_python -m venv $VENV_DIR"
+    "$venv_python" -m venv "$VENV_DIR"
     "$VENV_DIR/bin/pip" install --quiet --upgrade pip
     echo "[INSTALL] venv: created at $VENV_DIR (python=$("$VENV_DIR/bin/python" --version))"
 else

@@ -13,6 +13,7 @@ Mocking discipline (per project history of mocking traps):
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -54,14 +55,24 @@ def tmp_state(monkeypatch, tmp_path: Path) -> Path:
 
 def test_load_state_missing_returns_defaults(tmp_state):
     state = wd.load_state()
-    assert state == {"alert_history": {}, "auto_heal_history": [], "last_restart_counts": {}}
+    assert state == {
+        "alert_history": {},
+        "auto_heal_history": [],
+        "last_restart_counts": {},
+        "restart_loop_stable_cycles": 0,
+    }
 
 
 def test_load_state_corrupt_json_returns_defaults(tmp_state, caplog):
     (tmp_state / "state.json").write_text("{this is not json")
     with caplog.at_level("WARNING"):
         state = wd.load_state()
-    assert state == {"alert_history": {}, "auto_heal_history": [], "last_restart_counts": {}}
+    assert state == {
+        "alert_history": {},
+        "auto_heal_history": [],
+        "last_restart_counts": {},
+        "restart_loop_stable_cycles": 0,
+    }
     assert any("corrupt" in r.message for r in caplog.records)
 
 
@@ -599,3 +610,180 @@ def test_run_monitor_ib_recovery_clears_alert_and_notifies(monkeypatch, tmp_stat
     assert wd.ALERT_IB_API_DOWN not in saved["alert_history"]
     # RECOVERED message should have fired
     assert any("RECOVERED" in str(c) for c in mock_telegram.call_args_list)
+
+
+# ============================================================================
+# PR #31 additions
+# ============================================================================
+
+
+@pytest.fixture
+def clean_logger():
+    """Reset LOGGER.handlers around each test so configure_logging() can re-run."""
+    original = list(wd.LOGGER.handlers)
+    wd.LOGGER.handlers = []
+    yield
+    wd.LOGGER.handlers = original
+
+
+# ---- Fix B: TTY-conditional StreamHandler -----------------------------------
+
+
+def test_configure_logging_tty_adds_stream_handler(monkeypatch, tmp_state, clean_logger):
+    monkeypatch.setattr(wd, "_is_tty", lambda: True)
+    monkeypatch.delenv("WATCHDOG_FORCE_STREAM", raising=False)
+    wd.configure_logging()
+    types = [type(h) for h in wd.LOGGER.handlers]
+    assert logging.StreamHandler in types
+
+
+def test_configure_logging_no_tty_omits_stream_handler(monkeypatch, tmp_state, clean_logger):
+    monkeypatch.setattr(wd, "_is_tty", lambda: False)
+    monkeypatch.delenv("WATCHDOG_FORCE_STREAM", raising=False)
+    wd.configure_logging()
+    types = [type(h) for h in wd.LOGGER.handlers]
+    # FileHandler is still added; only the plain StreamHandler is suppressed.
+    assert logging.StreamHandler not in types
+    assert any("TimedRotating" in t.__name__ for t in types)
+
+
+def test_configure_logging_force_stream_env_overrides(monkeypatch, tmp_state, clean_logger):
+    monkeypatch.setattr(wd, "_is_tty", lambda: False)
+    monkeypatch.setenv("WATCHDOG_FORCE_STREAM", "1")
+    wd.configure_logging()
+    types = [type(h) for h in wd.LOGGER.handlers]
+    assert logging.StreamHandler in types
+
+
+# ---- Fix C: IB recovery log line --------------------------------------------
+
+
+def test_run_monitor_ib_recovery_logs_info_line(monkeypatch, tmp_state, caplog):
+    """Cycle-driven IB recovery must emit the canonical recovery: log line."""
+    _patch_all_green(monkeypatch)
+    seeded = {
+        "alert_history": {wd.ALERT_IB_API_DOWN: "2026-01-01T00:00:00+00:00"},
+        "auto_heal_history": [],
+        "last_restart_counts": {},
+    }
+    (tmp_state / "state.json").write_text(json.dumps(seeded))
+    monkeypatch.setattr(wd, "send_telegram", MagicMock(return_value=True))
+
+    with caplog.at_level(logging.INFO, logger=wd.LOGGER.name):
+        wd.run_monitor()
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("recovery: ib_api_down" in m for m in msgs), msgs
+
+
+# ---- Fix D: app_restart_loop dedup -----------------------------------------
+
+
+def _seed_restart_loop_alert(
+    tmp_state: Path,
+    *,
+    stable_cycles: int,
+    cur_count: int = 8,
+) -> dict:
+    """Seed state.json with an active app_restart_loop alert + stable counter."""
+    seeded = {
+        "alert_history": {
+            wd.ALERT_APP_RESTART_LOOP: datetime.now(UTC).isoformat(),
+        },
+        "auto_heal_history": [],
+        "last_restart_counts": {"tradeflow-app": cur_count},
+        "restart_loop_stable_cycles": stable_cycles,
+    }
+    (tmp_state / "state.json").write_text(json.dumps(seeded))
+    return seeded
+
+
+def _patch_restart_loop_probes(monkeypatch, *, cur_count: int) -> MagicMock:
+    """All green probes, with tradeflow-app's restart_count pinned."""
+    monkeypatch.setattr(wd, "probe_ib_api", lambda h, p, c: (True, "server_version=178"))
+
+    def app_probe(name):
+        if name == "tradeflow-app":
+            return (True, {"status": "running", "health": "healthy", "restart_count": cur_count})
+        return (True, {"status": "running", "health": "healthy", "restart_count": 0})
+
+    monkeypatch.setattr(wd, "probe_container", app_probe)
+    monkeypatch.setattr(wd, "probe_supabase", lambda u, k: (True, "http 200"))
+    monkeypatch.setattr(wd, "probe_dashboard", lambda: (True, "http 401"))
+    monkeypatch.setattr(wd, "probe_disk", lambda paths=None: (True, {"/": 20}))
+    monkeypatch.setattr(wd, "probe_memory", lambda meminfo_path=None: (True, {"used_pct": 30.0}))
+    mock_telegram = MagicMock(return_value=True)
+    monkeypatch.setattr(wd, "send_telegram", mock_telegram)
+    return mock_telegram
+
+
+def test_app_restart_loop_persists_after_single_stable_cycle(monkeypatch, tmp_state):
+    """One delta=0 cycle is NOT enough to clear the alert — the prior bug."""
+    _seed_restart_loop_alert(tmp_state, stable_cycles=0, cur_count=8)
+    mock_telegram = _patch_restart_loop_probes(monkeypatch, cur_count=8)
+
+    wd.run_monitor()
+
+    saved = json.loads((tmp_state / "state.json").read_text())
+    assert wd.ALERT_APP_RESTART_LOOP in saved["alert_history"], "alert cleared too eagerly"
+    assert saved["restart_loop_stable_cycles"] == 1
+    # No RECOVERED Telegram for restart-loop after a single stable cycle.
+    msgs = [str(c) for c in mock_telegram.call_args_list]
+    assert not any("restart loop stopped" in m for m in msgs), msgs
+
+
+def test_app_restart_loop_clears_after_three_stable_cycles(monkeypatch, tmp_state):
+    """At stable_cycles=2 going to 3, the alert clears and RECOVERED fires once."""
+    _seed_restart_loop_alert(tmp_state, stable_cycles=2, cur_count=8)
+    mock_telegram = _patch_restart_loop_probes(monkeypatch, cur_count=8)
+
+    wd.run_monitor()
+
+    saved = json.loads((tmp_state / "state.json").read_text())
+    assert wd.ALERT_APP_RESTART_LOOP not in saved["alert_history"]
+    assert saved["restart_loop_stable_cycles"] == 0
+    msgs = [str(c) for c in mock_telegram.call_args_list]
+    assert sum("restart loop stopped" in m for m in msgs) == 1, msgs
+
+
+def test_app_restart_loop_counter_resets_on_re_escalation(monkeypatch, tmp_state):
+    """Mid-cooldown new escalation: counter must reset to 0; alert deduped."""
+    _seed_restart_loop_alert(tmp_state, stable_cycles=2, cur_count=5)
+    # cur_count jumps from 5 → 11 → delta = 6 (≥ threshold)
+    mock_telegram = _patch_restart_loop_probes(monkeypatch, cur_count=11)
+
+    wd.run_monitor()
+
+    saved = json.loads((tmp_state / "state.json").read_text())
+    assert saved["restart_loop_stable_cycles"] == 0
+    # dedup still suppresses the resend within the 15-min window, so no new
+    # ALERT message; but the alert remains active in state.
+    assert wd.ALERT_APP_RESTART_LOOP in saved["alert_history"]
+    msgs = [str(c) for c in mock_telegram.call_args_list]
+    assert not any("restart loop stopped" in m for m in msgs), msgs
+
+
+def test_app_restart_loop_intermediate_stable_cycle_logs_progress(monkeypatch, tmp_state, caplog):
+    """During the cooldown, watchdog logs the stable-cycle count for observability."""
+    _seed_restart_loop_alert(tmp_state, stable_cycles=1, cur_count=8)
+    _patch_restart_loop_probes(monkeypatch, cur_count=8)
+
+    with caplog.at_level(logging.INFO, logger=wd.LOGGER.name):
+        wd.run_monitor()
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("app_restart_loop: stable cycle 2/" in m for m in msgs), msgs
+
+
+def test_default_state_includes_stable_cycles_counter():
+    s = wd._default_state()
+    assert s["restart_loop_stable_cycles"] == 0
+
+
+def test_load_state_backfills_stable_cycles_on_old_state(tmp_state):
+    """Migration: pre-PR-31 state files (no restart_loop_stable_cycles) get 0."""
+    (tmp_state / "state.json").write_text(
+        json.dumps({"alert_history": {}, "auto_heal_history": [], "last_restart_counts": {}})
+    )
+    state = wd.load_state()
+    assert state["restart_loop_stable_cycles"] == 0

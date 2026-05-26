@@ -49,6 +49,11 @@ ALERT_DEDUP_MINUTES = 15
 AUTO_HEAL_WINDOW_MINUTES = 60
 AUTO_HEAL_MAX_ATTEMPTS = 3
 RESTART_COUNT_DELTA_THRESHOLD = 3
+# After the restart-loop alert is active, require this many consecutive cycles
+# with delta=0 before clearing — a single stable cycle is not enough proof
+# the loop is over. PR #19 Task F surfaced multiple ALERTs firing during one
+# sustained event because the prior single-cycle clear was too eager.
+RESTART_LOOP_STABLE_CYCLES_TO_CLEAR = 3
 DISK_PCT_THRESHOLD = 85
 MEM_PCT_THRESHOLD = 90
 DASHBOARD_TIMEOUT_SEC = 5
@@ -72,7 +77,12 @@ def now_utc() -> datetime:
 
 
 def _default_state() -> dict:
-    return {"alert_history": {}, "auto_heal_history": [], "last_restart_counts": {}}
+    return {
+        "alert_history": {},
+        "auto_heal_history": [],
+        "last_restart_counts": {},
+        "restart_loop_stable_cycles": 0,
+    }
 
 
 def load_state() -> dict:
@@ -89,6 +99,7 @@ def load_state() -> dict:
     data.setdefault("alert_history", {})
     data.setdefault("auto_heal_history", [])
     data.setdefault("last_restart_counts", {})
+    data.setdefault("restart_loop_stable_cycles", 0)
     return data
 
 
@@ -470,6 +481,7 @@ def run_monitor() -> int:
             send_telegram(f"RECOVERED: IB API reachable — {detail_ib}")
             clear_alert(state, ALERT_IB_API_DOWN)
             clear_alert(state, ALERT_MANUAL_INTERVENTION)
+            LOGGER.info("[WATCHDOG] recovery: ib_api_down — sending Telegram message")
 
     ok_app, app_detail = probe_container("tradeflow-app")
     LOGGER.info(
@@ -490,6 +502,7 @@ def run_monitor() -> int:
     cur_rc = int(app_detail.get("restart_count", 0)) if isinstance(app_detail, dict) else 0
     prev_rc = int(last_counts.get("tradeflow-app", cur_rc))
     delta = cur_rc - prev_rc
+    stable_cycles = int(state.get("restart_loop_stable_cycles", 0))
     if delta >= RESTART_COUNT_DELTA_THRESHOLD:
         if should_send_alert(state, ALERT_APP_RESTART_LOOP):
             send_telegram(
@@ -497,9 +510,23 @@ def run_monitor() -> int:
                 f"(count={cur_rc})"
             )
             record_alert(state, ALERT_APP_RESTART_LOOP)
+        # Loop is active — any progress toward clear is invalidated.
+        state["restart_loop_stable_cycles"] = 0
     elif delta == 0 and ALERT_APP_RESTART_LOOP in state.get("alert_history", {}):
-        send_telegram("RECOVERED: tradeflow-app restart loop stopped")
-        clear_alert(state, ALERT_APP_RESTART_LOOP)
+        stable_cycles += 1
+        state["restart_loop_stable_cycles"] = stable_cycles
+        if stable_cycles >= RESTART_LOOP_STABLE_CYCLES_TO_CLEAR:
+            send_telegram("RECOVERED: tradeflow-app restart loop stopped")
+            clear_alert(state, ALERT_APP_RESTART_LOOP)
+            state["restart_loop_stable_cycles"] = 0
+            LOGGER.info("[WATCHDOG] recovery: app_restart_loop — sending Telegram message")
+        else:
+            LOGGER.info(
+                "[WATCHDOG] app_restart_loop: stable cycle %d/%d (not yet clearing)",
+                stable_cycles,
+                RESTART_LOOP_STABLE_CYCLES_TO_CLEAR,
+            )
+    # delta > 0 but below threshold: leave alert state and stable_cycles untouched.
     last_counts["tradeflow-app"] = cur_rc
 
     ok_ibgw, ibgw_detail = probe_container("tradeflow-ib-gateway")
@@ -675,6 +702,11 @@ def run_self_test() -> int:
     return 0 if sent else 1
 
 
+def _is_tty() -> bool:
+    """True when stderr is attached to a terminal — i.e. running interactively."""
+    return sys.stderr.isatty()
+
+
 def configure_logging() -> None:
     STATE_DIR.mkdir(mode=0o700, exist_ok=True, parents=True)
     if LOGGER.handlers:
@@ -683,11 +715,16 @@ def configure_logging() -> None:
         LOG_FILE, when="midnight", backupCount=14, encoding="utf-8"
     )
     file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     LOGGER.setLevel(logging.INFO)
     LOGGER.addHandler(file_handler)
-    LOGGER.addHandler(stream_handler)
+    # StreamHandler is added only for interactive invocations, or when the
+    # escape-hatch env var is set. Under cron, the crontab template already
+    # redirects stdout/stderr into watchdog.log via `>> ... 2>&1`, so adding
+    # the StreamHandler too would write every line twice.
+    if _is_tty() or os.environ.get("WATCHDOG_FORCE_STREAM") == "1":
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        LOGGER.addHandler(stream_handler)
 
 
 def main(argv: list[str] | None = None) -> int:
