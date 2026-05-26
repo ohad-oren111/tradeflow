@@ -1,0 +1,14 @@
+# tradeflow-watchdog — installed by scripts/install_watchdog.sh — DO NOT EDIT MANUALLY
+# Run installer to update. To remove: run scripts/uninstall_watchdog.sh.
+#
+# Monitor mode — every minute. cron runs in UTC by default; minute-level
+# granularity makes TZ irrelevant for this entry.
+* * * * * {{HOME}}/tradeflow/.watchdog-venv/bin/python {{REPO_DIR}}/scripts/tradeflow_watchdog.py --mode=monitor >> {{HOME}}/.tradeflow-watchdog/watchdog.log 2>&1
+#
+# Daily report — weekdays 09:00 America/New_York (handles DST automatically).
+CRON_TZ=America/New_York
+0 9 * * 1-5 {{HOME}}/tradeflow/.watchdog-venv/bin/python {{REPO_DIR}}/scripts/tradeflow_watchdog.py --mode=daily-report >> {{HOME}}/.tradeflow-watchdog/watchdog.log 2>&1
+#
+# Disk/log cleanup — daily 03:00 UTC.
+CRON_TZ=UTC
+0 3 * * * {{REPO_DIR}}/scripts/tradeflow_cleanup.sh >> {{HOME}}/.tradeflow-watchdog/cleanup.log 2>&1
