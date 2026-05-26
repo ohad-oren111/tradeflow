@@ -10,7 +10,7 @@ import pandas as pd
 
 from config.risk_params import RISK
 from src.indicators import add_all_indicators
-from src.strategy import Signal, Sma100BounceStrategy, detect_signal
+from src.strategy import Signal, Sma100BounceStrategy, _in_session_edge_window, detect_signal
 
 ET = ZoneInfo("America/New_York")
 
@@ -130,26 +130,43 @@ def test_no_signal_when_downtrend():
     assert signal is None  # SHORT branch deferred
 
 
-def test_no_signal_within_session_edge_open_window():
-    # Build a bar at 09:35 ET — within the 5-min open edge by default.
-    base_et = datetime(2026, 5, 21, 9, 35, tzinfo=ET)
-    # Warm MA100 with prior bars (also inside edge — but the gate only looks
-    # at the LAST bar's timestamp via on_new_bar; we want the LAST bar inside
-    # the edge window).
+def test_no_signal_during_daily_break_edge_via_on_new_bar():
+    # 17:30 ET Thursday — inside the daily CME maintenance break. Even with an
+    # engineered touch + bullish bar, the session-edge gate must suppress.
+    base_et = datetime(2026, 5, 21, 17, 30, tzinfo=ET)
     bars = _uptrend_bar_dicts(n=120)
-    bars[-1] = dict(bars[-1])
-    bars[-1]["time"] = base_et.astimezone(UTC)
+    df = pd.DataFrame(bars[:-1])
+    df = add_all_indicators(df)
+    ma_slow_prev = float(df["ma_slow"].iloc[-1])
+    last_close = ma_slow_prev + 12.0
+    bars[-1] = {
+        "time": base_et.astimezone(UTC),
+        "open": last_close - 1.0,
+        "high": last_close + 0.5,
+        "low": ma_slow_prev,
+        "close": last_close,
+    }
 
     strat = Sma100BounceStrategy("MNQM6")
     signal = _stuff_strategy(strat, bars)
     assert signal is None
 
 
-def test_no_signal_within_session_edge_close_window():
-    base_et = datetime(2026, 5, 21, 15, 58, tzinfo=ET)  # within 5min of 16:00
+def test_no_signal_after_friday_weekend_cutoff_via_on_new_bar():
+    # Fri 16:35 ET — past the 16:30 ET operator cutoff.
+    base_et = datetime(2026, 5, 22, 16, 35, tzinfo=ET)  # Friday
     bars = _uptrend_bar_dicts(n=120)
-    bars[-1] = dict(bars[-1])
-    bars[-1]["time"] = base_et.astimezone(UTC)
+    df = pd.DataFrame(bars[:-1])
+    df = add_all_indicators(df)
+    ma_slow_prev = float(df["ma_slow"].iloc[-1])
+    last_close = ma_slow_prev + 12.0
+    bars[-1] = {
+        "time": base_et.astimezone(UTC),
+        "open": last_close - 1.0,
+        "high": last_close + 0.5,
+        "low": ma_slow_prev,
+        "close": last_close,
+    }
 
     strat = Sma100BounceStrategy("MNQM6")
     signal = _stuff_strategy(strat, bars)
@@ -221,3 +238,146 @@ def test_mark_trade_closed_logs_cooldown_bars():
     assert strat._cooldown_bars_remaining == 0  # type: ignore[attr-defined]
     strat.mark_trade_closed()
     assert strat._cooldown_bars_remaining == RISK.cooldown_bars  # type: ignore[attr-defined]
+
+
+# ----------------------------------------------- 24/5 session edge window
+# Direct unit tests of ``_in_session_edge_window``. ``edge_minutes=5`` matches
+# ``RISK.session_edge_no_trade_minutes`` and is passed explicitly so the tests
+# don't depend on a global default. Wall-clock anchors are constructed in ET
+# and converted to UTC, the same way live bar timestamps reach the helper.
+
+
+def _et(year: int, month: int, day: int, hour: int, minute: int) -> datetime:
+    return datetime(year, month, day, hour, minute, tzinfo=ET).astimezone(UTC)
+
+
+class TestSessionEdgeWindow24x5:
+    EDGE = 5
+
+    def test_saturday_is_no_trade(self):
+        # 2026-05-23 is a Saturday.
+        assert _in_session_edge_window(_et(2026, 5, 23, 12, 0), self.EDGE) is True
+
+    def test_sunday_before_18_is_no_trade(self):
+        # Sun 17:55 ET — before the weekly open at 18:00.
+        assert _in_session_edge_window(_et(2026, 5, 24, 17, 55), self.EDGE) is True
+
+    def test_sunday_open_within_edge_is_no_trade(self):
+        # Sun 18:03 ET — 3 min into the post-open edge (5-min default).
+        assert _in_session_edge_window(_et(2026, 5, 24, 18, 3), self.EDGE) is True
+
+    def test_sunday_open_past_edge_is_tradable(self):
+        # Sun 18:06 ET — past the 5-min post-open edge.
+        assert _in_session_edge_window(_et(2026, 5, 24, 18, 6), self.EDGE) is False
+
+    def test_monday_morning_overnight_is_tradable(self):
+        # Mon 03:00 ET — deep overnight, far from any gate.
+        assert _in_session_edge_window(_et(2026, 5, 25, 3, 0), self.EDGE) is False
+
+    def test_monday_pre_break_edge_is_no_trade(self):
+        # Mon 16:57 ET — 3 min before the 17:00 break.
+        assert _in_session_edge_window(_et(2026, 5, 25, 16, 57), self.EDGE) is True
+
+    def test_monday_during_break_is_no_trade(self):
+        # Mon 17:30 ET — inside the CME daily maintenance break.
+        assert _in_session_edge_window(_et(2026, 5, 25, 17, 30), self.EDGE) is True
+
+    def test_monday_post_break_edge_is_no_trade(self):
+        # Mon 18:03 ET — 3 min into the 5-min post-break edge.
+        assert _in_session_edge_window(_et(2026, 5, 25, 18, 3), self.EDGE) is True
+
+    def test_monday_post_break_past_edge_is_tradable(self):
+        # Mon 18:06 ET — past the 5-min post-break edge.
+        assert _in_session_edge_window(_et(2026, 5, 25, 18, 6), self.EDGE) is False
+
+    def test_thursday_evening_after_break_is_tradable(self):
+        # Thu 22:00 ET — well after the daily break, before gateway restart.
+        assert _in_session_edge_window(_et(2026, 5, 21, 22, 0), self.EDGE) is False
+
+    def test_gateway_restart_window_is_no_trade(self):
+        # Thu 23:50 ET — inside the 23:45→00:15 ET gateway restart band.
+        assert _in_session_edge_window(_et(2026, 5, 21, 23, 50), self.EDGE) is True
+
+    def test_after_gateway_restart_is_tradable(self):
+        # Fri 00:20 ET — past the gateway restart window.
+        assert _in_session_edge_window(_et(2026, 5, 22, 0, 20), self.EDGE) is False
+
+    def test_friday_before_cutoff_is_tradable(self):
+        # Fri 14:00 ET — well before the operator weekend cutoff at 16:30.
+        assert _in_session_edge_window(_et(2026, 5, 22, 14, 0), self.EDGE) is False
+
+    def test_friday_pre_cutoff_edge_is_no_trade(self):
+        # Fri 16:27 ET — 3 min inside the 5-min pre-cutoff edge.
+        assert _in_session_edge_window(_et(2026, 5, 22, 16, 27), self.EDGE) is True
+
+    def test_friday_after_cutoff_is_no_trade(self):
+        # Fri 17:00 ET — past the 16:30 operator cutoff.
+        assert _in_session_edge_window(_et(2026, 5, 22, 17, 0), self.EDGE) is True
+
+    def test_zero_edge_minutes_keeps_break_window_no_trade(self):
+        # With edge_minutes=0 the pad collapses to zero, but the break itself
+        # is still no-trade. 17:30 ET on Mon is mid-break.
+        assert _in_session_edge_window(_et(2026, 5, 25, 17, 30), 0) is True
+
+    def test_dst_spring_forward_2026_03_08_boundary(self):
+        # 2026-03-08 02:00 ET → 03:00 ET (DST starts). zoneinfo handles the
+        # skip; we verify that mid-overnight is still tradable both sides of
+        # the boundary (Mon 02:30 doesn't exist, so use 04:00 instead).
+        assert _in_session_edge_window(_et(2026, 3, 9, 4, 0), self.EDGE) is False
+        # And the Sunday-before-open gate still fires the night of the change.
+        # 2026-03-08 is a Sunday; 17:30 ET is before the 18:00 weekly open.
+        assert _in_session_edge_window(_et(2026, 3, 8, 17, 30), self.EDGE) is True
+
+    def test_dst_fall_back_2026_11_01_boundary(self):
+        # 2026-11-01 02:00 ET → 01:00 ET (DST ends). The Friday before is
+        # 2026-10-30; the daily break still fires at 17:30 ET wall-clock.
+        assert _in_session_edge_window(_et(2026, 10, 30, 17, 30), self.EDGE) is True
+        # Sunday open still fires at 18:00 ET wall-clock post-DST.
+        assert _in_session_edge_window(_et(2026, 11, 1, 17, 30), self.EDGE) is True
+        assert _in_session_edge_window(_et(2026, 11, 1, 18, 6), self.EDGE) is False
+
+
+# ------------------------------------------------ 24/5 on_new_bar integration
+
+
+def test_on_new_bar_skips_signal_during_gateway_restart():
+    # Engineer a touch + bullish bar that WOULD fire under normal conditions,
+    # but stamp it inside the 23:45→00:15 ET gateway restart band.
+    bars = _uptrend_bar_dicts(n=120)
+    df = pd.DataFrame(bars[:-1])
+    df = add_all_indicators(df)
+    ma_slow_prev = float(df["ma_slow"].iloc[-1])
+    last_close = ma_slow_prev + 12.0
+    bars[-1] = {
+        "time": datetime(2026, 5, 21, 23, 55, tzinfo=ET).astimezone(UTC),
+        "open": last_close - 1.0,
+        "high": last_close + 0.5,
+        "low": ma_slow_prev,
+        "close": last_close,
+    }
+
+    strat = Sma100BounceStrategy("MNQM6")
+    signal = _stuff_strategy(strat, bars)
+    assert signal is None
+
+
+def test_on_new_bar_fires_signal_on_thursday_overnight():
+    # Same engineered bar, but stamped Thu 22:00 ET (tradable under 24/5,
+    # would have been gated out under the old RTH-only rule).
+    bars = _uptrend_bar_dicts(n=120)
+    df = pd.DataFrame(bars[:-1])
+    df = add_all_indicators(df)
+    ma_slow_prev = float(df["ma_slow"].iloc[-1])
+    last_close = ma_slow_prev + 12.0
+    bars[-1] = {
+        "time": datetime(2026, 5, 21, 22, 0, tzinfo=ET).astimezone(UTC),
+        "open": last_close - 1.0,
+        "high": last_close + 0.5,
+        "low": ma_slow_prev,
+        "close": last_close,
+    }
+
+    strat = Sma100BounceStrategy("MNQM6")
+    signal = _stuff_strategy(strat, bars)
+    assert signal is not None
+    assert signal.direction == "LONG"

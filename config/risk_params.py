@@ -38,22 +38,28 @@ class RiskParams:
     adx_period: int = 14
     adx_min_threshold: float = 20.0
 
-    # Session-edge no-trade window (minutes from RTH open and before RTH close)
+    # Session-edge buffer applied to every transition (Sunday open, CME daily
+    # break boundaries, Friday weekend cutoff). Minutes, wall-clock.
     session_edge_no_trade_minutes: int = 5
 
-    # Trading hours (America/New_York)
-    market_open_et: str = "09:30"
-    signal_scan_start_et: str = "09:35"  # 5min after open for SMA warmup
-    signal_scan_end_et: str = "15:50"  # 10min before close
-    force_close_et: str = "15:58"  # 2min before market close
-    market_close_et: str = "16:00"
+    # 24/5 CME futures session boundaries (America/New_York wall-clock).
+    sunday_open_et: str = "18:00"  # weekly open
+    daily_break_start_et: str = "17:00"  # CME maintenance break start (Mon–Thu)
+    daily_break_end_et: str = "18:00"  # CME maintenance break end (Mon–Thu)
 
-    # Weekend cutoff (per SeanBot pattern 8 — UTC, not ET)
+    # EOD force-close — fires on ``force_close_weekday`` at ``force_close_et``.
+    # Default is Friday at 16:25 ET (5 min before the weekend cutoff at 16:30 ET).
+    # Positions persist overnight Mon–Thu under 24/5.
+    force_close_et: str = "16:25"
+    force_close_weekday: int = 4  # Friday (Mon=0)
+
+    # Operator-imposed weekend flat cutoff (America/New_York wall-clock).
+    # Independent of CME's actual Friday 17:00 ET close so we get out 30 min early.
     weekend_flat_cutoff_weekday: int = 4  # Friday (Mon=0)
-    weekend_flat_cutoff_hour_utc: int = 20
-    weekend_flat_cutoff_minute_utc: int = 30
+    weekend_flat_cutoff_hour_et: int = 16
+    weekend_flat_cutoff_minute_et: int = 30
 
-    # Gateway restart window (no trading)
+    # IB Gateway daily restart window (no trading; may span midnight).
     gateway_restart_start_et: str = "23:45"
     gateway_restart_end_et: str = "00:15"
 
