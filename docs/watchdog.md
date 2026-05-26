@@ -39,6 +39,16 @@ Built to close the 85-hour silent-outage failure mode from Session 9: IB Gateway
                     Operator phone
 ```
 
+## Prerequisites
+
+Requires **Python 3.11+** on the host with the `venv` + `ensurepip` modules available. On Ubuntu 22.04, the default `python3` is 3.10 and the system venv module ships without `ensurepip`, so `python3 -m venv` fails. Install the matching venv package once:
+
+```
+sudo apt install python3.11-venv
+```
+
+The installer detects the highest available `python3.13` / `python3.12` / `python3.11` automatically and uses it explicitly — the unversioned `python3` is deliberately skipped.
+
 ## Installation
 
 Single command (idempotent — safe to re-run):
