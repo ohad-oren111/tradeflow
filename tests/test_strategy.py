@@ -11,7 +11,7 @@ import pandas as pd
 
 from config.risk_params import RISK
 from src.indicators import add_all_indicators
-from src.strategy import Signal, Sma100BounceStrategy, detect_signal
+from src.strategy import Signal, Sma100BounceStrategy, _regime_ok, detect_signal
 
 ET = ZoneInfo("America/New_York")
 
@@ -275,3 +275,76 @@ def test_mark_trade_closed_logs_cooldown_bars():
     assert strat._cooldown_bars_remaining == 0  # type: ignore[attr-defined]
     strat.mark_trade_closed()
     assert strat._cooldown_bars_remaining == RISK.cooldown_bars  # type: ignore[attr-defined]
+
+
+# ----------------------------------------- C1 regime gate (PR #33 addendum)
+# `_regime_ok` requires >=202 30-min bars to evaluate non-warmup behavior. The
+# Sma100BounceStrategy buffer caps at 150 1-min bars, so the live-path tests
+# below directly exercise `_regime_ok` with hand-built 30-min-spaced frames.
+# `test_regime_gate_fails_open_during_warmup` is the integration test that
+# confirms the gate doesn't break the existing 1-min strategy flow.
+
+
+def _thirty_minute_close_frame(
+    closes: list[float], *, start_ts: datetime | None = None
+) -> pd.DataFrame:
+    """Build a DataFrame with one row per ``closes`` value, 30-min spacing.
+
+    The 'time' column is UTC tz-aware so `_regime_ok` can resample cleanly.
+    """
+    if start_ts is None:
+        start_ts = datetime(2026, 5, 21, 0, 0, tzinfo=UTC)
+    times = [start_ts + pd.Timedelta(minutes=30 * i) for i in range(len(closes))]
+    return pd.DataFrame({"time": times, "close": closes})
+
+
+def test_regime_gate_blocks_long_when_price_below_30m_ema200(caplog):
+    """C1: when last 30-min price is at or below 30m EMA200, block."""
+    # 250 30-min bars in a strong downtrend so the latest close is well below
+    # the EMA200 of the resampled series. 250 >= 202 → past warmup.
+    closes = [18000.0 - i * 5.0 for i in range(250)]
+    df = _thirty_minute_close_frame(closes)
+
+    with caplog.at_level(logging.INFO, logger="src.strategy"):
+        ok = _regime_ok(df, RISK)
+
+    assert ok is False
+    blocked = [r.getMessage() for r in caplog.records if "regime gate BLOCKED" in r.getMessage()]
+    assert len(blocked) == 1
+    assert "30m EMA200" in blocked[0]
+
+
+def test_regime_gate_fails_open_during_warmup():
+    """A 1-min bar stream of 150 bars resamples to ~5 30-min bars → fail-open.
+
+    The strategy fixture flow is exactly what production sees, so this also
+    confirms the gate doesn't accidentally block when other gates would fire.
+    """
+    bars = _pullback_bar_dicts(n=120)
+    _engineer_fire_bar(bars)
+
+    strat = Sma100BounceStrategy("MNQM6")
+    signal = _stuff_strategy(strat, bars)
+    # If the regime gate were not failing-open during warmup the strategy would
+    # have rejected this otherwise-firing bar and signal would be None.
+    assert signal is not None
+    assert signal.direction == "LONG"
+
+
+def test_regime_gate_disabled_flag_bypasses_check():
+    """``regime_gate_enabled=False`` must skip the gate even when C1 would block."""
+    closes = [18000.0 - i * 5.0 for i in range(250)]  # same downtrend as C.1
+    df = _thirty_minute_close_frame(closes)
+
+    disabled = replace(RISK, regime_gate_enabled=False)
+    assert _regime_ok(df, disabled) is True
+
+
+def test_regime_gate_allows_long_when_price_above_30m_ema200():
+    """C1: when last 30-min price is above the 30m EMA200, allow."""
+    # Strong uptrend over 250 30-min bars so the latest close is well above
+    # the EMA200 level. 250 >= 202 → past warmup.
+    closes = [18000.0 + i * 5.0 for i in range(250)]
+    df = _thirty_minute_close_frame(closes)
+
+    assert _regime_ok(df, RISK) is True

@@ -38,6 +38,11 @@ class RiskParams:
     # Session-edge no-trade window (minutes from RTH open and before RTH close)
     session_edge_no_trade_minutes: int = 5
 
+    # SeanBot C1 regime gate — 30-min EMA200 level filter for LONG entries.
+    # When True, detect_signal blocks LONG signals if current price <= 30m EMA200.
+    # Fail-open on warmup (<202 30-min bars), missing timestamps, or exception.
+    regime_gate_enabled: bool = True
+
     # Trading hours (America/New_York)
     market_open_et: str = "09:30"
     signal_scan_start_et: str = "09:35"  # 5min after open for SMA warmup
