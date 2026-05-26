@@ -42,9 +42,14 @@ def _completed(
 
 @pytest.fixture
 def tmp_state(monkeypatch, tmp_path: Path) -> Path:
-    """Redirect STATE_DIR / STATE_FILE to a per-test temp dir."""
+    """Redirect STATE_DIR / STATE_FILE / LOG_FILE to a per-test temp dir.
+
+    Without LOG_FILE redirect, configure_logging() on a CI runner fails because
+    the real ~/.tradeflow-watchdog/ doesn't exist there.
+    """
     monkeypatch.setattr(wd, "STATE_DIR", tmp_path)
     monkeypatch.setattr(wd, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(wd, "LOG_FILE", tmp_path / "watchdog.log")
     return tmp_path
 
 
