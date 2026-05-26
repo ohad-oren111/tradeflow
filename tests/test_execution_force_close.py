@@ -77,7 +77,8 @@ def _make_contract() -> MagicMock:
 # ---------------------------------------------------------- next_trigger_at
 
 
-def test_next_trigger_at_returns_today_when_before_3_58pm_et():
+def test_next_trigger_at_thursday_morning_advances_to_friday_16_25_et():
+    # 24/5: EOD fires only on Friday at 16:25 ET. Thursday morning → Friday.
     router = _make_mock_router()
     sm = _make_mock_sm()
     eod = EodForceClose(router, sm, contract=_make_contract())
@@ -86,26 +87,30 @@ def test_next_trigger_at_returns_today_when_before_3_58pm_et():
     next_at = eod.next_trigger_at(now_et.astimezone(UTC))
 
     next_et = next_at.astimezone(ET)
-    assert next_et.date() == now_et.date()
-    assert next_et.hour == 15
-    assert next_et.minute == 58
+    assert next_et.weekday() == 4  # Friday
+    assert next_et.date() == datetime(2026, 5, 22).date()
+    assert next_et.hour == 16
+    assert next_et.minute == 25
 
 
-def test_next_trigger_at_rolls_to_next_weekday_when_after_3_58pm():
+def test_next_trigger_at_friday_morning_returns_today():
+    # Friday morning, before 16:25 ET → fire today.
     router = _make_mock_router()
     sm = _make_mock_sm()
     eod = EodForceClose(router, sm, contract=_make_contract())
 
-    now_et = datetime(2026, 5, 21, 17, 0, tzinfo=ET)  # Thursday evening
+    now_et = datetime(2026, 5, 22, 10, 0, tzinfo=ET)  # Friday morning
     next_at = eod.next_trigger_at(now_et.astimezone(UTC))
 
     next_et = next_at.astimezone(ET)
-    assert next_et.weekday() == 4  # Friday
-    assert next_et.hour == 15
-    assert next_et.minute == 58
+    assert next_et.date() == now_et.date()
+    assert next_et.weekday() == 4
+    assert next_et.hour == 16
+    assert next_et.minute == 25
 
 
-def test_next_trigger_at_skips_weekend():
+def test_next_trigger_at_friday_after_fire_advances_to_next_friday():
+    # Friday 17:00 ET (past 16:25 fire time) → next Friday.
     router = _make_mock_router()
     sm = _make_mock_sm()
     eod = EodForceClose(router, sm, contract=_make_contract())
@@ -114,25 +119,56 @@ def test_next_trigger_at_skips_weekend():
     next_at = eod.next_trigger_at(now_et.astimezone(UTC))
 
     next_et = next_at.astimezone(ET)
-    assert next_et.weekday() == 0  # Monday
-    assert next_et.hour == 15
-    assert next_et.minute == 58
+    assert next_et.weekday() == 4  # Friday
+    assert next_et.date() == datetime(2026, 5, 29).date()  # next Friday
+    assert next_et.hour == 16
+    assert next_et.minute == 25
 
 
-def test_next_trigger_at_uses_zoneinfo_for_dst():
-    """Both DST-active (summer) and DST-inactive (winter) produce 3:58pm ET local."""
+def test_next_trigger_at_saturday_advances_to_next_friday():
+    # Saturday → next Friday (6 days away).
     router = _make_mock_router()
     sm = _make_mock_sm()
     eod = EodForceClose(router, sm, contract=_make_contract())
 
-    summer_now_et = datetime(2026, 7, 15, 10, 0, tzinfo=ET)  # DST active
-    winter_now_et = datetime(2026, 1, 15, 10, 0, tzinfo=ET)  # DST inactive
+    now_et = datetime(2026, 5, 23, 10, 0, tzinfo=ET)  # Saturday morning
+    next_at = eod.next_trigger_at(now_et.astimezone(UTC))
+
+    next_et = next_at.astimezone(ET)
+    assert next_et.weekday() == 4
+    assert next_et.date() == datetime(2026, 5, 29).date()
+
+
+def test_next_trigger_at_sunday_evening_advances_to_friday():
+    # Sunday evening (after 18:00 ET weekly open) → upcoming Friday.
+    router = _make_mock_router()
+    sm = _make_mock_sm()
+    eod = EodForceClose(router, sm, contract=_make_contract())
+
+    now_et = datetime(2026, 5, 24, 19, 0, tzinfo=ET)
+    next_at = eod.next_trigger_at(now_et.astimezone(UTC))
+
+    next_et = next_at.astimezone(ET)
+    assert next_et.weekday() == 4
+    assert next_et.date() == datetime(2026, 5, 29).date()
+
+
+def test_next_trigger_at_uses_zoneinfo_for_dst():
+    """Both DST-active (summer) and DST-inactive (winter) produce 4:25pm ET local."""
+    router = _make_mock_router()
+    sm = _make_mock_sm()
+    eod = EodForceClose(router, sm, contract=_make_contract())
+
+    summer_now_et = datetime(2026, 7, 15, 10, 0, tzinfo=ET)  # Wed, DST active
+    winter_now_et = datetime(2026, 1, 14, 10, 0, tzinfo=ET)  # Wed, DST inactive
 
     summer_next_et = eod.next_trigger_at(summer_now_et.astimezone(UTC)).astimezone(ET)
     winter_next_et = eod.next_trigger_at(winter_now_et.astimezone(UTC)).astimezone(ET)
 
-    assert summer_next_et.hour == 15 and summer_next_et.minute == 58
-    assert winter_next_et.hour == 15 and winter_next_et.minute == 58
+    assert summer_next_et.hour == 16 and summer_next_et.minute == 25
+    assert summer_next_et.weekday() == 4
+    assert winter_next_et.hour == 16 and winter_next_et.minute == 25
+    assert winter_next_et.weekday() == 4
 
 
 # ---------------------------------------------------------------- fire_once

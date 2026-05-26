@@ -37,6 +37,29 @@ def test_long_market_tp_child_has_transmit_true_lmt_at_target():
     assert tp.transmit is True
 
 
+def test_bracket_tp_child_is_gtc_so_it_survives_daily_break_and_overnight():
+    # Under 24/5 trading the position can be open across the CME maintenance
+    # break and the next trading day; the TP leg MUST be GTC or it expires at
+    # the close of the daily session. Paired with the GTC STP from
+    # build_protective_stop so both protective legs persist.
+    _parent_long, tp_long = build_bracket(
+        direction=Direction.LONG,
+        qty=2,
+        entry_type="MKT",
+        entry_lmt_price=None,
+        target_price=17600.0,
+    )
+    _parent_short, tp_short = build_bracket(
+        direction=Direction.SHORT,
+        qty=1,
+        entry_type="MKT",
+        entry_lmt_price=None,
+        target_price=17400.0,
+    )
+    assert tp_long.tif == "GTC"
+    assert tp_short.tif == "GTC"
+
+
 def test_long_lmt_parent_carries_lmt_price():
     parent, _tp = build_bracket(
         direction=Direction.LONG,

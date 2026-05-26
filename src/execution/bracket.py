@@ -70,7 +70,10 @@ def build_bracket(
     tp_child.orderType = "LMT"
     tp_child.lmtPrice = float(target_price)
     tp_child.transmit = True
-    tp_child.tif = "DAY"
+    # GTC so the TP leg survives the daily CME maintenance break and overnight
+    # gap window under 24/5 trading — paired with the GTC STP placed after
+    # parent fill in :func:`build_protective_stop`.
+    tp_child.tif = "GTC"
     # parentId is left as the default 0 — OrderRouter stitches it after
     # IB.placeOrder assigns the parent orderId.
 
