@@ -18,18 +18,16 @@ def test_mnq_spec_matches_architecture_brief_v3() -> None:
 
 
 def test_risk_params_match_kickoff_section_3() -> None:
-    """Kickoff §3 — MA50/MA100 bounce + ADX filter strategy parameters."""
+    """Kickoff §3 + PR #33 SeanBot V3 realignment — MA100 pullback strategy."""
     assert RISK.ma_fast == 50
     assert RISK.ma_slow == 100
     assert RISK.ma_touch_buffer_pts == 5.0
-    assert RISK.ma_min_gap_pts == 2.0
+    assert RISK.ma_min_gap_pts == 0.5  # PR #33: lowered 2.0 -> 0.5 per SeanBot V3
     assert RISK.stop_loss_pts == 75.0
     assert RISK.take_profit_pts == 150.0
     assert RISK.cooldown_bars == 10
     assert RISK.contracts_per_trade == 2
     assert RISK.max_simultaneous_positions == 5
-    assert RISK.adx_period == 14
-    assert RISK.adx_min_threshold == 20.0
     assert RISK.session_edge_no_trade_minutes == 5
 
 

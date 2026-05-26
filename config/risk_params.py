@@ -1,12 +1,13 @@
-"""Risk parameters. Defaults from SeanBot + kickoff §3.
+"""Risk parameters. Defaults aligned with SeanBot V3 ``config/settings.py``.
 
-Field names aligned with the SeanBot signal-detection reference in PR #10:
+Field names aligned with the SeanBot signal-detection reference:
 - ma_touch_buffer_pts / ma_min_gap_pts / stop_loss_pts / take_profit_pts
   replace touch_buffer_pts / min_gap_pts / sl_points / trail_offset_pts.
-- adx_min_threshold / adx_period / session_edge_no_trade_minutes added for the
-  MA50/MA100 bounce + ADX filter strategy.
+- ``session_edge_no_trade_minutes`` gates session-edge bars.
 
-No value tuning vs the prior defaults — only field renames + additions.
+PR #33: ``ma_min_gap_pts`` default lowered 2.0 → 0.5 to match SeanBot V3
+``config/settings.py:44``. ``adx_period`` and ``adx_min_threshold`` dropped —
+the strategy no longer reads the ADX column.
 """
 
 from dataclasses import dataclass
@@ -29,14 +30,10 @@ class RiskParams:
     ma_fast: int = 50
     ma_slow: int = 100
     ma_touch_buffer_pts: float = 5.0
-    ma_min_gap_pts: float = 2.0
+    ma_min_gap_pts: float = 0.5  # SeanBot V3 config/settings.py:44
     stop_loss_pts: float = 75.0
     take_profit_pts: float = 150.0
     cooldown_bars: int = 10
-
-    # ADX trend-strength filter
-    adx_period: int = 14
-    adx_min_threshold: float = 20.0
 
     # Session-edge no-trade window (minutes from RTH open and before RTH close)
     session_edge_no_trade_minutes: int = 5
