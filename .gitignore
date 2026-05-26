@@ -42,3 +42,9 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# tradeflow watchdog (host-side, never in repo)
+.watchdog-venv/
+.tradeflow-watchdog/
+**/watchdog.log*
+**/cleanup.log*
