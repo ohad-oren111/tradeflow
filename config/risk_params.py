@@ -43,6 +43,11 @@ class RiskParams:
     daily_break_start_et: str = "17:00"  # CME maintenance break start (Mon–Thu)
     daily_break_end_et: str = "18:00"  # CME maintenance break end (Mon–Thu)
 
+    # SeanBot C1 regime gate — 30-min EMA200 level filter for LONG entries.
+    # When True, detect_signal blocks LONG signals if current price <= 30m EMA200.
+    # Fail-open on warmup (<202 30-min bars), missing timestamps, or exception.
+    regime_gate_enabled: bool = True
+
     # EOD force-close — fires on ``force_close_weekday`` at ``force_close_et``.
     # Default is Friday at 16:25 ET (5 min before the weekend cutoff at 16:30 ET).
     # Positions persist overnight Mon–Thu under 24/5.

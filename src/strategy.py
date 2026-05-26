@@ -60,6 +60,43 @@ class Signal:
 _TOUCH_LOWER_BAND_PTS = 15.0  # SeanBot ma_bounce.py:123 hardcodes -15 lower bound
 
 
+def _regime_ok(df: pd.DataFrame, params: RiskParams) -> bool:
+    """C1 regime gate (SeanBot ma_bounce.py:55-91, shipped 2026-05-18).
+
+    Block LONG entries when current price is at or below the 30-min EMA200.
+    Fail-open on warmup (<202 30-min bars), missing timestamps, or exception —
+    mirrors SeanBot's defensive semantics so a misconfigured frame never
+    silently disables every other strategy gate.
+    """
+    if not params.regime_gate_enabled:
+        return True
+    try:
+        close = df["close"]
+        if not isinstance(close.index, pd.DatetimeIndex):
+            if "time" in df.columns:
+                # TradeFlow uses 'time' (UTC datetime); SeanBot uses 'date'.
+                close = df.set_index("time")["close"]
+            else:
+                return True  # no timestamps — fail open
+        bars_30m = close.resample("30min").last().dropna()
+        if len(bars_30m) < 202:
+            return True  # warmup — fail open
+        ema = bars_30m.ewm(span=200, adjust=False).mean()
+        ema200_level = float(ema.iloc[-1])
+        last_price = float(close.iloc[-1])
+        if last_price <= ema200_level:
+            LOGGER.info(
+                "[STRAT] regime gate BLOCKED entry: price=%.2f <= 30m EMA200=%.2f",
+                last_price,
+                ema200_level,
+            )
+            return False
+        return True
+    except Exception as e:
+        LOGGER.warning("[STRAT] regime gate error (fail-open): %s", e)
+        return True
+
+
 def detect_signal(
     df: pd.DataFrame,
     instrument: str,
@@ -81,6 +118,12 @@ def detect_signal(
         return None
 
     rp = params if params is not None else RISK
+
+    # SeanBot C1 regime gate — checked first (mirrors ma_bounce.py:101) so the
+    # blocking decision precedes any indicator math on a downtrend bar.
+    if not _regime_ok(df, rp):
+        return None
+
     buf = buffer_pts if buffer_pts is not None else rp.ma_touch_buffer_pts
     gap_min = min_gap_pts if min_gap_pts is not None else rp.ma_min_gap_pts
     sl_pts = rp.stop_loss_pts
