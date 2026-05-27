@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import signal
+import socket
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -26,7 +27,7 @@ from ib_async import Contract, Future
 
 from comms.telegram import TelegramAlerter
 from config.instruments import MNQ
-from src.clients.ib_client import IBClient
+from src.clients.ib_client import BrokerExtendedOutageError, IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.execution.dirty_set import DirtySet
 from src.execution.force_close import EodForceClose
@@ -34,6 +35,16 @@ from src.execution.reconciler import Reconciler
 from src.execution.router import CloseResult, OrderRouter
 from src.state_machine import Lifecycle, State, StateMachine
 from src.strategy import STRATEGY_NAME, Signal, Sma100BounceStrategy
+
+# Transient broker disconnects worth catching mid-loop and triggering a
+# resilient reconnect rather than orchestrator exit. Mirrors the tuple in
+# ``src.clients.ib_client._TRANSIENT_CONNECT_EXC`` — kept local to avoid a
+# back-reference import. ConnectionError covers Refused / Reset / Aborted.
+_TRANSIENT_BROKER_EXC: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    socket.gaierror,
+    ConnectionError,
+)
 
 
 @dataclass
@@ -69,6 +80,10 @@ class Orchestrator:
         instrument: str = "MNQM6",
         bar_size: str = "1 min",
         enable_strategy: bool = True,
+        reconnect_max_attempts: int = 30,
+        reconnect_backoff_initial_sec: float = 2.0,
+        reconnect_backoff_max_sec: float = 30.0,
+        reconnect_connect_timeout_sec: float = 20.0,
     ) -> None:
         self._ib = ib
         self._db = db
@@ -81,6 +96,10 @@ class Orchestrator:
         self._instrument = instrument
         self._bar_size = bar_size
         self._enable_strategy = enable_strategy
+        self._reconnect_max_attempts = reconnect_max_attempts
+        self._reconnect_backoff_initial_sec = reconnect_backoff_initial_sec
+        self._reconnect_backoff_max_sec = reconnect_backoff_max_sec
+        self._reconnect_connect_timeout_sec = reconnect_connect_timeout_sec
         self._contract: Contract = _build_contract(instrument)
         self._strategy = Sma100BounceStrategy(instrument)
         # PR #11 — dirty set + halt flag + reconciler wired before any orders fly.
@@ -120,7 +139,15 @@ class Orchestrator:
         try:
             await self._startup()
             while not self._stop_event.is_set():
-                await self._healthcheck_once()
+                try:
+                    await self._healthcheck_once()
+                except _TRANSIENT_BROKER_EXC as exc:
+                    LOGGER.warning(
+                        "[ORCH] healthcheck: transient_disconnect — type=%s msg=%s",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    await self._resilient_reconnect()
                 try:
                     await asyncio.wait_for(
                         self._stop_event.wait(),
@@ -128,6 +155,21 @@ class Orchestrator:
                     )
                 except TimeoutError:
                     continue
+        except BrokerExtendedOutageError as exc:
+            # Clean exit (code 0) so docker recreates the container as a last
+            # resort. Distinct from the catch-all below: this is an EXPECTED
+            # escalation path, not a programming error.
+            LOGGER.error(
+                "[ORCH] shutdown: extended_outage — attempts=%d elapsed=%.1fs last=%s",
+                exc.attempts,
+                exc.elapsed_sec,
+                type(exc.last_exc).__name__,
+            )
+            LOGGER.info(
+                "[ALERT] extended_outage: attempts=%d elapsed_sec=%.1f",
+                exc.attempts,
+                exc.elapsed_sec,
+            )
         except Exception as exc:
             LOGGER.error(
                 "[ORCH] shutdown: exception — type=%s msg=%s",
@@ -139,6 +181,26 @@ class Orchestrator:
             await self._shutdown(exit_code)
 
         return exit_code
+
+    async def _resilient_reconnect(self) -> None:
+        """Reconnect the broker socket with exponential backoff.
+
+        Emits an ``[ALERT]`` line on success so Telegram surfaces the recovery
+        to the operator. Raises ``BrokerExtendedOutageError`` if max_attempts
+        is exhausted — caller in ``run()`` clean-exits on that.
+        """
+        started = time.monotonic()
+        await self._ib.connect_with_resilience(
+            max_attempts=self._reconnect_max_attempts,
+            backoff_initial_sec=self._reconnect_backoff_initial_sec,
+            backoff_max_sec=self._reconnect_backoff_max_sec,
+            connect_timeout_sec=self._reconnect_connect_timeout_sec,
+        )
+        elapsed = time.monotonic() - started
+        LOGGER.info(
+            "[ALERT] reconnect_recovered: elapsed_sec=%.1f",
+            elapsed,
+        )
 
     async def _startup(self) -> None:
         import os
@@ -155,7 +217,12 @@ class Orchestrator:
             getattr(self._ib, "_port", "?"),
             getattr(self._ib, "_client_id", "?"),
         )
-        await self._ib.connect()
+        await self._ib.connect_with_resilience(
+            max_attempts=self._reconnect_max_attempts,
+            backoff_initial_sec=self._reconnect_backoff_initial_sec,
+            backoff_max_sec=self._reconnect_backoff_max_sec,
+            connect_timeout_sec=self._reconnect_connect_timeout_sec,
+        )
         server_version = self._safe_server_version()
         LOGGER.info("[ORCH] startup: ib_connected — server_version=%s", server_version)
 

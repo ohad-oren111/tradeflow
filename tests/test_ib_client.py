@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import socket
+
 import pytest
 
-from src.clients.ib_client import IBClient
+from src.clients.ib_client import (
+    BrokerExtendedOutageError,
+    IBClient,
+    connect_with_resilience,
+)
 
 
 async def test_connect_calls_connect_async_with_expected_args(mock_ib_factory):
@@ -110,3 +116,127 @@ def test_disconnect_invokes_underlying_when_connected(mock_ib_factory):
     client.disconnect()
 
     fake_ib.disconnect.assert_called_once()
+
+
+# ----------------------------------------------------------- resilience layer
+
+
+async def test_connect_with_resilience_retries_gaierror(mock_ib_factory):
+    fake_ib = mock_ib_factory()
+    fake_ib.isConnected.return_value = True
+    # side_effect: 3 gaierror failures then 1 success = 4 calls total.
+    fake_ib.connectAsync.side_effect = [
+        socket.gaierror(-3, "Temporary failure in name resolution"),
+        socket.gaierror(-3, "Temporary failure in name resolution"),
+        socket.gaierror(-3, "Temporary failure in name resolution"),
+        None,
+    ]
+
+    result = await connect_with_resilience(
+        "ib-gateway",
+        4004,
+        1,
+        ib=fake_ib,
+        max_attempts=10,
+        backoff_initial_sec=0.01,
+        backoff_max_sec=0.05,
+        backoff_factor=1.1,
+        jitter_pct=0.0,
+        connect_timeout_sec=0.5,
+    )
+
+    assert result is fake_ib
+    assert fake_ib.connectAsync.await_count == 4
+    # All call args identical — clientId stable across retries.
+    for call in fake_ib.connectAsync.await_args_list:
+        assert call.args == ("ib-gateway", 4004)
+        assert call.kwargs["clientId"] == 1
+
+
+async def test_connect_with_resilience_retries_timeout(mock_ib_factory):
+    fake_ib = mock_ib_factory()
+    fake_ib.isConnected.return_value = True
+    # side_effect: 1 TimeoutError then 1 success = 2 calls total.
+    fake_ib.connectAsync.side_effect = [TimeoutError(), None]
+
+    result = await connect_with_resilience(
+        "h",
+        4002,
+        1,
+        ib=fake_ib,
+        max_attempts=5,
+        backoff_initial_sec=0.01,
+        backoff_max_sec=0.02,
+        jitter_pct=0.0,
+        connect_timeout_sec=0.5,
+    )
+
+    assert result is fake_ib
+    assert fake_ib.connectAsync.await_count == 2
+
+
+async def test_connect_with_resilience_raises_after_max_attempts(mock_ib_factory):
+    fake_ib = mock_ib_factory()
+    fake_ib.isConnected.return_value = False
+    # side_effect: always gaierror = exactly max_attempts calls.
+    fake_ib.connectAsync.side_effect = socket.gaierror(-3, "unreachable")
+
+    with pytest.raises(BrokerExtendedOutageError) as exc_info:
+        await connect_with_resilience(
+            "h",
+            4002,
+            1,
+            ib=fake_ib,
+            max_attempts=4,
+            backoff_initial_sec=0.01,
+            backoff_max_sec=0.02,
+            jitter_pct=0.0,
+            connect_timeout_sec=0.5,
+        )
+
+    assert exc_info.value.attempts == 4
+    assert isinstance(exc_info.value.last_exc, socket.gaierror)
+    assert fake_ib.connectAsync.await_count == 4
+
+
+async def test_connect_with_resilience_propagates_non_transient_exceptions(mock_ib_factory):
+    fake_ib = mock_ib_factory()
+    fake_ib.isConnected.return_value = False
+    # side_effect: non-transient ValueError on first attempt = 1 call, no retry.
+    fake_ib.connectAsync.side_effect = ValueError("bad credentials")
+
+    with pytest.raises(ValueError, match="bad credentials"):
+        await connect_with_resilience(
+            "h",
+            4002,
+            1,
+            ib=fake_ib,
+            max_attempts=10,
+            backoff_initial_sec=0.01,
+            backoff_max_sec=0.02,
+            jitter_pct=0.0,
+            connect_timeout_sec=0.5,
+        )
+
+    assert fake_ib.connectAsync.await_count == 1
+
+
+async def test_ibclient_connect_with_resilience_uses_wrapped_ib(mock_ib_factory):
+    fake_ib = mock_ib_factory()
+    fake_ib.isConnected.return_value = True
+    # side_effect: 1 transient then success = 2 calls total via the IBClient method.
+    fake_ib.connectAsync.side_effect = [TimeoutError(), None]
+
+    client = IBClient(host="ib-gateway", port=4004, client_id=1, ib_factory=lambda: fake_ib)
+    await client.connect_with_resilience(
+        max_attempts=5,
+        backoff_initial_sec=0.01,
+        backoff_max_sec=0.02,
+        jitter_pct=0.0,
+        connect_timeout_sec=0.5,
+    )
+
+    assert fake_ib.connectAsync.await_count == 2
+    # The IBClient method reuses self._ib — clientId carried through unchanged.
+    for call in fake_ib.connectAsync.await_args_list:
+        assert call.kwargs["clientId"] == 1

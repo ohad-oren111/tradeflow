@@ -47,6 +47,10 @@ def _build_orchestrator_from_env() -> Orchestrator:
             "Populate SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env before then."
         )
     interval = float(os.environ.get("ORCH_HEALTHCHECK_INTERVAL_SEC", "60"))
+    reconnect_max_attempts = int(os.environ.get("IBKR_RECONNECT_MAX_ATTEMPTS", "30"))
+    reconnect_backoff_initial = float(os.environ.get("IBKR_RECONNECT_BACKOFF_INITIAL_SEC", "2.0"))
+    reconnect_backoff_max = float(os.environ.get("IBKR_RECONNECT_BACKOFF_MAX_SEC", "30.0"))
+    reconnect_connect_timeout = float(os.environ.get("IBKR_RECONNECT_CONNECT_TIMEOUT_SEC", "20.0"))
 
     ib = IBClient(host=host, port=port, client_id=client_id)
     db = SupabaseClient(url=supabase_url, key=supabase_key)
@@ -55,6 +59,10 @@ def _build_orchestrator_from_env() -> Orchestrator:
         db,
         paper_account=paper_account,
         healthcheck_interval=interval,
+        reconnect_max_attempts=reconnect_max_attempts,
+        reconnect_backoff_initial_sec=reconnect_backoff_initial,
+        reconnect_backoff_max_sec=reconnect_backoff_max,
+        reconnect_connect_timeout_sec=reconnect_connect_timeout,
     )
 
 

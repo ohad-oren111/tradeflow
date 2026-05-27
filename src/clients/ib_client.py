@@ -7,7 +7,11 @@ bar subscription helper. Existing method signatures are unchanged.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
+import socket
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -16,6 +20,107 @@ from ib_async import IB, BarDataList, Contract, Order, PortfolioItem, Position, 
 LOGGER = logging.getLogger(__name__)
 
 BarCallback = Callable[[dict], Awaitable[None]] | Callable[[dict], None]
+
+# Transient exceptions worth retrying. ConnectionError is the parent of
+# ConnectionRefusedError / ConnectionResetError / BrokenPipeError, which is
+# what ib_async surfaces when the gateway socket closes mid-handshake or
+# during a scheduled restart.
+_TRANSIENT_CONNECT_EXC: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    socket.gaierror,
+    ConnectionError,
+)
+
+
+class BrokerExtendedOutageError(Exception):
+    """Raised when :func:`connect_with_resilience` exhausts ``max_attempts``.
+
+    The orchestrator treats this as the signal to clean-exit so docker can
+    recreate the container as a last resort. Carries ``attempts`` and
+    ``elapsed_sec`` for the shutdown log line.
+    """
+
+    def __init__(self, attempts: int, elapsed_sec: float, last_exc: BaseException) -> None:
+        super().__init__(
+            f"broker connect exhausted after {attempts} attempts in "
+            f"{elapsed_sec:.1f}s — last error: {type(last_exc).__name__}: {last_exc}"
+        )
+        self.attempts = attempts
+        self.elapsed_sec = elapsed_sec
+        self.last_exc = last_exc
+
+
+async def connect_with_resilience(
+    host: str,
+    port: int,
+    client_id: int,
+    *,
+    ib: IB | None = None,
+    max_attempts: int = 30,
+    backoff_initial_sec: float = 2.0,
+    backoff_max_sec: float = 30.0,
+    backoff_factor: float = 1.5,
+    jitter_pct: float = 0.2,
+    connect_timeout_sec: float = 20.0,
+) -> IB:
+    """Connect to IB Gateway with DNS-aware exponential backoff.
+
+    Retries on socket.gaierror (DNS), TimeoutError, ConnectionRefusedError,
+    ConnectionResetError, and the broader ConnectionError family that
+    ib_async surfaces when the gateway socket closes. Other exceptions
+    propagate unchanged on the first attempt.
+
+    Raises BrokerExtendedOutageError if max_attempts is exhausted.
+    """
+    if ib is None:
+        ib = IB()
+    started = time.monotonic()
+    backoff = backoff_initial_sec
+    last_exc: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await ib.connectAsync(host, port, clientId=client_id, timeout=connect_timeout_sec)
+        except _TRANSIENT_CONNECT_EXC as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                break
+            jitter = 1.0 + random.uniform(-jitter_pct, jitter_pct)
+            sleep_for = min(backoff * jitter, backoff_max_sec)
+            LOGGER.warning(
+                "[CONN] reconnect attempt %d/%d backoff=%.1fs reason=%s — %s",
+                attempt,
+                max_attempts,
+                sleep_for,
+                type(exc).__name__,
+                exc,
+            )
+            await asyncio.sleep(sleep_for)
+            backoff = min(backoff * backoff_factor, backoff_max_sec)
+            continue
+        elapsed = time.monotonic() - started
+        server_version: Any = "unknown"
+        try:
+            if ib.isConnected():
+                server_version = ib.client.serverVersion()
+        except Exception:
+            pass
+        LOGGER.info(
+            "[CONN] connected — server_version=%s client_id=%s elapsed=%.1fs attempts=%d",
+            server_version,
+            client_id,
+            elapsed,
+            attempt,
+        )
+        return ib
+    elapsed = time.monotonic() - started
+    assert last_exc is not None
+    LOGGER.error(
+        "[CONN] extended_outage — attempts=%d elapsed=%.1fs last=%s",
+        max_attempts,
+        elapsed,
+        type(last_exc).__name__,
+    )
+    raise BrokerExtendedOutageError(max_attempts, elapsed, last_exc)
 
 
 class IBClient:
@@ -51,6 +156,35 @@ class IBClient:
         )
         server_version = self._ib.client.serverVersion() if self._ib.isConnected() else "unknown"
         LOGGER.info("[ib_client] connected — server_version=%s", server_version)
+
+    async def connect_with_resilience(
+        self,
+        *,
+        max_attempts: int = 30,
+        backoff_initial_sec: float = 2.0,
+        backoff_max_sec: float = 30.0,
+        backoff_factor: float = 1.5,
+        jitter_pct: float = 0.2,
+        connect_timeout_sec: float = 20.0,
+    ) -> None:
+        """Retry-aware connect against the wrapped IB instance.
+
+        Reuses the existing ``self._ib`` so listeners / event subscriptions
+        wired previously on the instance survive a reconnect. The wrapped
+        socket is replaced on a successful ``connectAsync``.
+        """
+        await connect_with_resilience(
+            self._host,
+            self._port,
+            self._client_id,
+            ib=self._ib,
+            max_attempts=max_attempts,
+            backoff_initial_sec=backoff_initial_sec,
+            backoff_max_sec=backoff_max_sec,
+            backoff_factor=backoff_factor,
+            jitter_pct=jitter_pct,
+            connect_timeout_sec=connect_timeout_sec,
+        )
 
     def disconnect(self) -> None:
         """Disconnect from IB Gateway. No-op when already disconnected."""
