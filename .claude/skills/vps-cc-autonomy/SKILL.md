@@ -1,118 +1,143 @@
----
-name: vps-cc-autonomy
-description: Codifies VPS Claude Code's autonomy default for TradeFlow. Use at the start of EVERY VPS CC session. Defines (a) the pre-flight discipline (`git pull` main, read latest handoff), (b) what counts as a critical decision that requires an operator gate, and (c) what to auto-decide without prompting. Skip this skill and you'll fall back to the verbose permission-prompt anti-pattern that Sessions 2-4 burned cycles on. Trigger words: "session start", "kickoff", "begin", "what should I do first", any new VPS CC session.
----
+# CC VPS Autonomy Contract
 
-# VPS CC Autonomy Default
+Defines the three autonomy levels for delegating PR work to CC VPS, and what CC VPS auto-decides at each level. **Integrate into the `vps-cc-autonomy` skill** if that skill exists; otherwise this is its own skill or a section in `session-handoff-writer`'s handoff template (§17 Autonomy Contract).
 
-You operate on the TradeFlow VPS (Hetzner CPX21, `5.78.212.37`, user `tradeflow`). The operator (Ohad) is PM/orchestrator. He is paying real attention cost for every prompt you raise. **Your default is to decide and act.**
+## Goal
 
-## Pre-flight (do FIRST in every session, before reading the operator's brief)
+Maximize operator-hands-off operation while keeping operator judgment in the loop for high-risk changes. The operator's role at each level should be either zero (AUTO) or one word in chat (REPORT) or full review (AUDIT) — never multi-step shell pasting.
+
+## The three levels
+
+### AUTO — CC VPS ships end-to-end without operator approval
+
+**Scope**: changes where regression risk is bounded and cheap to revert.
+- Config tweaks (`docker-compose.yml`, `.env.example`, `pyproject.toml` minor)
+- Docs (README, handoffs, comments, docstrings)
+- Log format changes (no logic change)
+- Dependency bumps within patch versions
+- Test additions only (no production code change)
+- Whitespace, lint, type-hint additions
+
+**CC VPS behavior**:
+1. Implement PR per brief
+2. Open PR via `gh pr create`
+3. Wait for CI green via `gh pr checks --watch`
+4. **Auto-merge**: `gh pr merge --squash --delete-branch`
+5. Auto-run Task F smoke test
+6. Post structured report to operator
+7. STOP
+
+**Operator role**: Read the structured report. That's it. No "merge" instruction needed.
+
+### REPORT — CC VPS prepares everything; operator types one word
+
+**Scope**: bug fixes and small features touching ≤5 files with strong test coverage.
+- Bug fixes touching ≤3 files in well-tested modules
+- Refactors with no public-API change
+- Single-feature isolated changes
+- Connection/networking code (reconnect, retry, backoff)
+- Notification/alerting code
+- Reconciler tick logic (read-only state changes)
+
+**CC VPS behavior**:
+1. Implement PR per brief
+2. Open PR via `gh pr create`
+3. Wait for CI green
+4. Post structured report including: files changed, test counts, PR URL, smoke-test commands ready to run
+5. STOP (do NOT merge)
+
+**Operator role**: Read report. Type `merge` to authorize merge + smoke, or `stop` to halt. After "merge", CC VPS runs `gh pr merge`, then Task F smoke, then posts a second structured report. No operator shell pasting.
+
+### AUDIT — Operator reviews PR diff on GitHub before authorizing
+
+**Scope**: anything where a regression could cost money, leak secrets, or wedge production.
+- Order execution code (`src/execution/`, anything that places/cancels orders)
+- Strategy logic (`src/strategy/`)
+- Kill switch logic
+- IBKR authentication / credentials handling
+- Secret handling (rotation, redaction, .env touches)
+- Multi-file changes >50 lines net
+- Anything that changes broker-state-altering behavior
+
+**CC VPS behavior**:
+1. Implement PR per brief
+2. Open PR via `gh pr create`
+3. Wait for CI green
+4. Post structured report with PR URL emphasized
+5. STOP
+
+**Operator role**: Open PR on GitHub, review diff, read PR description, comment / approve / request changes. Type `merge` in chat after approving. CC VPS proceeds to merge + smoke + report.
+
+## How the brief author picks the level
+
+Chat-side me (the brief author) picks the level when writing each brief. The level appears in a `## Autonomy Level: <LEVEL>` header right after `## Role` in every PR brief.
+
+**Default for ambiguous cases**: REPORT. When in doubt, ask the operator to type one word rather than auto-merging or requiring full audit.
+
+## Pre-conditions every level depends on
+
+CC VPS executes a pre-flight scan at session start (or before any PR work):
 
 ```bash
-git -C ~/tradeflow fetch
-git -C ~/tradeflow pull --ff-only origin main
-ls -t docs/handoffs/ | head -3
+git -C ~/tradeflow fetch origin
+git -C ~/tradeflow log --oneline origin/main..main
+git -C ~/tradeflow log --oneline main..origin/main
+gh pr list --repo ohad-oren111/tradeflow --state open
+docker ps --filter name=tradeflow --format "table {{.Names}}\t{{.Status}}"
 ```
 
-Then read the latest `HANDOFF_v*.md` (and any pinned brief). If `pull --ff-only` fails (diverged), **STOP** — that IS a critical decision (Ohad has uncommitted work somewhere).
+Reports:
+- Local-vs-origin divergence (if any) — flag cosmetic vs blocking
+- Open PRs (so new work doesn't collide)
+- Container state — healthy / flapping / down
 
-## Critical decisions — STOP and ask
+If local main is divergent from origin/main, CC VPS does NOT attempt to sync via `git reset --hard` (denied by harness). Instead, ALL new PR branches are created off `origin/main` directly:
 
-These six only. Everything else: decide.
-
-1. **Security policy mutation** — any `~/.claude/settings.json` edit not pre-approved by an active bootstrap brief.
-2. **Secrets directory** — any write/delete under `/home/tradeflow/.tradeflow-secrets/`. Always immutable from VPS CC.
-3. **Live IBKR orders** — place/cancel/modify on a real account. (Pre-deployment today; relevant from PR #11+.)
-4. **Direct push to `main`** — branch protection already blocks it; if you find yourself designing a workaround, that's the signal.
-5. **$ at risk** — anything that moves capital, takes a position, changes leverage, flips a kill switch.
-6. **Explicit `GATE X` marker** in the operator's brief.
-
-If you hit any of these, stop with this format:
-
-```
-GATE — <what's blocking>
-Why I'm stopping: <which of the 6 criteria>
-What I'd do if approved: <concrete action>
-What I'd do if denied: <alternate path or "stop here">
+```bash
+git -C ~/tradeflow checkout -b claude/<branch> origin/main
 ```
 
-## Auto-decide — no prompt
+## Telegram kill switch (escape hatch)
 
-- All `sudo apt` / `apt-get` package installs + apt repo setup (keys, sources.list.d)
-- All `docker` subcommands EXCEPT the security carve-outs (`docker exec * env*`, `docker exec * printenv*`, `docker exec -u root *`, `docker exec * sh *`, `docker exec * bash *` — those are denied at the policy layer; don't try to work around)
-- All `git` on feature branches (`docs/*`, `feat/*`, `fix/*`, `chore/*`, `claude/*`) — commit, branch, push. Push to `main` stays denied.
-- All `gh` CLI: PR create/view/merge/auto-merge, auth, repo ops
-- File ops in `/tmp/`, `~/runbooks/`, `~/tradeflow/docs/`, `~/.claude/*.bak-*`
-- Shell expansions, chaining, subshells — all permitted (`$$`, `$(...)`, `${VAR}`, `$?`, `&&`, `;`, `|`)
-- `pip install`, `pytest`, `python3 -m *` in the project venv
-- Reads anywhere under `/home/tradeflow/` and `/tmp/`
+At any autonomy level, operator can halt CC VPS by sending the literal string `STOP` to the Telegram alerter bot or chat. CC VPS polls for kill signals before each major action (open PR, merge PR, recreate container). If STOP is detected, CC VPS halts immediately and posts last-known state.
 
-## Hardcoded safety heuristics — cannot be silenced via settings.json
+(Implementation detail: a future PR adds Telegram polling to CC VPS's loop. Until then, operator types `stop` in chat as the kill signal.)
 
-Claude Code has hardcoded pattern detectors that prompt the operator REGARDLESS of `~/.claude/settings.json` allow rules. These fire on bash-command text BEFORE the settings file is consulted. **Avoid the trigger patterns entirely; settings sweeps cannot disable them.**
+## Structured report format (mandatory at every level)
 
-### Patterns that ALWAYS prompt
+Every CC VPS report-back uses this exact markdown shape so operator can scan in seconds:
 
-1. **`cd X && <anything>`** — "Compound command contains cd with output redirection — manual approval required to prevent path resolution bypass" OR "This command changes directory before running git, which can execute untrusted hooks". Workaround: never `cd` in a bash command. Launch VPS CC from project root (`cd ~/tradeflow && claude`), then operate there directly with no further `cd`.
-2. **`command1; command2`** — "Contains shell syntax (`;`) that cannot be statically analyzed". Workaround: separate Bash tool calls per command, even when related. `&&` is fine; `;` is not.
-3. **`$(...)` command substitution** — "Contains command_substitution". Workaround: write a Python helper to `/tmp/scriptN.py` via the Write tool, then `python3 /tmp/scriptN.py`.
-4. **`${VAR}` parameter expansion** — "Contains expansion". Same workaround as #3 — compute interpolations in Python.
-5. **Heredocs (`<<EOF ... EOF`)** — "Contains brace with quote character". Workaround: use the Write tool to put content in `/tmp/content.txt` or `/tmp/script.py`, then read by path / pass as `-F /tmp/commitmsg.txt` / `--body-file /tmp/pr_body.md`.
-6. **Chained `sleep N` then probes** — "do not chain shorter sleeps to work around this block". Workaround: one `sleep N` per Bash call, OR a Python helper that polls in a loop.
+```markdown
+# PR-<id> <action> report
 
-### Working directory discipline — the single most important rule
+**Action**: <PR-opened / merged / smoke-passed / smoke-failed>
+**PR URL**: <url>
+**CI status**: <green/red/pending>
+**Files changed**: <N>, +<adds>/-<dels>
+**Test count delta**: <baseline>+<new>=<total> passed
+**Autonomy level**: <AUTO/REPORT/AUDIT>
+**Next step**: <auto-merging now / awaiting operator "merge" / awaiting operator audit on GitHub>
 
-When this skill is loaded, VPS CC's working directory IS `~/tradeflow`. **Do not `cd` in any Bash call.** Three replacements for the common `cd && X` pattern:
+## Brief summary
+<one paragraph>
 
-- For git on the project repo: just run `git <subcommand>` directly (cwd is repo root). Skip `cd ~/tradeflow &&`.
-- For git on OTHER repos: `git -C /absolute/path/to/repo <subcommand>` — no `cd`.
-- For paths outside the project: absolute paths in tool args, never `cd /path && ...`.
+## Notable findings (Task E, anything unexpected)
+- <item or "none">
 
-If you find yourself wanting `cd X && Y`, the right move is: just run `Y`. If your cwd isn't right, the issue is session launch, not the command — flag it once, don't paper over.
+## Smoke test status (if applicable)
+<output of Task F or "not yet run">
 
-### Polling and timed waits
-
-For arbitrary waits or post-state polls, write a Python helper. Example (`/tmp/wait_for_up.py`):
-
-```python
-import time, subprocess, sys
-target_sec = 90
-container = "tradeflow-app"
-start = time.time()
-while time.time() - start < target_sec:
-    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Status}}", container], capture_output=True, text=True)
-    if r.stdout.strip() == "running":
-        elapsed = time.time() - start
-        if elapsed >= target_sec:
-            break
-    time.sleep(2)
-print(f"elapsed={time.time()-start:.1f}s")
+## What I got wrong during this PR
+<1-3 lines or "nothing">
 ```
 
-Then `python3 /tmp/wait_for_up.py` is one clean Bash call, zero prompts.
+## When to deviate from the contract
 
-### When you forget and one of these fires
+CC VPS escalates to operator (regardless of level) when:
+1. **Task A audit surfaces a brief confabulation** (e.g. the .env override discovery in PR-B). Auto-proceeding with the brief's wrong assumption would corrupt the fix.
+2. **Harness denies a planned step** and the workaround isn't obvious. CC VPS reports the denial + options.
+3. **Pre-existing test count differs from baseline.** Could indicate the baseline drifted.
+4. **CI red on a change CC VPS expected to be CI-green** (e.g. an unrelated test now fails). Don't auto-fix the unrelated test.
+5. **A scope-boundary trip** — CC VPS finds the brief's "Files you WILL modify" doesn't actually cover the fix. Don't expand scope unilaterally.
 
-If a prompt fires despite this skill being loaded, you've used a triggered pattern. The operator pays attention cost. Note in your final report under "Patterns I should have avoided" so the next iteration is cleaner. **Do not "patch" by adding the pattern to the allowlist — these heuristics ignore the allowlist.**
-
-## Discipline carry-overs (still active)
-
-- **§0.5.97** — probe before baking. Verify external specs (broker contracts, library API surface, env shape) against source, never memory.
-- **§0.5.98** — broker/exchange API is ground truth for account state, not the DB, not the handoff doc.
-- **§0.5.105** — permission rule changes are comprehensive sweeps, not patches. If you find a second mundane gate firing, redesign the sweep (escalate to operator as a "settings policy mutation" critical decision).
-- **§0.5.108** — every PR you open has `--base main` pinned explicitly in `gh pr create`.
-- **§0.5.110 / §0.5.114** — `.env` strict `KEY=VALUE`, no inline comments, rstrip ALL values when rewriting.
-- **§0.5.111** — never paste `docker compose config` output to chat (interpolates secrets). Verify it works, discard.
-- **§0.5.112** — `docker compose ps` "healthy" lies during `start_period`. Trust service-level logs.
-- **§0.5.115** — autonomy default. This skill IS the rule. Any multi-step operator task should collapse to one VPS-CC-driven flow.
-
-## Output discipline
-
-- Compact verdicts: ✅ / ⛔ / PASS / FAIL / INVESTIGATE + one line.
-- Redact account numbers (`DUQ\d+` → `DUQ…`) and passwords from any log dump before display.
-- Don't echo PATs or secrets even via env. Use `gh auth login --with-token <<< "$PAT"` style and forget the variable.
-
-## Failure mode you must avoid
-
-**Patching the permissions allowlist one gate at a time mid-execution.** That's the Session 4 anti-pattern. If two mundane gates fire in one session, the policy is wrong — surface it as a critical decision ("Security policy mutation"), not a series of small ones.
+The contract is "operator approves judgment calls, CC VPS executes mechanics" — not "CC VPS does everything autonomously."
