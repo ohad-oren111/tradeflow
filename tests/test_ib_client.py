@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import socket
+from unittest.mock import MagicMock
 
 import pytest
 
 from src.clients.ib_client import (
     BrokerExtendedOutageError,
     IBClient,
+    _wire_bar_callback,
     connect_with_resilience,
 )
 
@@ -240,3 +243,65 @@ async def test_ibclient_connect_with_resilience_uses_wrapped_ib(mock_ib_factory)
     # The IBClient method reuses self._ib — clientId carried through unchanged.
     for call in fake_ib.connectAsync.await_args_list:
         assert call.kwargs["clientId"] == 1
+
+
+# ------------------------------------------------------------ bar callback wiring
+
+
+class _FakeEvent:
+    """Minimal stand-in for ib_async ``Event`` that captures ``+=`` handlers."""
+
+    def __init__(self) -> None:
+        self.handlers: list = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+
+class _FakeBars(list):
+    """List subclass that mimics ``BarDataList`` shape (carries ``contract`` + ``updateEvent``)."""
+
+    def __init__(self, items, contract=None) -> None:
+        super().__init__(items)
+        self.contract = contract
+        self.updateEvent = _FakeEvent()
+
+
+def _capture_adapter(bars: _FakeBars, callback) -> object:
+    """Wire the adapter via the public API and return the handler that was installed."""
+    _wire_bar_callback(bars, callback)
+    assert len(bars.updateEvent.handlers) == 1, "expected exactly one adapter wired"
+    return bars.updateEvent.handlers[0]
+
+
+def test_adapter_logs_bar_on_new_bar(caplog):
+    bar = MagicMock(close=21500.25, date="2026-05-27T20:30:00")
+    contract = MagicMock(localSymbol="MNQM6")
+    bars = _FakeBars([bar], contract=contract)
+    callback = MagicMock(return_value=None)
+    adapter = _capture_adapter(bars, callback)
+
+    with caplog.at_level(logging.INFO, logger="src.clients.ib_client"):
+        adapter(bars, True)
+
+    bar_logs = [r for r in caplog.records if r.getMessage().startswith("[BAR]")]
+    assert len(bar_logs) == 1
+    message = bar_logs[0].getMessage()
+    assert "MNQM6" in message
+    assert "21500.25" in message
+    assert "2026-05-27T20:30:00" in message
+
+
+def test_adapter_no_log_when_no_new_bar(caplog):
+    bar = MagicMock(close=21500.25, date="2026-05-27T20:30:00")
+    contract = MagicMock(localSymbol="MNQM6")
+    bars = _FakeBars([bar], contract=contract)
+    callback = MagicMock(return_value=None)
+    adapter = _capture_adapter(bars, callback)
+
+    with caplog.at_level(logging.INFO, logger="src.clients.ib_client"):
+        adapter(bars, False)
+
+    bar_logs = [r for r in caplog.records if r.getMessage().startswith("[BAR]")]
+    assert len(bar_logs) == 0

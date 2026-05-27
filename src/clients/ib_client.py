@@ -330,6 +330,12 @@ def _wire_bar_callback(bars: BarDataList, on_new_bar: BarCallback) -> None:
         if not has_new_bar or not bars_obj:
             return
         last = bars_obj[-1]
+        LOGGER.info(
+            "[BAR] %s: new — close=%.2f ts=%s",
+            getattr(getattr(bars_obj, "contract", None), "localSymbol", None) or "?",
+            last.close,
+            last.date,
+        )
         payload: dict[str, Any] = {
             "time": getattr(last, "date", None),
             "open": getattr(last, "open", None),
