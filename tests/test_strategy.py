@@ -443,6 +443,8 @@ def test_on_new_bar_fires_signal_on_thursday_overnight():
     signal = _stuff_strategy(strat, bars)
     assert signal is not None
     assert signal.direction == "LONG"
+
+
 # ----------------------------------------- C1 regime gate (PR #33 addendum)
 # `_regime_ok` requires >=202 30-min bars to evaluate non-warmup behavior. The
 # Sma100BounceStrategy buffer caps at 150 1-min bars, so the live-path tests
