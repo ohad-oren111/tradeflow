@@ -25,18 +25,14 @@ class RiskParams:
     max_contracts_per_trade: int = 2
     contracts_per_trade: int = 2  # default standard sizing
 
-    # Strategy parameters (per kickoff §3 — MA50/MA100 bounce + ADX filter)
+    # Strategy parameters (per kickoff §3 — MA50/MA100 bounce, no ADX after PR #33)
     ma_fast: int = 50
     ma_slow: int = 100
     ma_touch_buffer_pts: float = 5.0
-    ma_min_gap_pts: float = 2.0
+    ma_min_gap_pts: float = 0.5  # SeanBot V3 config/settings.py:44 (PR #33)
     stop_loss_pts: float = 75.0
     take_profit_pts: float = 150.0
     cooldown_bars: int = 10
-
-    # ADX trend-strength filter
-    adx_period: int = 14
-    adx_min_threshold: float = 20.0
 
     # Session-edge buffer applied to every transition (Sunday open, CME daily
     # break boundaries, Friday weekend cutoff). Minutes, wall-clock.
@@ -46,6 +42,11 @@ class RiskParams:
     sunday_open_et: str = "18:00"  # weekly open
     daily_break_start_et: str = "17:00"  # CME maintenance break start (Mon–Thu)
     daily_break_end_et: str = "18:00"  # CME maintenance break end (Mon–Thu)
+
+    # SeanBot C1 regime gate — 30-min EMA200 level filter for LONG entries.
+    # When True, detect_signal blocks LONG signals if current price <= 30m EMA200.
+    # Fail-open on warmup (<202 30-min bars), missing timestamps, or exception.
+    regime_gate_enabled: bool = True
 
     # EOD force-close — fires on ``force_close_weekday`` at ``force_close_et``.
     # Default is Friday at 16:25 ET (5 min before the weekend cutoff at 16:30 ET).

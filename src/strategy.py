@@ -1,7 +1,12 @@
-"""SeanBot V2 signal detection — MA100 bounce with candle confirmation + ADX filter.
+"""SeanBot V3-aligned signal detection — MA100 pullback with candle confirmation.
 
-Strategy LONG: MA50 > MA100, ADX >= 20, price touches MA100, bullish candle close.
-Entry at candle close. SL = 75 points from entry. TP = 150 points from entry.
+Strategy LONG: ``MA100 > MA50`` (recent pullback inside a larger uptrend per
+SeanBot ``strategy/ma_bounce.py:122``), price touches MA100 inside a windowed
+band ``low ∈ [MA100-15, MA100+5]``, bullish candle close ``close > open``, and
+``abs(MA100-MA50) >= MA_MIN_GAP`` (SeanBot V3 default 0.5). Entry at candle
+close. SL = 75 points from entry. TP = 150 points from entry. No ADX filter
+and no regime gate (the operator deferred SeanBot's C1 regime gate
+deliberately — see PR #33 description §E.1 for the risk callout).
 
 SHORT branch deferred to a post-paper-graduation PR.
 
@@ -52,29 +57,75 @@ class Signal:
     timestamp: datetime | None = None
 
 
+_TOUCH_LOWER_BAND_PTS = 15.0  # SeanBot ma_bounce.py:123 hardcodes -15 lower bound
+
+
+def _regime_ok(df: pd.DataFrame, params: RiskParams) -> bool:
+    """C1 regime gate (SeanBot ma_bounce.py:55-91, shipped 2026-05-18).
+
+    Block LONG entries when current price is at or below the 30-min EMA200.
+    Fail-open on warmup (<202 30-min bars), missing timestamps, or exception —
+    mirrors SeanBot's defensive semantics so a misconfigured frame never
+    silently disables every other strategy gate.
+    """
+    if not params.regime_gate_enabled:
+        return True
+    try:
+        close = df["close"]
+        if not isinstance(close.index, pd.DatetimeIndex):
+            if "time" in df.columns:
+                # TradeFlow uses 'time' (UTC datetime); SeanBot uses 'date'.
+                close = df.set_index("time")["close"]
+            else:
+                return True  # no timestamps — fail open
+        bars_30m = close.resample("30min").last().dropna()
+        if len(bars_30m) < 202:
+            return True  # warmup — fail open
+        ema = bars_30m.ewm(span=200, adjust=False).mean()
+        ema200_level = float(ema.iloc[-1])
+        last_price = float(close.iloc[-1])
+        if last_price <= ema200_level:
+            LOGGER.info(
+                "[STRAT] regime gate BLOCKED entry: price=%.2f <= 30m EMA200=%.2f",
+                last_price,
+                ema200_level,
+            )
+            return False
+        return True
+    except Exception as e:
+        LOGGER.warning("[STRAT] regime gate error (fail-open): %s", e)
+        return True
+
+
 def detect_signal(
     df: pd.DataFrame,
     instrument: str,
     buffer_pts: float | None = None,
     min_gap_pts: float | None = None,
-    min_adx: float | None = None,
     *,
     params: RiskParams | None = None,
 ) -> Signal | None:
     """Inspect the latest fully-formed bar in ``df`` and return a Signal or None.
 
-    Caller is expected to pre-populate ``ma_fast``, ``ma_slow``, ``adx`` columns
-    via :func:`src.indicators.add_all_indicators`. ``buffer_pts``, ``min_gap_pts``,
-    ``min_adx`` override the corresponding risk_params values when provided —
-    used by tests to vary thresholds without monkeypatching the global RISK.
+    Caller is expected to pre-populate ``ma_fast``, ``ma_slow`` columns via
+    :func:`src.indicators.add_all_indicators`. ``buffer_pts`` and
+    ``min_gap_pts`` override the corresponding risk_params values when
+    provided — used by tests to vary thresholds without monkeypatching the
+    global RISK. PR #33 removed the ``min_adx`` override; the strategy no
+    longer reads the adx column.
     """
     if len(df) < 2:
         return None
 
     rp = params if params is not None else RISK
+
+    # SeanBot C1 regime gate — checked first (mirrors ma_bounce.py:101) so the
+    # blocking decision precedes any indicator math on a downtrend bar.
+    if not _regime_ok(df, rp):
+        return None
+
     buf = buffer_pts if buffer_pts is not None else rp.ma_touch_buffer_pts
     gap_min = min_gap_pts if min_gap_pts is not None else rp.ma_min_gap_pts
-    adx_threshold = min_adx if min_adx is not None else rp.adx_min_threshold
     sl_pts = rp.stop_loss_pts
     tp_pts = rp.take_profit_pts
 
@@ -85,51 +136,69 @@ def detect_signal(
 
     ma_fast = float(bar["ma_fast"])
     ma_slow = float(bar["ma_slow"])
-    ma_gap = abs(ma_fast - ma_slow)
-
-    if ma_gap < gap_min:
-        return None
-
-    adx_val = bar.get("adx", 0.0)
-    if pd.isna(adx_val):
-        adx_val = 0.0
-    adx_val = float(adx_val)
-    if adx_threshold > 0 and adx_val < adx_threshold:
-        return None
+    ma_gap = abs(ma_slow - ma_fast)
 
     o = float(bar["open"])
-    h = float(bar["high"])  # noqa: F841 — kept to mirror SeanBot port for readability
     l_ = float(bar["low"])
     c = float(bar["close"])
 
-    # LONG: MA50 > MA100 (uptrend), price touches MA100, bullish candle close.
-    if ma_fast > ma_slow and l_ <= ma_slow + buf and c > o:
-        LOGGER.info(
-            "[STRAT] %s: long_signal — entry=%.2f stop=%.2f target=%.2f "
-            "ma_fast=%.2f ma_slow=%.2f adx=%.2f",
-            instrument,
-            c,
-            c - sl_pts,
-            c + tp_pts,
-            ma_fast,
-            ma_slow,
-            adx_val,
-        )
-        return Signal(
-            instrument=instrument,
-            direction="LONG",
-            entry_price=c,
-            stop_price=c - sl_pts,
-            target_price=c + tp_pts,
-            ma_fast_value=ma_fast,
-            ma_slow_value=ma_slow,
-            ma_gap=ma_gap,
-            adx_value=adx_val,
-            timestamp=datetime.now(UTC),
-        )
+    touch_lower = ma_slow - _TOUCH_LOWER_BAND_PTS
+    touch_upper = ma_slow + buf
 
-    # SHORT branch deferred — do not implement in this PR.
-    return None
+    # SeanBot ma_bounce.py:122-125 reference. ``ma_order_ok`` is INVERTED vs
+    # the pre-PR-33 port (was ``ma_fast > ma_slow``) — SeanBot treats
+    # ``MA100 > MA50`` as a pullback into MA support inside a larger uptrend.
+    ma_order_ok = ma_slow > ma_fast
+    touch_ok = (l_ >= touch_lower) and (l_ <= touch_upper)
+    bullish_ok = c > o
+    gap_ok = ma_gap >= gap_min
+
+    if not (ma_order_ok and touch_ok and bullish_ok and gap_ok):
+        LOGGER.debug(
+            "[STRAT] DECISION_TRACE: LONG blocked | "
+            "ma_order(MA100>MA50)=%s[%.1fvs%.1f] "
+            "touch=%s[low=%.1f must be >=%.1f and <=%.1f] "
+            "bullish=%s[c=%.1fvs_o=%.1f] "
+            "gap=%s[%.1fvs%s]",
+            "OK" if ma_order_ok else "FAIL",
+            ma_slow,
+            ma_fast,
+            "OK" if touch_ok else "FAIL",
+            l_,
+            touch_lower,
+            touch_upper,
+            "OK" if bullish_ok else "FAIL",
+            c,
+            o,
+            "OK" if gap_ok else "FAIL",
+            ma_gap,
+            gap_min,
+        )
+        return None
+
+    LOGGER.info(
+        "[STRAT] %s: long_signal — entry=%.2f stop=%.2f target=%.2f "
+        "ma_fast=%.2f ma_slow=%.2f gap=%.2f",
+        instrument,
+        c,
+        c - sl_pts,
+        c + tp_pts,
+        ma_fast,
+        ma_slow,
+        ma_gap,
+    )
+    return Signal(
+        instrument=instrument,
+        direction="LONG",
+        entry_price=c,
+        stop_price=c - sl_pts,
+        target_price=c + tp_pts,
+        ma_fast_value=ma_fast,
+        ma_slow_value=ma_slow,
+        ma_gap=ma_gap,
+        adx_value=0.0,
+        timestamp=datetime.now(UTC),
+    )
 
 
 def _normalise_bar_time(bar: dict) -> datetime:
