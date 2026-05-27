@@ -493,3 +493,49 @@ async def test_flatten_all_continues_if_one_close_fails(caplog):
     assert result.closed[1].closed is True
     error_logs = [r for r in caplog.records if "[ORCH] flatten_all: close_error" in r.getMessage()]
     assert len(error_logs) == 1
+
+
+# ============================================================================
+# PR-D2 — bar subscription requests extended-hours bars for the 24/5 strategy
+# ============================================================================
+
+
+async def test_subscribe_bars_called_with_use_rth_false():
+    """The 24/5 strategy must receive bars outside RTH (09:30–16:00 ET).
+
+    Regression for the silent mismatch shipped alongside PR #32 (24/5 session
+    boundaries): the bar subscription kept the wrapper default use_rth=True,
+    starving the scanner overnight.
+    """
+    mock_ib = _make_mock_ib()
+    mock_db = _make_mock_db()
+    orch = Orchestrator(mock_ib, mock_db, paper_account="DUQ1234567")
+
+    await orch._start_bar_subscription()
+
+    assert mock_ib.subscribe_bars.await_count == 1
+    kwargs = mock_ib.subscribe_bars.await_args.kwargs
+    assert kwargs.get("use_rth") is False, (
+        f"bar subscription must request extended-hours (24/5 CME) bars; "
+        f"got use_rth={kwargs.get('use_rth')!r}"
+    )
+
+
+async def test_bar_subscription_log_includes_use_rth(caplog):
+    """Startup log must surface the hours mode for production debugging."""
+    caplog.set_level(logging.INFO)
+    mock_ib = _make_mock_ib()
+    mock_db = _make_mock_db()
+    orch = Orchestrator(mock_ib, mock_db, paper_account="DUQ1234567")
+
+    await orch._start_bar_subscription()
+
+    start_logs = [
+        r.getMessage()
+        for r in caplog.records
+        if "[STRAT]" in r.getMessage() and "bar_subscription started" in r.getMessage()
+    ]
+    assert start_logs, "expected [STRAT] bar_subscription started log line"
+    assert (
+        "use_rth=False" in start_logs[0]
+    ), f"start log must include hours mode; got: {start_logs[0]!r}"

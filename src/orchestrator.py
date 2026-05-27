@@ -309,16 +309,22 @@ class Orchestrator:
         asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     async def _start_bar_subscription(self) -> None:
+        # CME futures trade 24/5; the strategy session boundaries (PR #32) span
+        # Sun 18:00 ET → Fri 16:25 ET. useRTH=True would silently filter bars
+        # to the 09:30–16:00 ET liquid window and starve the scanner overnight.
+        use_rth = False
         try:
             self._bars = await self._ib.subscribe_bars(
                 self._contract,
                 bar_size=self._bar_size,
+                use_rth=use_rth,
                 on_new_bar=self._on_new_bar,
             )
             LOGGER.info(
-                "[STRAT] %s: bar_subscription started — bar_size=%s",
+                "[STRAT] %s: bar_subscription started — bar_size=%s use_rth=%s",
                 self._instrument,
                 self._bar_size,
+                use_rth,
             )
         except Exception as exc:
             LOGGER.warning(
