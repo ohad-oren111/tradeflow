@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -28,13 +28,14 @@ LOGGER = logging.getLogger(__name__)
 STRATEGY_NAME = "sma100_bounce"
 
 _ET = ZoneInfo("America/New_York")
-# Regular trading hours boundaries for MNQ (mirror config.risk_params).
-_RTH_OPEN_HOUR = 9
-_RTH_OPEN_MIN = 30
-_RTH_CLOSE_HOUR = 16
-_RTH_CLOSE_MIN = 0
 # Rolling buffer big enough for MA100 + ADX(14) warmup with headroom.
 _BAR_BUFFER_MAX = 150
+
+
+def _parse_hhmm(s: str) -> time:
+    """Parse an "HH:MM" wall-clock string into a stdlib ``time``."""
+    h, m = s.split(":")
+    return time(int(h), int(m))
 
 
 @dataclass
@@ -153,26 +154,76 @@ def _normalise_bar_time(bar: dict) -> datetime:
     return dt
 
 
-def _in_session_edge_window(ts_utc: datetime, edge_minutes: int) -> bool:
-    """True if ``ts_utc`` falls within ``edge_minutes`` of the RTH open or close.
+def _in_session_edge_window(
+    ts_utc: datetime,
+    edge_minutes: int,
+    *,
+    daily_break: tuple[time, time] = (time(17, 0), time(18, 0)),
+    gateway_restart: tuple[time, time] = (time(23, 45), time(0, 15)),
+    weekend_cutoff: tuple[int, time] = (4, time(16, 30)),
+    sunday_open: time = time(18, 0),
+) -> bool:
+    """True if ``ts_utc`` falls inside any no-trade window of the 24/5 MNQ session.
 
-    Uses America/New_York wall-clock so DST is handled transparently. Trades
-    outside RTH (e.g. overnight bars) are also gated as "edge" — the strategy
-    only fires during RTH.
+    America/New_York wall-clock is used for all comparisons so DST is handled
+    transparently. The no-trade windows are: Saturday, Sunday before the weekly
+    open, the first ``edge_minutes`` after the Sunday open, an ``edge_minutes``
+    pad on each side of the daily CME maintenance break ``daily_break``, an
+    ``edge_minutes`` pad before the Friday ``weekend_cutoff`` and everything
+    after it, and the ``gateway_restart`` band (may span midnight).
     """
     et = ts_utc.astimezone(_ET)
     weekday = et.weekday()
-    if weekday >= 5:
-        return True  # weekend
-    open_dt = et.replace(hour=_RTH_OPEN_HOUR, minute=_RTH_OPEN_MIN, second=0, microsecond=0)
-    close_dt = et.replace(hour=_RTH_CLOSE_HOUR, minute=_RTH_CLOSE_MIN, second=0, microsecond=0)
-    if et < open_dt or et >= close_dt:
+
+    # Saturday: full day no-trade.
+    if weekday == 5:
         return True
-    minutes_from_open = (et - open_dt).total_seconds() / 60.0
-    minutes_to_close = (close_dt - et).total_seconds() / 60.0
-    if minutes_from_open < edge_minutes:
+
+    # Sunday before the weekly open: no-trade.
+    if weekday == 6 and et.time() < sunday_open:
         return True
-    return minutes_to_close <= edge_minutes
+
+    # Sunday inside the post-open edge buffer: no-trade.
+    if weekday == 6:
+        open_dt = et.replace(
+            hour=sunday_open.hour, minute=sunday_open.minute, second=0, microsecond=0
+        )
+        if (et - open_dt).total_seconds() / 60.0 < edge_minutes:
+            return True
+
+    # Friday weekend cutoff: pre-cutoff edge AND everything after the cutoff.
+    cutoff_weekday, cutoff_time = weekend_cutoff
+    if weekday == cutoff_weekday:
+        cutoff_dt = et.replace(
+            hour=cutoff_time.hour, minute=cutoff_time.minute, second=0, microsecond=0
+        )
+        if et >= cutoff_dt:
+            return True
+        if (cutoff_dt - et).total_seconds() / 60.0 <= edge_minutes:
+            return True
+
+    # Daily CME maintenance break (Mon–Fri): pad ``edge_minutes`` on each side.
+    if weekday in (0, 1, 2, 3, 4):
+        break_start, break_end = daily_break
+        anchor = datetime.combine(et.date(), break_start)
+        pre_break_start = (anchor - timedelta(minutes=edge_minutes)).time()
+        post_break_end = (
+            datetime.combine(et.date(), break_end) + timedelta(minutes=edge_minutes)
+        ).time()
+        if pre_break_start <= et.time() < post_break_end:
+            return True
+
+    # IB Gateway restart band (may span midnight).
+    gw_start, gw_end = gateway_restart
+    et_time = et.time()
+    if gw_start <= gw_end:
+        if gw_start <= et_time < gw_end:
+            return True
+    else:
+        if et_time >= gw_start or et_time < gw_end:
+            return True
+
+    return False
 
 
 class Sma100BounceStrategy:
@@ -194,6 +245,22 @@ class Sma100BounceStrategy:
         self._params: RiskParams = params if params is not None else RISK
         self._bars: deque[dict] = deque(maxlen=buffer_size)
         self._cooldown_bars_remaining = 0
+        # Parse "HH:MM" strings from risk_params once; the session-edge helper
+        # gets ready-to-use ``time`` objects on every bar.
+        p = self._params
+        self._daily_break: tuple[time, time] = (
+            _parse_hhmm(p.daily_break_start_et),
+            _parse_hhmm(p.daily_break_end_et),
+        )
+        self._gateway_restart: tuple[time, time] = (
+            _parse_hhmm(p.gateway_restart_start_et),
+            _parse_hhmm(p.gateway_restart_end_et),
+        )
+        self._weekend_cutoff: tuple[int, time] = (
+            p.weekend_flat_cutoff_weekday,
+            time(p.weekend_flat_cutoff_hour_et, p.weekend_flat_cutoff_minute_et),
+        )
+        self._sunday_open: time = _parse_hhmm(p.sunday_open_et)
 
     @property
     def instrument(self) -> str:
@@ -221,7 +288,14 @@ class Sma100BounceStrategy:
             return None
 
         ts_utc = _normalise_bar_time(bar)
-        if _in_session_edge_window(ts_utc, self._params.session_edge_no_trade_minutes):
+        if _in_session_edge_window(
+            ts_utc,
+            self._params.session_edge_no_trade_minutes,
+            daily_break=self._daily_break,
+            gateway_restart=self._gateway_restart,
+            weekend_cutoff=self._weekend_cutoff,
+            sunday_open=self._sunday_open,
+        ):
             LOGGER.debug("[STRAT] %s: session_edge — skip bar at %s", self._instrument, ts_utc)
             return None
 

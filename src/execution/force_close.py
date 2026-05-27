@@ -1,13 +1,15 @@
-"""End-of-day force-close. Fires at 3:58pm America/New_York every weekday.
+"""End-of-week force-close. Fires Fridays at 4:25pm America/New_York.
 
-§0.5.T5 forbids leaving a futures position without a GTC stop; this scheduler
-goes further and flat-closes every non-CLOSED lifecycle 2 minutes before the
-RTH close so the bot is fully flat overnight. PR #10 is paper-only — the
-behaviour is the same in live, but the rule is enforced first in paper.
+§0.5.T5 forbids leaving a futures position without a GTC stop; under 24/5
+trading positions persist overnight Mon–Thu (downside covered by the GTC STP
+placed in :mod:`src.execution.bracket`), and this scheduler flat-closes every
+non-CLOSED lifecycle 5 minutes before the operator-imposed weekend cutoff so
+the bot is fully flat over the weekend.
 
 Idempotency: every fire reloads non-CLOSED lifecycles from Supabase. If a
 prior fire already closed all positions, the second fire observes an empty
-list and no-ops. Crash + restart near 3:58pm therefore does not double-cancel.
+list and no-ops. Crash + restart near the fire window therefore does not
+double-cancel.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 from ib_async import Contract, Order
 
+from config.risk_params import RISK, RiskParams
 from src.execution.router import OrderRouter
 from src.state_machine import (
     Direction,
@@ -32,12 +35,15 @@ from src.state_machine import (
 LOGGER = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
-_DEFAULT_EOD_HOUR_ET = 15
-_DEFAULT_EOD_MINUTE_ET = 58
+
+
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    h, m = s.split(":")
+    return int(h), int(m)
 
 
 class EodForceClose:
-    """One-shot scheduler that flat-closes every weekday at 3:58pm ET."""
+    """One-shot scheduler that flat-closes every Friday at the configured ET time."""
 
     def __init__(
         self,
@@ -45,30 +51,38 @@ class EodForceClose:
         sm: StateMachine,
         *,
         contract: Contract,
-        eod_hour_et: int = _DEFAULT_EOD_HOUR_ET,
-        eod_minute_et: int = _DEFAULT_EOD_MINUTE_ET,
+        params: RiskParams | None = None,
+        eod_hour_et: int | None = None,
+        eod_minute_et: int | None = None,
+        eod_weekday: int | None = None,
     ) -> None:
         self._router = router
         self._sm = sm
         self._contract = contract
-        self._hour = eod_hour_et
-        self._minute = eod_minute_et
+        rp = params if params is not None else RISK
+        if eod_hour_et is None or eod_minute_et is None:
+            h, m = _parse_hhmm(rp.force_close_et)
+        self._hour = eod_hour_et if eod_hour_et is not None else h
+        self._minute = eod_minute_et if eod_minute_et is not None else m
+        self._weekday = eod_weekday if eod_weekday is not None else rp.force_close_weekday
 
     def next_trigger_at(self, now_utc: datetime | None = None) -> datetime:
         """Return the next datetime (UTC) at which the EOD task should fire.
 
-        Skips weekends. If the next 3:58pm ET on a weekday is already in the
-        past relative to ``now_utc``, returns the same time on the following
-        weekday.
+        Fires only on ``self._weekday`` (Mon=0 … Sun=6). If today is the fire
+        weekday and the configured time is still in the future, returns today.
+        Otherwise advances to the next occurrence of the fire weekday.
         """
         if now_utc is None:
             now_utc = datetime.now(UTC)
         now_et = now_utc.astimezone(_ET)
         candidate_et = now_et.replace(hour=self._hour, minute=self._minute, second=0, microsecond=0)
-        if candidate_et <= now_et:
+        if candidate_et <= now_et or candidate_et.weekday() != self._weekday:
+            # Advance day-by-day until we land on the configured weekday strictly
+            # in the future. Bounded by 7 iterations.
             candidate_et = candidate_et + timedelta(days=1)
-        while candidate_et.weekday() >= 5:
-            candidate_et = candidate_et + timedelta(days=1)
+            while candidate_et.weekday() != self._weekday or candidate_et <= now_et:
+                candidate_et = candidate_et + timedelta(days=1)
         return candidate_et.astimezone(UTC)
 
     async def fire_once(self) -> int:
