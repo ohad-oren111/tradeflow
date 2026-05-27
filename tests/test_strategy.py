@@ -399,7 +399,7 @@ class TestSessionEdgeWindow24x5:
 def test_on_new_bar_skips_signal_during_gateway_restart():
     # Engineer a touch + bullish bar that WOULD fire under normal conditions,
     # but stamp it inside the 23:45→00:15 ET gateway restart band.
-    bars = _uptrend_bar_dicts(n=120)
+    bars = _pullback_bar_dicts(n=120)  # MA100>MA50 — PR #33 strategy regime
     df = pd.DataFrame(bars[:-1])
     df = add_all_indicators(df)
     ma_slow_prev = float(df["ma_slow"].iloc[-1])
@@ -420,7 +420,7 @@ def test_on_new_bar_skips_signal_during_gateway_restart():
 def test_on_new_bar_fires_signal_on_thursday_overnight():
     # Same engineered bar, but stamped Thu 22:00 ET (tradable under 24/5,
     # would have been gated out under the old RTH-only rule).
-    bars = _uptrend_bar_dicts(n=120)
+    bars = _pullback_bar_dicts(n=120)  # MA100>MA50 — PR #33 strategy regime
     df = pd.DataFrame(bars[:-1])
     df = add_all_indicators(df)
     ma_slow_prev = float(df["ma_slow"].iloc[-1])
