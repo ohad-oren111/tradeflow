@@ -65,7 +65,7 @@ async def test_run_calls_connect_then_disconnect(caplog):
     with patch.object(orch, "_install_signal_handlers"):
         await asyncio.wait_for(asyncio.gather(orch.run(), stopper()), timeout=2.0)
 
-    assert mock_ib.connect.await_count == 1
+    assert mock_ib.connect_with_resilience.await_count == 1
     assert mock_ib.disconnect.call_count == 1
     mock_db.close.assert_awaited_once()
 
@@ -126,7 +126,7 @@ async def test_sigterm_triggers_shutdown():
 async def test_exception_in_run_loop_disconnects_ib(caplog):
     caplog.set_level(logging.INFO)
     mock_ib = _make_mock_ib()
-    mock_ib.connect.side_effect = RuntimeError("boom — connect failed")  # one call
+    mock_ib.connect_with_resilience.side_effect = RuntimeError("boom — connect failed")  # one call
     mock_db = _make_mock_db()
     orch = Orchestrator(mock_ib, mock_db, paper_account="DUQ1234567", healthcheck_interval=10.0)
 
@@ -198,6 +198,54 @@ async def test_signal_handler_noop_before_run():
     mock_db = _make_mock_db()
     orch = Orchestrator(mock_ib, mock_db, paper_account="DUQ1234567", healthcheck_interval=10.0)
     orch._handle_signal(signal.SIGTERM, None)  # must not raise
+
+
+async def test_orchestrator_survives_transient_disconnect_in_healthcheck(caplog):
+    """PR-A — gateway-restart resilience.
+
+    Healthcheck raises TimeoutError once (mid-loop). Orchestrator MUST
+    NOT exit; instead, it calls connect_with_resilience to recover,
+    emits the [ALERT] reconnect_recovered line, and keeps looping until
+    stop_event is set.
+    """
+    caplog.set_level(logging.INFO)
+    mock_ib = _make_mock_ib()
+    # side_effect: 1 TimeoutError on first healthcheck, then datetimes forever.
+    fake_time = MagicMock(name="datetime")
+    fake_time.strftime = MagicMock(return_value="2026-05-27T16:00:00Z")
+    mock_ib._ib.reqCurrentTimeAsync = AsyncMock(side_effect=[TimeoutError(), fake_time, fake_time])
+    mock_db = _make_mock_db()
+    orch = Orchestrator(
+        mock_ib,
+        mock_db,
+        paper_account="DUQ1234567",
+        healthcheck_interval=0.01,
+        reconnect_max_attempts=3,
+        reconnect_backoff_initial_sec=0.001,
+        reconnect_backoff_max_sec=0.002,
+        reconnect_connect_timeout_sec=0.1,
+    )
+
+    async def stopper():
+        # Wait for at least one transient + recovery + one more healthcheck.
+        for _ in range(40):
+            await asyncio.sleep(0)
+        if orch._stop_event is not None:
+            orch._stop_event.set()
+
+    with patch.object(orch, "_install_signal_handlers"):
+        exit_code = await asyncio.wait_for(asyncio.gather(orch.run(), stopper()), timeout=3.0)
+
+    # gather returns a list — first element is orch.run()'s exit code.
+    assert exit_code[0] == 0, "orchestrator must not exit non-zero on a transient disconnect"
+    # Startup connect (1) + recovery connect (1) = >= 2 calls.
+    assert mock_ib.connect_with_resilience.await_count >= 2
+    transient_logs = [
+        r for r in caplog.records if "[ORCH] healthcheck: transient_disconnect" in r.getMessage()
+    ]
+    assert transient_logs, "expected transient_disconnect log line"
+    recovered_logs = [r for r in caplog.records if "[ALERT] reconnect_recovered" in r.getMessage()]
+    assert recovered_logs, "expected [ALERT] reconnect_recovered alert line"
 
 
 # ============================================================================
