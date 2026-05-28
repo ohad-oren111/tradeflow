@@ -516,3 +516,38 @@ def test_regime_gate_allows_long_when_price_above_30m_ema200():
     df = _thirty_minute_close_frame(closes)
 
     assert _regime_ok(df, RISK) is True
+
+
+# ----------------------------------------- PR-D3a — per-bar [STRAT] eval log
+
+
+def test_evaluate_emits_strat_eval_log(caplog):
+    """PR-D3a: every on_new_bar() invocation emits exactly one [STRAT] eval log.
+
+    Feeds a single bar to a fresh strategy. The bar is at 11:00 ET (well outside
+    every session-edge window), cooldown is inactive, and one bar is below the
+    warmup threshold of two — so the decision is noop_warmup. Exactly one
+    matching log record must appear.
+    """
+    strat = Sma100BounceStrategy("MNQM6")
+    one_bar = _pullback_bar_dicts(n=1)[0]
+
+    with caplog.at_level(logging.INFO, logger="src.strategy"):
+        result = strat.on_new_bar(one_bar)
+
+    assert result is None  # 1 bar < 2-bar warmup threshold
+
+    eval_lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("[STRAT] MNQM6: eval ts=")
+    ]
+    assert (
+        len(eval_lines) == 1
+    ), f"expected exactly one [STRAT] eval log per on_new_bar; got {len(eval_lines)}"
+
+    msg = eval_lines[0]
+    for field in ("ts=", "close=", "ma_fast=", "ma_slow=", "gap=", "cooldown=", "decision="):
+        assert field in msg, f"expected field {field!r} in eval log: {msg!r}"
+    assert "cooldown=False" in msg
+    assert "decision=noop_warmup" in msg
