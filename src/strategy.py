@@ -57,6 +57,32 @@ class Signal:
     timestamp: datetime | None = None
 
 
+@dataclass
+class GateEval:
+    """Full per-bar gate breakdown — the single source of truth for both the
+    entry decision and the granular [STRAT] eval decision label (PR Track 3).
+
+    ``detect_signal`` delegates to :func:`evaluate_gates` and returns only
+    ``.signal``, so its public behavior is unchanged. ``on_new_bar`` reads the
+    booleans to split the old collapsed filter-or-regime label into
+    ``noop_regime`` / ``noop_warmup`` (indicators not ready) / ``noop_filter``.
+
+    Filter booleans are ``None`` when the bar short-circuited before they were
+    evaluated (regime blocked, or indicators not yet warm).
+    """
+
+    signal: Signal | None
+    regime_ok: bool
+    indicators_ready: bool
+    ma_order_ok: bool | None = None
+    touch_ok: bool | None = None
+    bullish_ok: bool | None = None
+    gap_ok: bool | None = None
+    ma_fast: float = float("nan")
+    ma_slow: float = float("nan")
+    ma_gap: float = float("nan")
+
+
 _TOUCH_LOWER_BAND_PTS = 15.0  # SeanBot ma_bounce.py:123 hardcodes -15 lower bound
 
 
@@ -97,32 +123,35 @@ def _regime_ok(df: pd.DataFrame, params: RiskParams) -> bool:
         return True
 
 
-def detect_signal(
+def evaluate_gates(
     df: pd.DataFrame,
     instrument: str,
     buffer_pts: float | None = None,
     min_gap_pts: float | None = None,
     *,
     params: RiskParams | None = None,
-) -> Signal | None:
-    """Inspect the latest fully-formed bar in ``df`` and return a Signal or None.
+) -> GateEval:
+    """Run every entry gate on the latest bar and return the full breakdown.
 
-    Caller is expected to pre-populate ``ma_fast``, ``ma_slow`` columns via
-    :func:`src.indicators.add_all_indicators`. ``buffer_pts`` and
-    ``min_gap_pts`` override the corresponding risk_params values when
-    provided — used by tests to vary thresholds without monkeypatching the
-    global RISK. PR #33 removed the ``min_adx`` override; the strategy no
-    longer reads the adx column.
+    This holds the logic that used to live in :func:`detect_signal`; the gate
+    order, thresholds, fail-open semantics, DECISION_TRACE debug line, and the
+    ``long_signal`` INFO line are all unchanged — only the return type widened
+    from ``Signal | None`` to :class:`GateEval` so callers can see *why* a bar
+    did or didn't fire. :func:`detect_signal` delegates here and returns
+    ``.signal`` so its public behavior is byte-for-byte identical.
+
+    ``buffer_pts`` / ``min_gap_pts`` override the corresponding risk_params
+    values when provided (tests vary thresholds without monkeypatching RISK).
     """
     if len(df) < 2:
-        return None
+        return GateEval(signal=None, regime_ok=True, indicators_ready=False)
 
     rp = params if params is not None else RISK
 
     # SeanBot C1 regime gate — checked first (mirrors ma_bounce.py:101) so the
     # blocking decision precedes any indicator math on a downtrend bar.
     if not _regime_ok(df, rp):
-        return None
+        return GateEval(signal=None, regime_ok=False, indicators_ready=False)
 
     buf = buffer_pts if buffer_pts is not None else rp.ma_touch_buffer_pts
     gap_min = min_gap_pts if min_gap_pts is not None else rp.ma_min_gap_pts
@@ -132,7 +161,8 @@ def detect_signal(
     bar = df.iloc[-1]
 
     if pd.isna(bar["ma_fast"]) or pd.isna(bar["ma_slow"]):
-        return None
+        # Regime passed (or fail-open) but the SMA buffer is not warm yet.
+        return GateEval(signal=None, regime_ok=True, indicators_ready=False)
 
     ma_fast = float(bar["ma_fast"])
     ma_slow = float(bar["ma_slow"])
@@ -174,7 +204,18 @@ def detect_signal(
             ma_gap,
             gap_min,
         )
-        return None
+        return GateEval(
+            signal=None,
+            regime_ok=True,
+            indicators_ready=True,
+            ma_order_ok=ma_order_ok,
+            touch_ok=touch_ok,
+            bullish_ok=bullish_ok,
+            gap_ok=gap_ok,
+            ma_fast=ma_fast,
+            ma_slow=ma_slow,
+            ma_gap=ma_gap,
+        )
 
     LOGGER.info(
         "[STRAT] %s: long_signal — entry=%.2f stop=%.2f target=%.2f "
@@ -187,7 +228,7 @@ def detect_signal(
         ma_slow,
         ma_gap,
     )
-    return Signal(
+    signal = Signal(
         instrument=instrument,
         direction="LONG",
         entry_price=c,
@@ -199,6 +240,51 @@ def detect_signal(
         adx_value=0.0,
         timestamp=datetime.now(UTC),
     )
+    return GateEval(
+        signal=signal,
+        regime_ok=True,
+        indicators_ready=True,
+        ma_order_ok=True,
+        touch_ok=True,
+        bullish_ok=True,
+        gap_ok=True,
+        ma_fast=ma_fast,
+        ma_slow=ma_slow,
+        ma_gap=ma_gap,
+    )
+
+
+def detect_signal(
+    df: pd.DataFrame,
+    instrument: str,
+    buffer_pts: float | None = None,
+    min_gap_pts: float | None = None,
+    *,
+    params: RiskParams | None = None,
+) -> Signal | None:
+    """Inspect the latest fully-formed bar in ``df`` and return a Signal or None.
+
+    Thin wrapper over :func:`evaluate_gates` — public behavior unchanged. Pass
+    ``buffer_pts`` / ``min_gap_pts`` to override risk_params thresholds.
+    """
+    return evaluate_gates(df, instrument, buffer_pts, min_gap_pts, params=params).signal
+
+
+def _first_failed_filter(ge: GateEval) -> str:
+    """Name the first filter gate that failed, in the order they're checked.
+
+    Used only for the ``noop_filter failed=<gate>`` decision label. Assumes the
+    caller already established regime_ok and indicators_ready.
+    """
+    if ge.touch_ok is False:
+        return "touch"
+    if ge.ma_order_ok is False:
+        return "ma_order"
+    if ge.bullish_ok is False:
+        return "bullish"
+    if ge.gap_ok is False:
+        return "gap"
+    return "unknown"
 
 
 def _normalise_bar_time(bar: dict) -> datetime:
@@ -330,6 +416,9 @@ class Sma100BounceStrategy:
             time(p.weekend_flat_cutoff_hour_et, p.weekend_flat_cutoff_minute_et),
         )
         self._sunday_open: time = _parse_hhmm(p.sunday_open_et)
+        # Track 3 — structured record of the most recent on_new_bar decision,
+        # read by the orchestrator's decision journal after each bar.
+        self._last_decision: dict | None = None
 
     @property
     def instrument(self) -> str:
@@ -338,6 +427,11 @@ class Sma100BounceStrategy:
     @property
     def bar_count(self) -> int:
         return len(self._bars)
+
+    @property
+    def last_decision(self) -> dict | None:
+        """The structured decision record from the most recent ``on_new_bar``."""
+        return self._last_decision
 
     def on_new_bar(self, bar: dict) -> Signal | None:
         """Append a bar, recompute indicators, apply gates, return a Signal or None.
@@ -357,6 +451,8 @@ class Sma100BounceStrategy:
         ma_gap = float("nan")
         cooldown_active = self._cooldown_bars_remaining > 0
         signal: Signal | None = None
+        ge: GateEval | None = None
+        failed: str | None = None
 
         if cooldown_active:
             self._cooldown_bars_remaining -= 1
@@ -388,12 +484,34 @@ class Sma100BounceStrategy:
                 ma_slow = float(last_row["ma_slow"])
             if not (pd.isna(ma_fast) or pd.isna(ma_slow)):
                 ma_gap = abs(ma_slow - ma_fast)
-            signal = detect_signal(df, self._instrument, params=self._params)
-            decision = "long_signal" if signal is not None else "noop_filter_or_regime"
+            ge = evaluate_gates(df, self._instrument, params=self._params)
+            signal = ge.signal
+            # Split the old collapsed filter-or-regime label into the actual
+            # blocking reason (Track 3). Entry/noop boundary is unchanged — only
+            # the label is finer.
+            if signal is not None:
+                decision = "long_signal"
+            elif not ge.regime_ok:
+                decision = "noop_regime"
+            elif not ge.indicators_ready:
+                decision = "noop_warmup"  # SMA buffer not yet warm
+            else:
+                failed = _first_failed_filter(ge)
+                decision = "noop_filter"
 
+        # Enriched eval log — self-explaining: carries every gate value (when a
+        # full gate eval ran) plus the failing filter, so no replay is needed to
+        # know why a bar didn't fire.
+        gate_str = ""
+        if ge is not None:
+            failed_str = f" failed={failed}" if failed is not None else ""
+            gate_str = (
+                f"{failed_str} regime_ok={ge.regime_ok} touch_ok={ge.touch_ok} "
+                f"ma_order_ok={ge.ma_order_ok} bullish_ok={ge.bullish_ok} gap_ok={ge.gap_ok}"
+            )
         LOGGER.info(
             "[STRAT] %s: eval ts=%s close=%.2f ma_fast=%.2f ma_slow=%.2f gap=%.2f "
-            "cooldown=%s decision=%s",
+            "cooldown=%s decision=%s%s",
             self._instrument,
             ts_utc.isoformat(),
             float(bar.get("close", float("nan"))),
@@ -402,7 +520,23 @@ class Sma100BounceStrategy:
             ma_gap,
             cooldown_active,
             decision,
+            gate_str,
         )
+
+        # Track 3 — expose the decision as a structured record for the
+        # orchestrator's decision journal + replay tool.
+        self._last_decision = {
+            "ts": ts_utc.isoformat(),
+            "decision": decision,
+            "failed": failed,
+            "close": float(bar.get("close", float("nan"))),
+            "sma100": ma_slow if not pd.isna(ma_slow) else None,
+            "regime_ok": ge.regime_ok if ge is not None else None,
+            "touch_ok": ge.touch_ok if ge is not None else None,
+            "ma_order_ok": ge.ma_order_ok if ge is not None else None,
+            "bullish_ok": ge.bullish_ok if ge is not None else None,
+            "gap_ok": ge.gap_ok if ge is not None else None,
+        }
         return signal
 
     def mark_trade_closed(self) -> None:

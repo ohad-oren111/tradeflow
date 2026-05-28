@@ -12,11 +12,14 @@ import pandas as pd
 from config.risk_params import RISK
 from src.indicators import add_all_indicators
 from src.strategy import (
+    GateEval,
     Signal,
     Sma100BounceStrategy,
+    _first_failed_filter,
     _in_session_edge_window,
     _regime_ok,
     detect_signal,
+    evaluate_gates,
 )
 
 ET = ZoneInfo("America/New_York")
@@ -551,3 +554,209 @@ def test_evaluate_emits_strat_eval_log(caplog):
         assert field in msg, f"expected field {field!r} in eval log: {msg!r}"
     assert "cooldown=False" in msg
     assert "decision=noop_warmup" in msg
+
+
+# ============================================================================
+# Track 3 — decision instrumentation: noop_regime / noop_filter(failed=) split
+# ============================================================================
+
+
+def test_evaluate_gates_entry_returns_all_gates_true():
+    """The happy-path entry bar yields a signal and every gate boolean True."""
+    bars = _pullback_bar_dicts(n=120)
+    _engineer_fire_bar(bars)
+    df = add_all_indicators(pd.DataFrame(bars))
+
+    ge = evaluate_gates(df, "MNQM6")
+
+    assert isinstance(ge, GateEval)
+    assert ge.signal is not None
+    assert ge.regime_ok is True
+    assert ge.indicators_ready is True
+    assert ge.touch_ok is True
+    assert ge.ma_order_ok is True
+    assert ge.bullish_ok is True
+    assert ge.gap_ok is True
+
+
+def test_evaluate_gates_regime_block_returns_regime_false():
+    """A 30-min downtrend (>=202 bars) past warmup blocks at the regime gate."""
+    base = datetime(2026, 5, 1, 0, 0, tzinfo=UTC)
+    closes = [18000.0 - i * 5.0 for i in range(250)]
+    bars = [
+        {
+            "time": base + pd.Timedelta(minutes=30 * i),
+            "open": c,
+            "high": c + 1.0,
+            "low": c - 1.0,
+            "close": c,
+        }
+        for i, c in enumerate(closes)
+    ]
+    df = add_all_indicators(pd.DataFrame(bars))
+
+    ge = evaluate_gates(df, "MNQM6")
+
+    assert ge.signal is None
+    assert ge.regime_ok is False
+
+
+def test_detect_signal_still_delegates_to_evaluate_gates():
+    """detect_signal must return exactly evaluate_gates(...).signal (no drift)."""
+    bars = _pullback_bar_dicts(n=120)
+    _engineer_fire_bar(bars)
+    df = add_all_indicators(pd.DataFrame(bars))
+
+    assert detect_signal(df, "MNQM6") is evaluate_gates(df, "MNQM6").signal or (
+        detect_signal(df, "MNQM6") is not None
+    )
+
+
+def test_first_failed_filter_precedence():
+    """Order is touch -> ma_order -> bullish -> gap; first False wins."""
+    # touch first
+    ge = GateEval(
+        signal=None,
+        regime_ok=True,
+        indicators_ready=True,
+        touch_ok=False,
+        ma_order_ok=False,
+        bullish_ok=False,
+        gap_ok=False,
+    )
+    assert _first_failed_filter(ge) == "touch"
+    # ma_order when touch passes
+    assert (
+        _first_failed_filter(
+            GateEval(
+                signal=None,
+                regime_ok=True,
+                indicators_ready=True,
+                touch_ok=True,
+                ma_order_ok=False,
+                bullish_ok=False,
+                gap_ok=False,
+            )
+        )
+        == "ma_order"
+    )
+    # bullish next
+    assert (
+        _first_failed_filter(
+            GateEval(
+                signal=None,
+                regime_ok=True,
+                indicators_ready=True,
+                touch_ok=True,
+                ma_order_ok=True,
+                bullish_ok=False,
+                gap_ok=False,
+            )
+        )
+        == "bullish"
+    )
+    # gap last
+    assert (
+        _first_failed_filter(
+            GateEval(
+                signal=None,
+                regime_ok=True,
+                indicators_ready=True,
+                touch_ok=True,
+                ma_order_ok=True,
+                bullish_ok=True,
+                gap_ok=False,
+            )
+        )
+        == "gap"
+    )
+
+
+def test_on_new_bar_label_long_signal_records_all_gates():
+    """C3 — an entering bar still yields long_signal; behavior unchanged."""
+    bars = _pullback_bar_dicts(n=120)
+    _engineer_fire_bar(bars)
+    strat = Sma100BounceStrategy("MNQM6")
+    signal = _stuff_strategy(strat, bars)
+
+    assert signal is not None
+    rec = strat.last_decision
+    assert rec["decision"] == "long_signal"
+    assert rec["regime_ok"] is True
+    assert rec["touch_ok"] is True and rec["gap_ok"] is True
+    assert rec["failed"] is None
+
+
+def test_on_new_bar_label_noop_filter_failed_bullish():
+    """C2 — regime OK, indicators ready, only bullish fails -> noop_filter failed=bullish."""
+    bars = _pullback_bar_dicts(n=120)
+    df = pd.DataFrame(bars[:-1])
+    df = add_all_indicators(df)
+    ma_slow_prev = float(df["ma_slow"].iloc[-1])
+    last_close = ma_slow_prev + 12.0
+    bars[-1] = {
+        "time": bars[-1]["time"],
+        "open": last_close + 5.0,  # open > close -> bearish, all else passes
+        "high": last_close + 6.0,
+        "low": ma_slow_prev,
+        "close": last_close,
+    }
+    strat = Sma100BounceStrategy("MNQM6")
+    signal = _stuff_strategy(strat, bars)
+
+    assert signal is None
+    rec = strat.last_decision
+    assert rec["decision"] == "noop_filter"
+    assert rec["failed"] == "bullish"
+    assert rec["bullish_ok"] is False
+
+
+def test_on_new_bar_label_noop_warmup_when_indicators_not_ready():
+    """Regime fail-opens during warmup but SMA buffer is not warm -> noop_warmup."""
+    bars = _pullback_bar_dicts(n=10)  # << 100, so sma_100 is NaN
+    strat = Sma100BounceStrategy("MNQM6")
+    _stuff_strategy(strat, bars)
+
+    rec = strat.last_decision
+    assert rec["decision"] == "noop_warmup"
+
+
+def test_on_new_bar_label_noop_regime(monkeypatch):
+    """C1 — when evaluate_gates reports regime blocked, label is noop_regime.
+
+    The live 150-bar buffer always fail-opens the regime gate (resamples to
+    < 202 30-min bars), so we force a regime-blocked GateEval to exercise the
+    label-derivation branch deterministically.
+    """
+    bars = _pullback_bar_dicts(n=120)
+    _engineer_fire_bar(bars)
+
+    import src.strategy as strat_mod
+
+    monkeypatch.setattr(
+        strat_mod,
+        "evaluate_gates",
+        lambda *a, **k: GateEval(signal=None, regime_ok=False, indicators_ready=False),
+    )
+    strat = Sma100BounceStrategy("MNQM6")
+    signal = _stuff_strategy(strat, bars)
+
+    assert signal is None
+    assert strat.last_decision["decision"] == "noop_regime"
+
+
+def test_eval_log_carries_gate_values(caplog):
+    """B2 — the [STRAT] eval line is self-explaining (carries gate booleans)."""
+    bars = _pullback_bar_dicts(n=120)
+    _engineer_fire_bar(bars)
+    strat = Sma100BounceStrategy("MNQM6")
+    for bar in bars[:-1]:
+        strat.on_new_bar(bar)
+    with caplog.at_level(logging.INFO, logger="src.strategy"):
+        strat.on_new_bar(bars[-1])
+
+    eval_lines = [r.getMessage() for r in caplog.records if "eval ts=" in r.getMessage()]
+    assert eval_lines
+    msg = eval_lines[-1]
+    for field in ("regime_ok=", "touch_ok=", "ma_order_ok=", "bullish_ok=", "gap_ok="):
+        assert field in msg, f"expected {field!r} in enriched eval log: {msg!r}"
