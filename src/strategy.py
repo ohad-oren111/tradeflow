@@ -346,18 +346,27 @@ class Sma100BounceStrategy:
         ``close``. ``volume`` is optional but propagated.
         """
         self._bars.append(dict(bar))
+        ts_utc = _normalise_bar_time(bar)
 
-        if self._cooldown_bars_remaining > 0:
+        # PR-D3a — emit one [STRAT] eval log per bar so we have per-bar truth
+        # on what the strategy decided. Fields stay in fixed order so downstream
+        # parsing is trivial. ma_*/gap default to NaN for bars that early-exit
+        # before indicators are computed (cooldown, session edge, warmup).
+        ma_fast = float("nan")
+        ma_slow = float("nan")
+        ma_gap = float("nan")
+        cooldown_active = self._cooldown_bars_remaining > 0
+        signal: Signal | None = None
+
+        if cooldown_active:
             self._cooldown_bars_remaining -= 1
             LOGGER.debug(
                 "[STRAT] %s: cooldown_bar — remaining=%s",
                 self._instrument,
                 self._cooldown_bars_remaining,
             )
-            return None
-
-        ts_utc = _normalise_bar_time(bar)
-        if _in_session_edge_window(
+            decision = "noop_cooldown"
+        elif _in_session_edge_window(
             ts_utc,
             self._params.session_edge_no_trade_minutes,
             daily_break=self._daily_break,
@@ -366,14 +375,35 @@ class Sma100BounceStrategy:
             sunday_open=self._sunday_open,
         ):
             LOGGER.debug("[STRAT] %s: session_edge — skip bar at %s", self._instrument, ts_utc)
-            return None
+            decision = "noop_session_edge"
+        elif len(self._bars) < 2:
+            decision = "noop_warmup"
+        else:
+            df = pd.DataFrame(list(self._bars))
+            df = add_all_indicators(df)
+            last_row = df.iloc[-1]
+            if not pd.isna(last_row["ma_fast"]):
+                ma_fast = float(last_row["ma_fast"])
+            if not pd.isna(last_row["ma_slow"]):
+                ma_slow = float(last_row["ma_slow"])
+            if not (pd.isna(ma_fast) or pd.isna(ma_slow)):
+                ma_gap = abs(ma_slow - ma_fast)
+            signal = detect_signal(df, self._instrument, params=self._params)
+            decision = "long_signal" if signal is not None else "noop_filter_or_regime"
 
-        if len(self._bars) < 2:
-            return None
-
-        df = pd.DataFrame(list(self._bars))
-        df = add_all_indicators(df)
-        return detect_signal(df, self._instrument, params=self._params)
+        LOGGER.info(
+            "[STRAT] %s: eval ts=%s close=%.2f ma_fast=%.2f ma_slow=%.2f gap=%.2f "
+            "cooldown=%s decision=%s",
+            self._instrument,
+            ts_utc.isoformat(),
+            float(bar.get("close", float("nan"))),
+            ma_fast,
+            ma_slow,
+            ma_gap,
+            cooldown_active,
+            decision,
+        )
+        return signal
 
     def mark_trade_closed(self) -> None:
         """Start the cooldown_bars timer; new signals suppressed until elapsed."""
