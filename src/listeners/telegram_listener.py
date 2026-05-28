@@ -98,6 +98,16 @@ async def main() -> None:
     client = TelegramClient(StringSession(session_string), api_id, api_hash)
     await client.start()
 
+    # Telethon's get_entity() resolves a display-name string ("Trading NQ
+    # Triggers") only against the dialog cache, which is empty on a first-run
+    # StringSession. Walk dialogs once so a private-channel title resolves
+    # without forcing operators to look up the numeric peer id. Cheap even
+    # for accounts with hundreds of chats; only runs at startup.
+    n_dialogs = 0
+    async for _ in client.iter_dialogs():
+        n_dialogs += 1
+    LOGGER.info("[TG_LISTENER] dialog cache warmed — count=%d", n_dialogs)
+
     entity = await client.get_entity(channel)
     LOGGER.info("[TG_LISTENER] connected — channel=%s id=%s", channel, entity.id)
 
