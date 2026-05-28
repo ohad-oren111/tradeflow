@@ -13,8 +13,10 @@ inside the parent fillEvent handler before the lifecycle reaches ACTIVE.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import pathlib
 import signal
 import socket
 import time
@@ -50,6 +52,13 @@ from src.strategy import (
 _WATCHDOG_STALE_THRESHOLD_SEC = 5 * 60
 _WATCHDOG_ALERT_COOLDOWN_SEC = 15 * 60
 _BAR_TIMESTAMP_RING_MAXLEN = 4096
+
+# Track 3 — decision journal. Bounded in-memory ring of the most recent
+# per-bar strategy decisions (mirrors the live_bars_60m ring), plus a local
+# JSONL append for the inspect_decisions replay tool. The JSONL dir is created
+# on demand; if no logs volume is mounted it is ephemeral (queued follow-up).
+_DECISION_JOURNAL_MAXLEN = 240
+_DECISION_JSONL_PATH = "/app/logs/decisions.jsonl"
 
 # Transient broker disconnects worth catching mid-loop and triggering a
 # resilient reconnect rather than orchestrator exit. Mirrors the tuple in
@@ -148,6 +157,7 @@ class Orchestrator:
         self._last_bar_at: datetime | None = None
         self._last_bar_alert_at: datetime | None = None
         self._bar_timestamps: deque[datetime] = deque(maxlen=_BAR_TIMESTAMP_RING_MAXLEN)
+        self._decision_journal: deque[dict] = deque(maxlen=_DECISION_JOURNAL_MAXLEN)
 
     async def run(self) -> int:
         """Start orchestrator, loop on healthcheck, return process exit code."""
@@ -409,6 +419,8 @@ class Orchestrator:
                 exc,
             )
             return
+        # Track 3 — record every bar's decision (entry or noop) to the journal.
+        self._record_decision(self._strategy.last_decision)
         if signal_or_none is None:
             return
         if self._loop is None:
@@ -460,6 +472,34 @@ class Orchestrator:
         ):
             self._bar_timestamps.popleft()
         return len(self._bar_timestamps)
+
+    def _record_decision(self, record: dict | None) -> None:
+        """Append the strategy's latest decision to the ring buffer + JSONL.
+
+        Best-effort on the file write — a journal IO error (e.g. read-only fs)
+        must never break the bar path, so it degrades to a debug log.
+        """
+        if record is None:
+            return
+        self._decision_journal.append(record)
+        try:
+            path = pathlib.Path(_DECISION_JSONL_PATH)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as fh:
+                fh.write(json.dumps(record) + "\n")
+        except Exception as exc:
+            LOGGER.debug("[ORCH] decision_journal: write skipped — %s", exc)
+
+    def get_recent_decisions(self, n: int = 50) -> list[dict]:
+        """Return up to the last ``n`` decisions, newest first.
+
+        Consumed by the inspect_decisions replay tool, /status, and (Track 4)
+        the SeanBot reconciler's nearest-decision lookup.
+        """
+        items = list(self._decision_journal)
+        if n > 0:
+            items = items[-n:]
+        return list(reversed(items))
 
     async def _handle_trade_signal(self, signal: Signal) -> None:
         # PR #12 — drop new entries while halted (foreign-position detection
