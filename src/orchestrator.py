@@ -32,6 +32,7 @@ from comms.telegram import TelegramAlerter
 from config.instruments import MNQ
 from src.clients.ib_client import BrokerExtendedOutageError, IBClient
 from src.clients.supabase_client import SupabaseClient
+from src.comparison.seanbot_reconciler import SeanbotReconciler
 from src.execution.dirty_set import DirtySet
 from src.execution.force_close import EodForceClose
 from src.execution.reconciler import Reconciler
@@ -158,6 +159,12 @@ class Orchestrator:
         self._last_bar_alert_at: datetime | None = None
         self._bar_timestamps: deque[datetime] = deque(maxlen=_BAR_TIMESTAMP_RING_MAXLEN)
         self._decision_journal: deque[dict] = deque(maxlen=_DECISION_JOURNAL_MAXLEN)
+        # Track 4 — SeanBot-vs-TradeFlow reconciler. Reads its decision data
+        # from this orchestrator's journal (get_recent_decisions); polls the
+        # shared Supabase seanbot_signals table for new entries in its task.
+        self._seanbot_reconciler = SeanbotReconciler(
+            decisions_getter=lambda: self.get_recent_decisions(_DECISION_JOURNAL_MAXLEN)
+        )
 
     async def run(self) -> int:
         """Start orchestrator, loop on healthcheck, return process exit code."""
@@ -696,6 +703,13 @@ class Orchestrator:
         )
         self._background_tasks.append(recon_task)
         LOGGER.info("[RECON] task_launched — name=tradeflow-reconciler")
+        # Track 4 — SeanBot reconciliation poll loop (read-only; never trades).
+        seanbot_task = asyncio.create_task(
+            self._seanbot_reconciler.run_until_stopped(self._stop_event, self._db),
+            name="tradeflow-seanbot-reconciler",
+        )
+        self._background_tasks.append(seanbot_task)
+        LOGGER.info("[RECON] task_launched — name=tradeflow-seanbot-reconciler")
         # PR #14 — telegram subsystem (optional; only when env vars are set).
         if self._telegram is not None and self._loop is not None:
             self._telegram.install_handler(self._loop, logging.getLogger())
