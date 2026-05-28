@@ -326,6 +326,7 @@ class TelegramAlerter:
                 f"open_trades: {summary.get('open_trades_count', 0)}",
                 f"account: {summary.get('account', '?')}",
                 f"net_liq: ${summary.get('net_liq', '?')}",
+                f"live_bars_60m: {summary.get('live_bars_60m', '?')}",
             ]
         )
         await self._send("\n".join(lines))

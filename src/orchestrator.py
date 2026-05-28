@@ -18,6 +18,7 @@ import os
 import signal
 import socket
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import FrameType
@@ -34,7 +35,21 @@ from src.execution.force_close import EodForceClose
 from src.execution.reconciler import Reconciler
 from src.execution.router import CloseResult, OrderRouter
 from src.state_machine import Lifecycle, State, StateMachine
-from src.strategy import STRATEGY_NAME, Signal, Sma100BounceStrategy
+
+# _in_session_edge_window is reused by the bar-liveness watchdog so that the
+# "expected bar window" definition has a single source of truth with the
+# strategy. This is the only consumer outside src.strategy itself.
+from src.strategy import (
+    STRATEGY_NAME,
+    Signal,
+    Sma100BounceStrategy,
+    _in_session_edge_window,
+)
+
+# Bar-liveness watchdog tunables.
+_WATCHDOG_STALE_THRESHOLD_SEC = 5 * 60
+_WATCHDOG_ALERT_COOLDOWN_SEC = 15 * 60
+_BAR_TIMESTAMP_RING_MAXLEN = 4096
 
 # Transient broker disconnects worth catching mid-loop and triggering a
 # resilient reconnect rather than orchestrator exit. Mirrors the tuple in
@@ -127,6 +142,12 @@ class Orchestrator:
         self._telegram: TelegramAlerter | None = _build_telegram_if_configured(self, db=db)
         self._background_tasks: list[asyncio.Task[Any]] = []
         self._bars: Any = None
+        # Bar-liveness watchdog state. Armed at the end of
+        # _start_bar_subscription (regardless of subscribe success) so the
+        # 5-min staleness clock starts there. None means "not yet armed".
+        self._last_bar_at: datetime | None = None
+        self._last_bar_alert_at: datetime | None = None
+        self._bar_timestamps: deque[datetime] = deque(maxlen=_BAR_TIMESTAMP_RING_MAXLEN)
 
     async def run(self) -> int:
         """Start orchestrator, loop on healthcheck, return process exit code."""
@@ -332,8 +353,19 @@ class Orchestrator:
                 type(exc).__name__,
                 exc,
             )
+        # Arm the bar-liveness watchdog clock either way — if the subscribe
+        # failed we still want a [WATCHDOG] alert 5 min later instead of
+        # silent darkness.
+        self._last_bar_at = datetime.now(UTC)
 
     def _on_new_bar(self, bar: dict) -> None:
+        now = datetime.now(UTC)
+        self._last_bar_at = now
+        self._bar_timestamps.append(now)
+        if self._last_bar_alert_at is not None:
+            LOGGER.warning("[WATCHDOG] bar feed recovered — first bar after stale window")
+            LOGGER.info("[ALERT] watchdog_bar_recovered")
+            self._last_bar_alert_at = None
         try:
             signal_or_none = self._strategy.on_new_bar(bar)
         except Exception as exc:
@@ -349,6 +381,52 @@ class Orchestrator:
         if self._loop is None:
             return
         asyncio.run_coroutine_threadsafe(self._handle_trade_signal(signal_or_none), self._loop)
+
+    def _watchdog_check_bar_liveness(self) -> None:
+        """Alert if no bar arrived in >5 min during an expected CME session.
+
+        Suppressed during edge windows (Saturday, Sunday pre-open, daily CME
+        break, Friday cutoff, IB Gateway restart band) so maintenance silence
+        never wakes the operator. ALERT-only; does NOT auto-halt. Re-fires
+        every ``_WATCHDOG_ALERT_COOLDOWN_SEC`` while stale to avoid log spam.
+        """
+        if self._last_bar_at is None:
+            return
+        now = datetime.now(UTC)
+        if _in_session_edge_window(now, edge_minutes=0):
+            return
+        stale_sec = (now - self._last_bar_at).total_seconds()
+        if stale_sec <= _WATCHDOG_STALE_THRESHOLD_SEC:
+            return
+        if (
+            self._last_bar_alert_at is not None
+            and (now - self._last_bar_alert_at).total_seconds() < _WATCHDOG_ALERT_COOLDOWN_SEC
+        ):
+            return
+        stale_min = int(stale_sec // 60)
+        LOGGER.warning(
+            "[WATCHDOG] no live bar in %dm during session — feed delayed/dead",
+            stale_min,
+        )
+        LOGGER.info("[ALERT] watchdog_stale_bars: stale_min=%d", stale_min)
+        self._last_bar_alert_at = now
+
+    def _count_live_bars_last_60m(self) -> int:
+        """Return number of bars whose arrival ts is within the last 60 minutes.
+
+        Prunes the deque in-place to bound memory across long uptimes; the
+        deque maxlen also caps worst-case growth.
+        """
+        if not self._bar_timestamps:
+            return 0
+        now = datetime.now(UTC)
+        window_start_sec = 60 * 60
+        while (
+            self._bar_timestamps
+            and (now - self._bar_timestamps[0]).total_seconds() > window_start_sec
+        ):
+            self._bar_timestamps.popleft()
+        return len(self._bar_timestamps)
 
     async def _handle_trade_signal(self, signal: Signal) -> None:
         # PR #12 — drop new entries while halted (foreign-position detection
@@ -430,6 +508,7 @@ class Orchestrator:
             ],
             "open_trades_count": len(open_trades),
             "account": self._account_prefix(self._paper_account),
+            "live_bars_60m": self._count_live_bars_last_60m(),
         }
         try:
             account_summary = await self._ib._ib.accountSummaryAsync(self._paper_account)
@@ -590,6 +669,7 @@ class Orchestrator:
     async def _healthcheck_once(self) -> None:
         ib_time = await self._ib._ib.reqCurrentTimeAsync()
         LOGGER.info("[ORCH] healthcheck: ok — ib_time=%s", self._format_ib_time(ib_time))
+        self._watchdog_check_bar_liveness()
 
     async def _shutdown(self, exit_code: int) -> None:
         await self._cancel_background_tasks()
