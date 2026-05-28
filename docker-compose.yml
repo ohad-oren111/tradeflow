@@ -71,6 +71,26 @@ services:
     networks:
       - tradeflow-net
 
+  # PR-D3b — SeanBot Telegram signal capture. Separate service so a listener
+  # crash never impacts the trading orchestrator. Reuses the tradeflow-app
+  # image (same Dockerfile/context) so telethon installs once; `build:` lets
+  # `docker compose build telegram-listener` work as documented in Task F.
+  telegram-listener:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tradeflow-tradeflow-app:latest
+    container_name: tradeflow-telegram-listener
+    command: python -m src.listeners.telegram_listener
+    restart: unless-stopped
+    env_file:
+      - ${TRADEFLOW_SECRETS_DIR:-/home/tradeflow/.tradeflow-secrets}/.env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      ORCH_LOG_LEVEL: ${ORCH_LOG_LEVEL:-INFO}
+    networks:
+      - tradeflow-net
+
 networks:
   tradeflow-net:
     driver: bridge
