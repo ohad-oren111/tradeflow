@@ -263,6 +263,7 @@ class Orchestrator:
         if self._enable_strategy:
             self._wire_fill_event()
             await self._start_bar_subscription()
+            self._arm_farm_flap_resubscribe()
             self._launch_background_tasks()
 
     async def _recover_state(self) -> None:
@@ -357,6 +358,27 @@ class Orchestrator:
         # failed we still want a [WATCHDOG] alert 5 min later instead of
         # silent darkness.
         self._last_bar_at = datetime.now(UTC)
+
+    def _arm_farm_flap_resubscribe(self) -> None:
+        """Wire the IB client's farm-flap watcher to re-arm the bar sub.
+
+        §0.5.181 — the keepUpToDate sub dies on the 2103/2105/10182 trio and is
+        never auto-rearmed (the socket stays up, so the PR-A socket reconnect
+        does not fire). The client watches ``ib.errorEvent`` and calls back into
+        ``_start_bar_subscription``, which reuses the retained contract + args.
+        Composes with the PR #47 watchdog (still the safety net) — does not
+        replace it.
+        """
+        if self._loop is None:
+            return
+        try:
+            self._ib.arm_farm_flap_watch(self._loop, self._start_bar_subscription)
+        except Exception as exc:
+            LOGGER.warning(
+                "[ORCH] farm_flap_watch_arm_failed — type=%s msg=%s",
+                type(exc).__name__,
+                exc,
+            )
 
     def _on_new_bar(self, bar: dict) -> None:
         now = datetime.now(UTC)

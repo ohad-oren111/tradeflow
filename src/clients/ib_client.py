@@ -31,6 +31,23 @@ _TRANSIENT_CONNECT_EXC: tuple[type[BaseException], ...] = (
     ConnectionError,
 )
 
+# Farm-flap auto-resubscribe (§0.5.181). The IBKR market-data farm drops
+# several times a day with a 2103 (usfarm broken) + 2105 (ushmds broken) +
+# 10182 (failed to request live updates) trio, recovers ~1s later with
+# 2104/2106, but the keepUpToDate bar subscription dies with the 10182 and is
+# never re-armed — the gateway socket stays UP throughout, so the orchestrator's
+# socket-level reconnect (PR-A) does not fire. We watch ib.errorEvent for the
+# trio and re-invoke the subscribe path after a short debounce.
+_FARM_FLAP_TRIO_CODES: tuple[int, ...] = (2103, 2105, 10182)
+# All three codes must land within this window to count as one flap.
+_FARM_FLAP_WINDOW_SEC = 5.0
+# Wait this long after the trio so the 2104/2106 recovery lands before we
+# re-request live updates into a still-broken farm.
+_FARM_FLAP_DEBOUNCE_SEC = 3.0
+# Skip a resubscribe if the previous one fired this recently — collapses
+# rapid-fire flaps to a single re-arm.
+_FARM_FLAP_RESUB_GUARD_SEC = 30.0
+
 
 class BrokerExtendedOutageError(Exception):
     """Raised when :func:`connect_with_resilience` exhausts ``max_attempts``.
@@ -142,6 +159,13 @@ class IBClient:
         self._port = port
         self._client_id = client_id
         self._ib: IB = ib_factory()
+        # Farm-flap auto-resubscribe state (§0.5.181). Armed lazily via
+        # arm_farm_flap_watch() after the first subscribe_bars; left dormant
+        # (resubscribe callback None) until then.
+        self._flap_trio_seen: dict[int, float] = {}
+        self._last_resubscribe_monotonic: float | None = None
+        self._farm_flap_loop: asyncio.AbstractEventLoop | None = None
+        self._farm_flap_resubscribe: Callable[[], Awaitable[None]] | None = None
 
     async def connect(self, timeout: float = 10.0) -> None:
         """Connect to IB Gateway. Raises whatever ib_async raises on failure."""
@@ -317,6 +341,113 @@ class IBClient:
         if on_new_bar is not None:
             _wire_bar_callback(bars, on_new_bar)
         return bars
+
+    # ------------------------------------------------- farm-flap auto-resubscribe
+    # §0.5.181 — re-arm the keepUpToDate bar subscription after the IBKR
+    # market-data farm flaps. Detection lives here (it owns the raw ``ib``
+    # errorEvent); the resubscribe itself re-invokes the orchestrator's existing
+    # subscribe callable so the resolved front-month contract + args are reused.
+
+    def arm_farm_flap_watch(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        resubscribe: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Watch ``ib.errorEvent`` for the 2103/2105/10182 farm-flap trio.
+
+        ``resubscribe`` is an idempotent async callable (the orchestrator's
+        ``_start_bar_subscription``) that re-requests live bars with the
+        retained contract + args. Wired once, after the initial subscribe.
+        """
+        self._farm_flap_loop = loop
+        self._farm_flap_resubscribe = resubscribe
+        self._ib.errorEvent += self._on_ib_error_farm_flap
+        LOGGER.info(
+            "[ib_client] farm_flap_watch armed — trio=%s window=%.0fs debounce=%.0fs guard=%.0fs",
+            _FARM_FLAP_TRIO_CODES,
+            _FARM_FLAP_WINDOW_SEC,
+            _FARM_FLAP_DEBOUNCE_SEC,
+            _FARM_FLAP_RESUB_GUARD_SEC,
+        )
+
+    def _on_ib_error_farm_flap(
+        self,
+        req_id: int,
+        error_code: int,
+        error_string: str,
+        contract: Contract | None = None,
+    ) -> None:
+        """``ib.errorEvent`` handler. Completes the trio, then claims+schedules.
+
+        Signature mirrors ib_async's ``errorEvent(reqId, errorCode, errorString,
+        contract)`` (dispatched positionally). Tracks the partial 2103/2105/10182
+        sequence in a short rolling window. On a completed trio it claims the
+        idempotency slot synchronously (so rapid-fire flaps collapse to one
+        resubscribe without racing on the debounce) and schedules the re-arm.
+        """
+        if error_code not in _FARM_FLAP_TRIO_CODES:
+            return
+        now = time.monotonic()
+        # Drop partials older than the window so a stale 2103 + a fresh 2105
+        # cannot falsely complete a trio.
+        self._flap_trio_seen = {
+            code: ts
+            for code, ts in self._flap_trio_seen.items()
+            if now - ts <= _FARM_FLAP_WINDOW_SEC
+        }
+        self._flap_trio_seen[error_code] = now
+        if not all(code in self._flap_trio_seen for code in _FARM_FLAP_TRIO_CODES):
+            return
+        # Completed trio — reset the partial tracker for the next flap.
+        self._flap_trio_seen.clear()
+        last = self._last_resubscribe_monotonic
+        if last is not None and (now - last) < _FARM_FLAP_RESUB_GUARD_SEC:
+            LOGGER.info(
+                "[ib_client] farm_flap resubscribe skipped — last resub %.1fs ago < %.0fs guard",
+                now - last,
+                _FARM_FLAP_RESUB_GUARD_SEC,
+            )
+            return
+        # Claim the slot now (synchronous) so a second trio within the guard
+        # window is deduped even before this resubscribe completes.
+        self._last_resubscribe_monotonic = now
+        LOGGER.warning(
+            "[ib_client] farm_flap detected — trio 2103/2105/10182 within %.0fs; "
+            "resubscribing after %.0fs debounce",
+            _FARM_FLAP_WINDOW_SEC,
+            _FARM_FLAP_DEBOUNCE_SEC,
+        )
+        self._schedule_farm_flap_resubscribe(detected_monotonic=now)
+
+    def _schedule_farm_flap_resubscribe(self, *, detected_monotonic: float) -> None:
+        loop = self._farm_flap_loop
+        if loop is None or self._farm_flap_resubscribe is None:
+            return
+        loop.create_task(self._farm_flap_resubscribe_after_debounce(detected_monotonic))
+
+    async def _farm_flap_resubscribe_after_debounce(self, detected_monotonic: float) -> None:
+        await asyncio.sleep(_FARM_FLAP_DEBOUNCE_SEC)
+        resubscribe = self._farm_flap_resubscribe
+        if resubscribe is None:
+            return
+        try:
+            await resubscribe()
+        except Exception as exc:
+            LOGGER.warning(
+                "[ib_client] farm_flap resubscribe failed — type=%s msg=%s",
+                type(exc).__name__,
+                exc,
+            )
+            return
+        elapsed = time.monotonic() - detected_monotonic
+        LOGGER.info(
+            "[ORCH] bar_subscription auto-resubscribed after farm-flap — elapsed_sec=%.1f",
+            elapsed,
+        )
+        LOGGER.info(
+            "[ALERT] bar_sub_resubscribed_after_farm_flap: elapsed_sec=%.1f",
+            elapsed,
+        )
 
 
 def _wire_bar_callback(bars: BarDataList, on_new_bar: BarCallback) -> None:
