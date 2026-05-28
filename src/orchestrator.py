@@ -222,6 +222,17 @@ class Orchestrator:
             "[ALERT] reconnect_recovered: elapsed_sec=%.1f",
             elapsed,
         )
+        # The keepUpToDate bar subscription is bound to the socket that just
+        # dropped; ib_async does not carry it across a reconnect. Re-arm it on
+        # the fresh connection so [BAR] resumes — otherwise the feed stays
+        # silent until a manual restart even though the socket is healthy (the
+        # "Peer closed connection" blind-feed mode, distinct from the §0.5.181
+        # farm flap that PR-R1 handles via errorEvent). The errorEvent /
+        # execDetails handlers live on the persistent IB object and survive the
+        # reconnect, so only the bar subscription needs re-arming.
+        if self._enable_strategy:
+            await self._start_bar_subscription()
+            LOGGER.info("[ORCH] bar_subscription re-armed after socket reconnect")
 
     async def _startup(self) -> None:
         import os

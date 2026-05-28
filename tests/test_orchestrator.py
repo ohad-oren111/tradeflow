@@ -248,6 +248,42 @@ async def test_orchestrator_survives_transient_disconnect_in_healthcheck(caplog)
     assert recovered_logs, "expected [ALERT] reconnect_recovered alert line"
 
 
+async def test_resilient_reconnect_rearms_bar_subscription(caplog):
+    """Track 2 — the keepUpToDate bar sub dies with the dropped socket and is
+    NOT carried across an ib_async reconnect. After a successful resilient
+    reconnect the orchestrator must re-arm it (re-invoke subscribe_bars) so
+    [BAR] resumes without a manual restart (the "Peer closed connection" mode).
+    """
+    caplog.set_level(logging.INFO)
+    mock_ib = _make_mock_ib()
+    mock_db = _make_mock_db()
+    orch = Orchestrator(mock_ib, mock_db, paper_account="DUQ1234567")
+    orch._loop = asyncio.get_running_loop()
+
+    await orch._resilient_reconnect()
+
+    mock_ib.connect_with_resilience.assert_awaited_once()
+    mock_ib.subscribe_bars.assert_awaited_once()  # the re-arm
+    assert any(
+        "[ORCH] bar_subscription re-armed after socket reconnect" in r.getMessage()
+        for r in caplog.records
+    )
+    assert any("[ALERT] reconnect_recovered" in r.getMessage() for r in caplog.records)
+
+
+async def test_resilient_reconnect_skips_rearm_when_strategy_disabled():
+    """With strategy disabled there is no bar sub to re-arm — reconnect only."""
+    mock_ib = _make_mock_ib()
+    mock_db = _make_mock_db()
+    orch = Orchestrator(mock_ib, mock_db, paper_account="DUQ1234567", enable_strategy=False)
+    orch._loop = asyncio.get_running_loop()
+
+    await orch._resilient_reconnect()
+
+    mock_ib.connect_with_resilience.assert_awaited_once()
+    mock_ib.subscribe_bars.assert_not_awaited()
+
+
 # ============================================================================
 # PR #12 — halt API (raise_halt / clear_halt / is_halted / halt_raised_at)
 # ============================================================================
