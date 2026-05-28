@@ -64,8 +64,12 @@ def _empty() -> ParsedSignal:
     )
 
 
+# The symbol and the "Long @ <price>" clause may be on the same line
+# (old concatenated form "MNQLong @ …") or split across a newline
+# (current form "MNQ\nLong @ …"). ``\s*`` between them tolerates both —
+# ``\s`` matches the newline, zero-width matches the concatenated form.
 _ENTRY_HEAD_RE = re.compile(
-    r"ENTRY\s*[—\-]\s*(?P<symbol>[A-Z]{2,5})(?P<direction>Long|Short)\s*@\s*(?P<price>"
+    r"ENTRY\s*[—\-]\s*(?P<symbol>[A-Z]{2,5})\s*(?P<direction>Long|Short)\s*@\s*(?P<price>"
     + _NUM
     + r")",
     re.IGNORECASE,
@@ -74,8 +78,10 @@ _STOP_LINE_RE = re.compile(r"Stop[:\s]+(?P<stop>" + _NUM + r")", re.IGNORECASE)
 _TARGET_LINE_RE = re.compile(r"Target[:\s]+(?P<target>" + _NUM + r")", re.IGNORECASE)
 _BOT_SIZE_RE = re.compile(r"Bot\s+size[:\s]+(?P<contracts>\d+)\s*contract", re.IGNORECASE)
 
+# ``\s*`` before "Closed" tolerates both "MNQClosed @ …" (old) and
+# "MNQ\nClosed @ …" (current newline-split) forms, same as the entry head.
 _EXIT_HEAD_RE = re.compile(
-    r"EXIT.*?(?P<symbol>[A-Z]{2,5})Closed\s*@\s*(?P<price>" + _NUM + r")"
+    r"EXIT.*?(?P<symbol>[A-Z]{2,5})\s*Closed\s*@\s*(?P<price>" + _NUM + r")"
     r"(?:[^+\-−]*(?P<pnl_sign>[+\-−])\s*(?P<pnl>\d+(?:\.\d+)?)\s*pt)?",
     re.IGNORECASE | re.DOTALL,
 )
