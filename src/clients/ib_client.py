@@ -32,20 +32,24 @@ _TRANSIENT_CONNECT_EXC: tuple[type[BaseException], ...] = (
 )
 
 # Farm-flap auto-resubscribe (§0.5.181). The IBKR market-data farm drops
-# several times a day with a 2103 (usfarm broken) + 2105 (ushmds broken) +
-# 10182 (failed to request live updates) trio, recovers ~1s later with
-# 2104/2106, but the keepUpToDate bar subscription dies with the 10182 and is
-# never re-armed — the gateway socket stays UP throughout, so the orchestrator's
-# socket-level reconnect (PR-A) does not fire. We watch ib.errorEvent for the
-# trio and re-invoke the subscribe path after a short debounce.
-_FARM_FLAP_TRIO_CODES: tuple[int, ...] = (2103, 2105, 10182)
-# All three codes must land within this window to count as one flap.
-_FARM_FLAP_WINDOW_SEC = 5.0
-# Wait this long after the trio so the 2104/2106 recovery lands before we
+# several times a day with some combination of 2103 (usfarm broken), 2105
+# (ushmds broken), and 10182 (failed to request live updates), recovers ~1s
+# later with 2104/2106, but the keepUpToDate bar subscription dies and is never
+# re-armed — the gateway socket stays UP throughout, so the orchestrator's
+# socket-level reconnect (PR-A) does not fire.
+#
+# W-S14.2 Track 3 (PR-R1 follow-up): detection is "ANY of these codes", not the
+# full trio. The 04:03 UTC flap that left the feed blind for 37 min was
+# 2105 + 10182 with NO 2103, so the all-of-trio guard never completed and the
+# resubscribe never fired. Any single farm-broken/lost-updates code now arms the
+# debounced resubscribe; the 30s idempotency guard collapses a multi-code flap
+# to exactly one re-arm.
+_FARM_FLAP_CODES: frozenset[int] = frozenset({2103, 2105, 10182})
+# Wait this long after a flap code so the 2104/2106 recovery lands before we
 # re-request live updates into a still-broken farm.
 _FARM_FLAP_DEBOUNCE_SEC = 3.0
-# Skip a resubscribe if the previous one fired this recently — collapses
-# rapid-fire flaps to a single re-arm.
+# Skip a resubscribe if the previous one fired this recently — collapses a
+# multi-code flap (and rapid-fire flaps) to a single re-arm.
 _FARM_FLAP_RESUB_GUARD_SEC = 30.0
 
 
@@ -162,7 +166,6 @@ class IBClient:
         # Farm-flap auto-resubscribe state (§0.5.181). Armed lazily via
         # arm_farm_flap_watch() after the first subscribe_bars; left dormant
         # (resubscribe callback None) until then.
-        self._flap_trio_seen: dict[int, float] = {}
         self._last_resubscribe_monotonic: float | None = None
         self._farm_flap_loop: asyncio.AbstractEventLoop | None = None
         self._farm_flap_resubscribe: Callable[[], Awaitable[None]] | None = None
@@ -363,9 +366,8 @@ class IBClient:
         self._farm_flap_resubscribe = resubscribe
         self._ib.errorEvent += self._on_ib_error_farm_flap
         LOGGER.info(
-            "[ib_client] farm_flap_watch armed — trio=%s window=%.0fs debounce=%.0fs guard=%.0fs",
-            _FARM_FLAP_TRIO_CODES,
-            _FARM_FLAP_WINDOW_SEC,
+            "[ib_client] farm_flap_watch armed — codes=%s (any) debounce=%.0fs guard=%.0fs",
+            sorted(_FARM_FLAP_CODES),
             _FARM_FLAP_DEBOUNCE_SEC,
             _FARM_FLAP_RESUB_GUARD_SEC,
         )
@@ -377,44 +379,34 @@ class IBClient:
         error_string: str,
         contract: Contract | None = None,
     ) -> None:
-        """``ib.errorEvent`` handler. Completes the trio, then claims+schedules.
+        """``ib.errorEvent`` handler — ANY farm-flap code arms the resubscribe.
 
         Signature mirrors ib_async's ``errorEvent(reqId, errorCode, errorString,
-        contract)`` (dispatched positionally). Tracks the partial 2103/2105/10182
-        sequence in a short rolling window. On a completed trio it claims the
-        idempotency slot synchronously (so rapid-fire flaps collapse to one
-        resubscribe without racing on the debounce) and schedules the re-arm.
+        contract)`` (dispatched positionally). W-S14.2 Track 3: any single code
+        in ``_FARM_FLAP_CODES`` triggers the debounced resubscribe (the prior
+        all-of-trio guard missed real flaps that lacked a 2103). The 30s
+        idempotency guard, claimed synchronously, collapses the remaining codes
+        of a multi-code flap — and rapid-fire flaps — to exactly one resubscribe.
         """
-        if error_code not in _FARM_FLAP_TRIO_CODES:
+        if error_code not in _FARM_FLAP_CODES:
             return
         now = time.monotonic()
-        # Drop partials older than the window so a stale 2103 + a fresh 2105
-        # cannot falsely complete a trio.
-        self._flap_trio_seen = {
-            code: ts
-            for code, ts in self._flap_trio_seen.items()
-            if now - ts <= _FARM_FLAP_WINDOW_SEC
-        }
-        self._flap_trio_seen[error_code] = now
-        if not all(code in self._flap_trio_seen for code in _FARM_FLAP_TRIO_CODES):
-            return
-        # Completed trio — reset the partial tracker for the next flap.
-        self._flap_trio_seen.clear()
         last = self._last_resubscribe_monotonic
         if last is not None and (now - last) < _FARM_FLAP_RESUB_GUARD_SEC:
             LOGGER.info(
-                "[ib_client] farm_flap resubscribe skipped — last resub %.1fs ago < %.0fs guard",
+                "[ib_client] farm_flap resubscribe skipped — code=%s, last resub %.1fs ago "
+                "< %.0fs guard",
+                error_code,
                 now - last,
                 _FARM_FLAP_RESUB_GUARD_SEC,
             )
             return
-        # Claim the slot now (synchronous) so a second trio within the guard
-        # window is deduped even before this resubscribe completes.
+        # Claim the slot now (synchronous) so the other codes of the same flap
+        # (and a second flap within the guard) are deduped before this completes.
         self._last_resubscribe_monotonic = now
         LOGGER.warning(
-            "[ib_client] farm_flap detected — trio 2103/2105/10182 within %.0fs; "
-            "resubscribing after %.0fs debounce",
-            _FARM_FLAP_WINDOW_SEC,
+            "[ib_client] farm_flap detected — code=%s; resubscribing after %.0fs debounce",
+            error_code,
             _FARM_FLAP_DEBOUNCE_SEC,
         )
         self._schedule_farm_flap_resubscribe(detected_monotonic=now)
