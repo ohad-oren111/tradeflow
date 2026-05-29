@@ -114,6 +114,25 @@ else
     echo "[CLEANUP] log_rotate: skipped — $LOG_DIR not in ALLOWED_PATHS"
 fi
 
+# 2b. In-container JSONL journal backups (W-S14.2 Track 6c).
+# The orchestrator/reconciler rotate decisions.jsonl / reconciliations.jsonl to a
+# single ".1" backup in-writer (journal_rotation.py), so accumulation is already
+# bounded. This is a defensive sweep of any stale rotated backups in the
+# container's /app/logs (whitelisted to that in-container path), older than 7
+# days. Skipped when the container isn't running.
+JOURNAL_GLOB='/app/logs/*.jsonl.*'
+if docker inspect tradeflow-app >/dev/null 2>&1; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[CLEANUP] journals: dry-run — would delete in-container ${JOURNAL_GLOB} older than 7 days"
+    else
+        run_cmd docker exec tradeflow-app sh -c \
+            "find /app/logs -maxdepth 1 -name '*.jsonl.*' -mtime +7 -delete 2>/dev/null || true"
+        echo "[CLEANUP] journals: pruned in-container rotated journal backups older than 7 days"
+    fi
+else
+    echo "[CLEANUP] journals: skipped — tradeflow-app container not present"
+fi
+
 # 3. Docker hygiene — narrow, conservative pruning only
 echo "[CLEANUP] docker_image_prune: dangling + unused older than 7 days"
 run_cmd docker image prune -af --filter "until=168h"

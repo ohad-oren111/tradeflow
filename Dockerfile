@@ -18,6 +18,9 @@ COPY src ./src
 COPY config ./config
 COPY comms ./comms
 COPY dashboard ./dashboard
+# W-S14.2 Track 6e — ship scripts/ so inspect_decisions.py (and siblings) run
+# in-container instead of host-only.
+COPY scripts ./scripts
 COPY main.py ./main.py
 
 EXPOSE 8080
