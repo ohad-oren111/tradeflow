@@ -255,7 +255,12 @@ class Reconciler:
             payload={"exit_reason_hint": exit_reason.value},
             exit_order_id=exit_order_id,
         )
-        await self._close_from_exiting(lc, exit_reason)
+        await self._close_from_exiting(
+            lc,
+            exit_reason,
+            stop_order_open=stop_order_open,
+            target_order_open=target_order_open,
+        )
         self._log_action(lifecycle, ReconcileAction.ACTIVE_TO_CLOSED)
         return ReconcileAction.ACTIVE_TO_CLOSED
 
@@ -286,14 +291,41 @@ class Reconciler:
             stop_order_open=stop_order_open,
             target_order_open=target_order_open,
         )
-        await self._close_from_exiting(lifecycle, exit_reason)
+        await self._close_from_exiting(
+            lifecycle,
+            exit_reason,
+            stop_order_open=stop_order_open,
+            target_order_open=target_order_open,
+        )
         self._log_action(lifecycle, ReconcileAction.EXITING_TO_CLOSED)
         return ReconcileAction.EXITING_TO_CLOSED
 
     # -------------------------------------------------------------- close helpers
 
-    async def _close_from_exiting(self, lifecycle: Lifecycle, exit_reason: ExitReason) -> Lifecycle:
-        """Apply EXITING → CLOSED with broker-best-effort exit fields + pnl."""
+    async def _close_from_exiting(
+        self,
+        lifecycle: Lifecycle,
+        exit_reason: ExitReason,
+        *,
+        stop_order_open: bool = False,
+        target_order_open: bool = False,
+    ) -> Lifecycle:
+        """Apply EXITING → CLOSED with broker-best-effort exit fields + pnl.
+
+        W-S15.1 — before transitioning, cancel any bracket leg still working at
+        the broker. This is the orphan-prevention safety net for the
+        reconciler-driven close path: when the event-driven router misses an exit
+        fillEvent (network blip, IB Gateway restart, or a container recreate that
+        delivered the fill to the prior process), the position goes flat but the
+        opposite (un-OCA'd) GTC leg is left resting with no position behind it.
+        Cancelling happens FIRST so a transient transition failure leaves the
+        lifecycle non-CLOSED and the next scan retries the cancel.
+        """
+        await self._cancel_open_legs(
+            lifecycle,
+            stop_order_open=stop_order_open,
+            target_order_open=target_order_open,
+        )
         qty = lifecycle.entry_qty or 0
         entry_price = lifecycle.entry_price or 0.0
         exit_price = _exit_price_for(lifecycle, exit_reason)
@@ -318,6 +350,44 @@ class Reconciler:
             pnl_gross=pnl_gross,
             pnl_net=pnl_net,
         )
+
+    async def _cancel_open_legs(
+        self,
+        lifecycle: Lifecycle,
+        *,
+        stop_order_open: bool,
+        target_order_open: bool,
+    ) -> None:
+        """W-S15.1 — cancel any bracket leg still working after the position has
+        gone flat broker-side. Only the legs reported still-open by ``openTrades``
+        are cancelled (the filled leg is already gone). Cancels via our own IB
+        client — the same clientId that placed the orders, so it's a same-client
+        cancel (never IB error 10147). Idempotent: errors are logged, never raised.
+        """
+        for is_open, oid, leg, px in (
+            (stop_order_open, lifecycle.stop_order_id, "STP", lifecycle.stop_price),
+            (target_order_open, lifecycle.target_order_id, "LMT", lifecycle.target_price),
+        ):
+            if not is_open or oid is None:
+                continue
+            try:
+                await self._ib.cancel_order(_order_ref(oid))
+                LOGGER.info(
+                    "[RECON] %s: cancelled orphan %s @%s — id=%s position flat broker-side",
+                    lifecycle.symbol,
+                    leg,
+                    f"{px:.2f}" if px is not None else "?",
+                    lifecycle.lifecycle_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — cancel is idempotent; never raise
+                LOGGER.warning(
+                    "[RECON] %s: cancel_orphan_error — leg=%s order=%s type=%s msg=%s",
+                    lifecycle.symbol,
+                    leg,
+                    oid,
+                    type(exc).__name__,
+                    exc,
+                )
 
     # -------------------------------------------------------------- drains + scan
 
@@ -518,6 +588,23 @@ def compute_pnl_gross(
     """
     delta = exit_price - entry_price if direction is Direction.LONG else entry_price - exit_price
     return delta * qty * MNQ.multiplier
+
+
+class _OrderIdRef:
+    """Minimal duck-type for ``IBClient.cancel_order``: only ``orderId`` is read.
+
+    Mirrors ``router._OrderIdRef`` deliberately — the reconciler avoids importing
+    a sibling module's private surface (same convention as the duplicated
+    :func:`compute_pnl_gross`).
+    """
+
+    orderId: int = 0  # noqa: N815 — IB-API attribute name, must match ib_async
+
+
+def _order_ref(order_id: int) -> Any:
+    ref = _OrderIdRef()
+    ref.orderId = order_id
+    return ref
 
 
 def _broker_qty_for(positions: list[Any], symbol: str) -> int | None:

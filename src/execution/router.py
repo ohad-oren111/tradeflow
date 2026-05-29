@@ -348,6 +348,16 @@ class OrderRouter:
         trade: Trade,
         reason: ExitReason,
     ) -> None:
+        # W-S15.1 — cancel the resting sibling bracket leg(s) FIRST so nothing is
+        # left working once this lifecycle reaches CLOSED. The protective STP is a
+        # standalone GTC order (§0.5.T2: parentId=0, NOT OCA-linked to the TP
+        # child), so the broker will not auto-cancel the survivor on a fill — an
+        # uncancelled SELL leg would rest with no position and could flip the
+        # long-only bot SHORT if hit. The orders were placed under our own
+        # clientId, so cancelOrder-by-id is a same-client cancel (never IB error
+        # 10147, the foreign-client trap that defeats side-scripts).
+        await self._cancel_sibling_legs(lc, reason, self._order_id_of(trade))
+
         fill_qty, fill_price, fill_time = self._extract_fill(trade)
         entry_qty = lc.entry_qty or fill_qty or self._contracts_per_signal()
         entry_price = lc.entry_price or 0.0
@@ -407,6 +417,59 @@ class OrderRouter:
         )
 
     # ----------------------------------------------------------------- cancel
+
+    async def _cancel_sibling_legs(
+        self,
+        lc: Lifecycle,
+        reason: ExitReason,
+        filled_order_id: int,
+    ) -> None:
+        """W-S15.1 — idempotently cancel the bracket leg(s) left resting after an
+        exit fill, in-process via our own IB client.
+
+        - TARGET fill → cancel the protective STP.
+        - STOP fill → cancel the TP LMT.
+        - MANUAL / EOD market exit → cancel both remaining children (the prior
+          :meth:`cancel_all_for` already handled them — these are safe no-ops).
+
+        The leg that just filled (``filled_order_id``) is skipped. Cancelling an
+        already-filled/already-cancelled order is a logged no-op — this method
+        never raises, so a duplicate fill or a broker reject can't crash the
+        fill-event loop.
+        """
+        if reason is ExitReason.TARGET:
+            legs: list[tuple[int | None, str, float | None]] = [
+                (lc.stop_order_id, "STP", lc.stop_price)
+            ]
+        elif reason is ExitReason.STOP:
+            legs = [(lc.target_order_id, "LMT", lc.target_price)]
+        else:  # MANUAL / EOD — exit is a separate MKT order; clear both children.
+            legs = [
+                (lc.stop_order_id, "STP", lc.stop_price),
+                (lc.target_order_id, "LMT", lc.target_price),
+            ]
+
+        for oid, leg, px in legs:
+            if oid is None or oid == filled_order_id:
+                continue
+            try:
+                await self._ib.cancel_order(_order_handle(oid))
+                LOGGER.info(
+                    "[ROUTER] %s: cancelled sibling %s @%s — %s fill",
+                    lc.lifecycle_id,
+                    leg,
+                    f"{px:.2f}" if px is not None else "?",
+                    reason.value,
+                )
+            except Exception as exc:  # noqa: BLE001 — cancel is idempotent; never raise
+                LOGGER.warning(
+                    "[ROUTER] %s: cancel_sibling_error — leg=%s order=%s type=%s msg=%s",
+                    lc.lifecycle_id,
+                    leg,
+                    oid,
+                    type(exc).__name__,
+                    exc,
+                )
 
     async def cancel_all_for(self, lifecycle: Lifecycle) -> None:
         """Best-effort cancel of every working order_id on a lifecycle.

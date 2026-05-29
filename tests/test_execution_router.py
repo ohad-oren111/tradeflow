@@ -379,6 +379,110 @@ async def test_cancel_all_for_swallows_errors():
     assert ib.cancel_order.await_count == 3
 
 
+# ------------------------------------------------ W-S15.1 sibling-cancel on exit
+
+
+def _cancelled_order_ids(ib: AsyncMock) -> list[int]:
+    """The orderIds passed to ``ib.cancel_order``, in call order.
+
+    ``cancel_order`` receives an ``_order_handle`` duck-type whose only field is
+    ``orderId``; assert on identity, not call index.
+    """
+    return [call.args[0].orderId for call in ib.cancel_order.await_args_list]
+
+
+async def test_target_fill_cancels_resting_stop_sibling():
+    # W-S15.1: a TARGET (LMT) fill must cancel the standalone protective STP so
+    # no SELL leg is left resting with no position behind it.
+    ib = _make_mock_ib()
+    ib.cancel_order = AsyncMock()
+    sm = _make_mock_sm()
+    active_lc = _make_lifecycle(State.ACTIVE)  # target=1002, stop=1003
+    sm.transition = AsyncMock(
+        side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]
+    )
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[active_lc.target_order_id] = active_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[active_lc.lifecycle_id] = active_lc
+    router._contracts[active_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(active_lc.target_order_id, qty=2, price=17600.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    # Exactly the STP (1003) cancelled; the filled TP (1002) is NOT re-cancelled.
+    assert _cancelled_order_ids(ib) == [active_lc.stop_order_id]
+
+
+async def test_stop_fill_cancels_resting_target_sibling():
+    # W-S15.1: a STOP fill must cancel the resting TP LMT.
+    ib = _make_mock_ib()
+    ib.cancel_order = AsyncMock()
+    sm = _make_mock_sm()
+    active_lc = _make_lifecycle(State.ACTIVE)
+    sm.transition = AsyncMock(
+        side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]
+    )
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[active_lc.stop_order_id] = active_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[active_lc.lifecycle_id] = active_lc
+    router._contracts[active_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(active_lc.stop_order_id, qty=2, price=17400.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    assert _cancelled_order_ids(ib) == [active_lc.target_order_id]
+
+
+async def test_manual_market_exit_cancels_both_remaining_children():
+    # W-S15.1: a MANUAL/EOD market exit (separate order) clears BOTH children.
+    ib = _make_mock_ib()
+    ib.cancel_order = AsyncMock()
+    sm = _make_mock_sm()
+    exiting_lc = _make_lifecycle(State.EXITING)  # target=1002, stop=1003
+    sm.transition = AsyncMock(
+        return_value=_make_lifecycle(State.CLOSED)
+    )  # 1 call (already EXITING)
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_lifecycle_id[exiting_lc.lifecycle_id] = exiting_lc
+    router.register_manual_exit(exiting_lc, order_id=5001)
+    router._contracts[exiting_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(5001, qty=2, price=17500.0)
+    await router.on_fill(trade, None)
+
+    # Both bracket children cancelled; the MKT exit order (5001) is not.
+    assert set(_cancelled_order_ids(ib)) == {
+        exiting_lc.target_order_id,
+        exiting_lc.stop_order_id,
+    }
+
+
+async def test_sibling_cancel_is_safe_noop_when_order_already_gone():
+    # W-S15.1: cancelling an already-filled/cancelled sibling must not raise.
+    ib = _make_mock_ib()
+    ib.cancel_order = AsyncMock(side_effect=RuntimeError("Error 10148: cannot cancel filled"))
+    sm = _make_mock_sm()
+    active_lc = _make_lifecycle(State.ACTIVE)
+    sm.transition = AsyncMock(
+        side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]
+    )
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[active_lc.target_order_id] = active_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[active_lc.lifecycle_id] = active_lc
+    router._contracts[active_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(active_lc.target_order_id, qty=2, price=17600.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)  # must not raise
+
+    # Cancel was attempted, the close still completed (CLOSED transition ran).
+    assert ib.cancel_order.await_count == 1
+    assert sm.transition.await_args.args[1] is State.CLOSED
+
+
 # -------------------------------------------------------------------- recovery
 
 

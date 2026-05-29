@@ -351,6 +351,78 @@ async def test_reconcile_active_no_position_no_child_fills_closes_as_manual():
     assert closed_call.kwargs["exit_reason"] == "MANUAL"
 
 
+# -------- W-S15.1 orphan-leg cancel on reconciler-driven close --------
+
+
+def _cancelled_order_ids(ib: AsyncMock) -> list[int]:
+    """The orderIds passed to ``ib.cancel_order`` (a ``_order_ref`` duck-type)."""
+    return [call.args[0].orderId for call in ib.cancel_order.await_args_list]
+
+
+async def test_recon_active_stop_filled_cancels_orphan_target_leg():
+    # Stop filled (1003 missing), target (1002) still resting → reconciler closes
+    # AND cancels the orphan target so it can't fill with no position behind it.
+    ib = _make_mock_ib(positions=[], open_trades=[_make_open_trade(1002)])
+    ib.cancel_order = AsyncMock()
+    sm = _make_mock_sm()
+    sm.transition = AsyncMock(
+        side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]
+    )
+    rec, _ib, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm)
+
+    action = await rec.reconcile_one(_make_lifecycle(State.ACTIVE))
+
+    assert action is ReconcileAction.ACTIVE_TO_CLOSED
+    assert _cancelled_order_ids(ib) == [1002]  # only the still-open target leg
+
+
+async def test_recon_active_target_filled_cancels_orphan_stop_leg():
+    # Target filled (1002 missing), stop (1003) still resting → cancel the stop.
+    ib = _make_mock_ib(positions=[], open_trades=[_make_open_trade(1003)])
+    ib.cancel_order = AsyncMock()
+    sm = _make_mock_sm()
+    sm.transition = AsyncMock(
+        side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]
+    )
+    rec, _ib, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm)
+
+    action = await rec.reconcile_one(_make_lifecycle(State.ACTIVE))
+
+    assert action is ReconcileAction.ACTIVE_TO_CLOSED
+    assert _cancelled_order_ids(ib) == [1003]
+
+
+async def test_recon_close_with_no_open_legs_cancels_nothing():
+    # Both children already gone broker-side → nothing left to cancel.
+    ib = _make_mock_ib(positions=[], open_trades=[])
+    ib.cancel_order = AsyncMock()
+    sm = _make_mock_sm()
+    sm.transition = AsyncMock(
+        side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]
+    )
+    rec, _ib, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm)
+
+    await rec.reconcile_one(_make_lifecycle(State.ACTIVE))
+
+    ib.cancel_order.assert_not_awaited()
+
+
+async def test_recon_orphan_cancel_is_safe_noop_on_error():
+    # A cancel reject (e.g. order already filled) must not crash the reconciler.
+    ib = _make_mock_ib(positions=[], open_trades=[_make_open_trade(1002)])
+    ib.cancel_order = AsyncMock(side_effect=RuntimeError("Error 10148: cannot cancel"))
+    sm = _make_mock_sm()
+    sm.transition = AsyncMock(
+        side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]
+    )
+    rec, _ib, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm)
+
+    action = await rec.reconcile_one(_make_lifecycle(State.ACTIVE))  # must not raise
+
+    assert action is ReconcileAction.ACTIVE_TO_CLOSED
+    assert sm.transition.await_count == 2  # close still completed
+
+
 # -------- EXITING rows --------
 
 
