@@ -433,10 +433,29 @@ def _ib_env() -> tuple[str, int, int]:
 
 
 def _supabase_env() -> tuple[str | None, str | None]:
-    """Prefer anon key (least privilege); fall back to service-role if anon missing."""
+    """Prefer anon key (least privilege); fall back to service-role if anon missing.
+
+    Correct for ``probe_supabase`` (only needs a 200 — RLS deny-all still answers
+    200 with an empty body), but NOT for data reads — see ``_supabase_data_env``.
+    """
     return (
         os.environ.get("SUPABASE_URL"),
         os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY"),
+    )
+
+
+def _supabase_data_env() -> tuple[str | None, str | None]:
+    """Env for data reads (lifecycle count, realized P&L, open position).
+
+    W-S14.2 Track 5c fix: these tables are RLS deny-all, and the anon key sees an
+    empty result set (HTTP 200, ``[]``) — which silently reports 0 lifecycles /
+    $0 P&L / FLAT even when there IS activity. Data reads MUST use the
+    service-role key, which bypasses RLS. Falls back to anon only if service-role
+    is absent (degrades to the old, visibly-empty behavior rather than crashing).
+    """
+    return (
+        os.environ.get("SUPABASE_URL"),
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY"),
     )
 
 
@@ -789,12 +808,14 @@ def run_daily_report() -> int:
     probes.append(("Memory", ok_mem, str(mem_detail)))
 
     today_iso = datetime.now(UTC).strftime("%Y-%m-%d")
-    lifecycles_today = _count_lifecycles_today(sb_url, sb_key)
+    # Data reads bypass RLS via the service-role key (anon sees an empty set).
+    data_url, data_key = _supabase_data_env()
+    lifecycles_today = _count_lifecycles_today(data_url, data_key)
     # Fix 5 — LOG the lifecycle-count query result so a future "0" is
     # distinguishable from a transient failure (err:/http) in the watchdog log.
     LOGGER.info("[WATCHDOG] daily_report: lifecycles_today_query=%s", lifecycles_today)
-    realized_pnl = _realized_pnl_today(sb_url, sb_key)
-    open_pos = _open_position_summary(sb_url, sb_key)
+    realized_pnl = _realized_pnl_today(data_url, data_key)
+    open_pos = _open_position_summary(data_url, data_key)
     seanbot_scorecard = _seanbot_scorecard_today()
     app_rc = app_detail.get("restart_count", "?") if isinstance(app_detail, dict) else "?"
     last_log = _last_app_log_line()
