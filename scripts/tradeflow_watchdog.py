@@ -729,34 +729,43 @@ def _open_position_summary(url: str | None, key: str | None) -> str:
     return "; ".join(parts)
 
 
-def _seanbot_scorecard_today() -> str:
-    """AGREE/MISS scorecard for today's SeanBot entries from the in-container
-    reconciliation journal (read via docker exec). '(unavailable)' on any error."""
+def _seanbot_scorecard_today(url: str | None, key: str | None) -> str:
+    """AGREE/MISS scorecard for today's SeanBot entries from the durable
+    Supabase ``signal_reconciliations`` table (W-S15.2 — survives container
+    recreates, unlike the old ephemeral JSONL journal).
+
+    Reads with the service-role key (RLS deny-all; anon sees ``[]``). Empty
+    result → "0 entries today"; an error → "(unavailable: ...)". Never raises.
+    """
+    if not url or not key:
+        return "?"
     today_iso = datetime.now(UTC).strftime("%Y-%m-%d")
     try:
-        res = subprocess.run(
-            ["docker", "exec", "tradeflow-app", "cat", "/app/logs/reconciliations.jsonl"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+        resp = httpx.get(
+            f"{url.rstrip('/')}/rest/v1/signal_reconciliations",
+            params={
+                "select": "classification,signal_ts",
+                "signal_ts": f"gte.{today_iso}T00:00:00Z",
+            },
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Accept": "application/json",
+            },
+            timeout=5.0,
         )
-    except (subprocess.TimeoutExpired, OSError) as exc:
+    except Exception as exc:  # noqa: BLE001
         return f"(unavailable: {type(exc).__name__})"
-    if res.returncode != 0:
-        return "(unavailable: journal not found)"
+    if resp.status_code != 200:
+        return f"(unavailable: http {resp.status_code})"
+    try:
+        rows = resp.json()
+    except ValueError:
+        return "(unavailable: parse_err)"
     agree = 0
     miss: dict[str, int] = {}
     total = 0
-    for raw in res.stdout.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            rec = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if not str(rec.get("signal_ts", "")).startswith(today_iso):
-            continue
+    for rec in rows:
         total += 1
         cls = str(rec.get("classification", ""))
         if cls.startswith("AGREE"):
@@ -816,7 +825,9 @@ def run_daily_report() -> int:
     LOGGER.info("[WATCHDOG] daily_report: lifecycles_today_query=%s", lifecycles_today)
     realized_pnl = _realized_pnl_today(data_url, data_key)
     open_pos = _open_position_summary(data_url, data_key)
-    seanbot_scorecard = _seanbot_scorecard_today()
+    # W-S15.2 — scorecard now reads the durable signal_reconciliations table
+    # (service-role) instead of the ephemeral in-container JSONL journal.
+    seanbot_scorecard = _seanbot_scorecard_today(data_url, data_key)
     app_rc = app_detail.get("restart_count", "?") if isinstance(app_detail, dict) else "?"
     last_log = _last_app_log_line()
     green = sum(1 for _, ok, _ in probes if ok)

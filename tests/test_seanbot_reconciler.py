@@ -8,7 +8,12 @@ import json
 import logging
 from unittest.mock import AsyncMock
 
-from src.comparison.seanbot_reconciler import SeanbotReconciler, classify, nearest_decision
+from src.comparison.seanbot_reconciler import (
+    SeanbotReconciler,
+    classify,
+    nearest_decision,
+    record_to_row,
+)
 
 
 def _decision(ts: str, decision: str, *, failed: str | None = None, close=30310.0, sma100=30309.0):
@@ -167,9 +172,16 @@ async def test_poll_once_seeds_cursor_then_reconciles(tmp_path):
     second = await rec.poll_once(db)
     assert second == 1
     db.select.assert_awaited_once()
-    # Read-only: never writes/orders via the db.
+    # Never places orders / inserts lifecycle rows via the db.
     db.insert.assert_not_called()
-    db.upsert.assert_not_called()
+    # W-S15.2 — the reconciliation IS durably mirrored to Supabase via upsert
+    # (the only write this loop makes), keyed on the signal identity.
+    db.upsert.assert_awaited_once()
+    table, row = db.upsert.await_args.args
+    assert table == "signal_reconciliations"
+    assert db.upsert.await_args.kwargs["on_conflict"] == "channel,message_id"
+    assert row["message_id"] == 42
+    assert row["classification"] == "AGREE_ENTER"
 
 
 async def test_poll_once_no_double_count_on_repeat(tmp_path):
@@ -182,3 +194,88 @@ async def test_poll_once_no_double_count_on_repeat(tmp_path):
     # Same row redelivered -> deduped to 0.
     db.select = AsyncMock(return_value=[_entry(message_id=99)])
     assert await rec.poll_once(db) == 0
+
+
+# ----- W-S15.2: durable Supabase mirror (writer) ----------------------------
+
+
+def test_record_to_row_maps_fields_and_natural_key():
+    rec = classify(
+        _entry(message_id=5),
+        [_decision("2026-05-28T22:05:00+00:00", "noop_filter", failed="bullish")],
+    )
+    row = record_to_row(rec)
+    # Natural key (channel, message_id) — drives the upsert on_conflict.
+    assert row["channel"] == "Trading NQ Triggers"
+    assert row["message_id"] == 5
+    assert row["classification"] == "MISS-filter:bullish"
+    assert row["symbol"] == "MNQ"
+    assert row["direction"] == "long"
+    assert row["price"] == 30301.75
+    assert row["signal_ts"] == rec["signal_ts"]
+    assert row["seanbot_type"] == "entry"
+    # tf_decision preserved as a nested object for forensic depth.
+    assert row["tf_decision"]["decision"] == "noop_filter"
+
+
+async def test_persist_upserts_once_with_mapped_row_and_key(tmp_path):
+    getter = _getter([_decision("2026-05-28T22:05:00+00:00", "long_signal")])
+    rec = _reconciler(getter, tmp_path)
+    db = AsyncMock()
+    record = classify(_entry(message_id=11), getter())
+
+    await rec._persist_reconciliation(db, record)
+
+    db.upsert.assert_awaited_once()
+    table, row = db.upsert.await_args.args
+    assert table == "signal_reconciliations"
+    assert db.upsert.await_args.kwargs["on_conflict"] == "channel,message_id"
+    assert row["message_id"] == 11
+    assert row["classification"] == "AGREE_ENTER"
+
+
+async def test_persist_swallows_supabase_failure(tmp_path, caplog):
+    getter = _getter([_decision("2026-05-28T22:05:00+00:00", "long_signal")])
+    rec = _reconciler(getter, tmp_path)
+    db = AsyncMock()
+    db.upsert = AsyncMock(side_effect=RuntimeError("supabase down"))  # 1 call, raises
+    record = classify(_entry(message_id=12), getter())
+
+    with caplog.at_level(logging.WARNING, logger="src.comparison.seanbot_reconciler"):
+        await rec._persist_reconciliation(db, record)  # must NOT raise
+
+    assert any("persist failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_poll_once_persist_failure_does_not_break_eval(tmp_path):
+    """A Supabase write that raises must not stop the eval loop — the JSONL
+    fallback still lands and the count still advances."""
+    getter = _getter([_decision("2026-05-28T22:05:00+00:00", "long_signal")])
+    rec = _reconciler(getter, tmp_path)
+    db = AsyncMock()
+    await rec.poll_once(db)  # seed cursor
+    db.select = AsyncMock(return_value=[_entry(message_id=77)])
+    db.upsert = AsyncMock(side_effect=RuntimeError("boom"))  # 1 call, raises
+
+    assert await rec.poll_once(db) == 1  # eval completed despite the write error
+    # JSONL local fallback still written.
+    lines = (tmp_path / "reconciliations.jsonl").read_text().strip().splitlines()
+    assert len(lines) == 1
+
+
+async def test_repeat_signal_upserts_same_key_idempotent_shape(tmp_path):
+    """Re-emitting the same signal sends the same on_conflict key + identity —
+    the table's UNIQUE(channel, message_id) then merges rather than duplicates."""
+    getter = _getter([_decision("2026-05-28T22:05:00+00:00", "long_signal")])
+    rec = _reconciler(getter, tmp_path)
+    db = AsyncMock()
+    record = classify(_entry(message_id=88), getter())
+
+    await rec._persist_reconciliation(db, record)
+    await rec._persist_reconciliation(db, record)
+
+    assert db.upsert.await_count == 2
+    for call in db.upsert.await_args_list:
+        assert call.args[0] == "signal_reconciliations"
+        assert call.kwargs["on_conflict"] == "channel,message_id"
+        assert call.args[1]["message_id"] == 88

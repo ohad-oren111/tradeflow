@@ -37,6 +37,11 @@ LOGGER = logging.getLogger(__name__)
 _TOLERANCE_SEC = 120.0
 _POLL_INTERVAL_SEC = 30.0
 _RECON_JSONL_PATH = "/app/logs/reconciliations.jsonl"
+# W-S15.2 — durable mirror of the (ephemeral) JSONL journal. Idempotent on the
+# SeanBot signal identity (channel, message_id), so a re-poll/backfill updates
+# the same row instead of duplicating. RLS deny-all; written with service-role.
+_RECON_TABLE = "signal_reconciliations"
+_RECON_ON_CONFLICT = "channel,message_id"
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -127,6 +132,27 @@ def classify(
     }
 
 
+def record_to_row(record: dict) -> dict:
+    """Flatten a reconciliation ``record`` (from :func:`classify`) into a
+    ``signal_reconciliations`` row. Pure — no IO. The natural key
+    (``channel``, ``message_id``) mirrors ``seanbot_signals`` and drives the
+    upsert's ``on_conflict``."""
+    sb = record.get("seanbot") or {}
+    return {
+        "signal_ts": record.get("signal_ts"),
+        "channel": sb.get("channel"),
+        "message_id": sb.get("message_id"),
+        "seanbot_type": sb.get("type"),
+        "direction": sb.get("direction"),
+        "symbol": sb.get("symbol"),
+        "price": sb.get("price"),
+        "classification": record.get("classification"),
+        "justification": record.get("justification"),
+        "tf_decision": record.get("tf_decision"),
+        "acknowledged_at": record.get("acknowledged_at"),
+    }
+
+
 class SeanbotReconciler:
     """Polls Supabase ``seanbot_signals`` for new entries and reconciles each.
 
@@ -188,6 +214,31 @@ class SeanbotReconciler:
             record["classification"],
         )
 
+    async def _persist_reconciliation(self, db: Any, record: dict) -> None:
+        """Upsert ``record`` to Supabase ``signal_reconciliations`` (durable
+        store that survives container recreates, unlike the JSONL). Keyed on
+        ``(channel, message_id)`` so a re-poll updates the same row.
+
+        Observability must never break the eval loop: a write failure is logged
+        as a warning and swallowed — the JSONL append is the local fallback.
+        """
+        row = record_to_row(record)
+        try:
+            await db.upsert(_RECON_TABLE, row, on_conflict=_RECON_ON_CONFLICT)
+            LOGGER.info(
+                "[RECON-CMP] %s: persisted reconciliation %s — seanbot_ts=%s",
+                row.get("symbol"),
+                row.get("classification"),
+                row.get("signal_ts"),
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "[RECON-CMP] %s: reconciliation persist failed — type=%s msg=%s",
+                row.get("symbol"),
+                type(exc).__name__,
+                exc,
+            )
+
     def _append_journal(self, record: dict) -> None:
         """Best-effort durable record — IO failure must not break the loop."""
         try:
@@ -220,7 +271,11 @@ class SeanbotReconciler:
             created = row.get("created_at")
             if created and (self._cursor_iso is None or created > self._cursor_iso):
                 self._cursor_iso = created
-            if self.reconcile_row(row) is not None:
+            record = self.reconcile_row(row)
+            if record is not None:
+                # Durable mirror of the JSONL append (W-S15.2). Best-effort —
+                # _persist_reconciliation never raises.
+                await self._persist_reconciliation(db, record)
                 count += 1
         return count
 
