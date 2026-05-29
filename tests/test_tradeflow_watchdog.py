@@ -858,3 +858,48 @@ def test_run_daily_report_includes_trading_section(monkeypatch, caplog):
     assert "Lifecycles today: 2" in msg
     # Fix 5 — the lifecycle-count query result is logged (0 vs failure distinguishable).
     assert any("lifecycles_today_query=2" in r.getMessage() for r in caplog.records)
+
+
+# ============================================================================
+# W-S14.2 Track 5c fix — data reads bypass RLS via the service-role key
+# ============================================================================
+
+
+def test_supabase_data_env_prefers_service_role(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://x")
+    monkeypatch.setenv("SUPABASE_ANON_KEY", "anon")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service")
+    url, key = wd._supabase_data_env()
+    assert url == "https://x"
+    assert key == "service"  # NOT anon — RLS deny-all returns [] to anon
+
+
+def test_supabase_data_env_falls_back_to_anon(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://x")
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.setenv("SUPABASE_ANON_KEY", "anon")
+    _, key = wd._supabase_data_env()
+    assert key == "anon"
+
+
+def test_daily_report_uses_service_role_for_data_reads(monkeypatch):
+    """The lifecycle/P&L/position helpers must receive the service-role key."""
+    seen_keys: list = []
+    monkeypatch.setattr(wd, "send_telegram", lambda *a, **k: True)
+    monkeypatch.setattr(wd, "_ib_env", lambda: ("h", 4002, 96))
+    monkeypatch.setattr(wd, "_supabase_env", lambda: ("https://x", "anon"))
+    monkeypatch.setattr(wd, "_supabase_data_env", lambda: ("https://x", "service"))
+    monkeypatch.setattr(wd, "probe_ib_api", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(wd, "probe_container", lambda name: (True, {"restart_count": 0}))
+    monkeypatch.setattr(wd, "probe_supabase", lambda *a, **k: (True, "http 200"))
+    monkeypatch.setattr(wd, "probe_dashboard", lambda *a, **k: (True, "http 200"))
+    monkeypatch.setattr(wd, "probe_disk", lambda *a, **k: (True, {"/": 13}))
+    monkeypatch.setattr(wd, "probe_memory", lambda *a, **k: (True, {"used_pct": 30.0}))
+    monkeypatch.setattr(wd, "_last_app_log_line", lambda: "tail")
+    monkeypatch.setattr(wd, "_seanbot_scorecard_today", lambda: "0 entries today")
+    monkeypatch.setattr(wd, "_count_lifecycles_today", lambda u, k: seen_keys.append(k) or "2")
+    monkeypatch.setattr(wd, "_realized_pnl_today", lambda u, k: seen_keys.append(k) or "$0")
+    monkeypatch.setattr(wd, "_open_position_summary", lambda u, k: seen_keys.append(k) or "FLAT")
+
+    assert wd.run_daily_report() == 0
+    assert seen_keys == ["service", "service", "service"]  # never the anon key
