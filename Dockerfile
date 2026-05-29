@@ -5,6 +5,11 @@
 
 FROM python:3.11-slim
 
+# W-S15.3 Track E — bake the deployed commit so the running container can report
+# what code it's actually running (readiness block in the daily report + hourly
+# digest). Passed at build time: `GIT_COMMIT=$(git rev-parse HEAD) docker compose
+# build tradeflow-app`. Defaults to "unknown" when the arg is omitted. Placed
+# late-ish so it doesn't bust the dependency-install cache layer on every commit.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
@@ -22,6 +27,11 @@ COPY dashboard ./dashboard
 # in-container instead of host-only.
 COPY scripts ./scripts
 COPY main.py ./main.py
+
+# W-S15.3 Track E — deployed-commit stamp (see note above). After the COPYs so a
+# new commit only invalidates this tiny layer, not the dependency install.
+ARG GIT_COMMIT=unknown
+ENV TRADEFLOW_COMMIT=${GIT_COMMIT}
 
 EXPOSE 8080
 

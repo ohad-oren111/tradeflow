@@ -795,6 +795,147 @@ def _last_app_log_line() -> str:
     return output.splitlines()[-1][:120]
 
 
+# ----------------------------------------------------- W-S15.3 Track E readiness
+
+
+def _deployed_commit_from_env(env_lines: list[str]) -> str:
+    """Pull the short ``TRADEFLOW_COMMIT`` from a list of ``KEY=value`` env strings."""
+    for line in env_lines:
+        if line.startswith("TRADEFLOW_COMMIT="):
+            val = line.split("=", 1)[1].strip()
+            return (val or "unknown")[:8]
+    return "unknown"
+
+
+def _deployed_commit(container: str = "tradeflow-app") -> str:
+    """Read the baked ``TRADEFLOW_COMMIT`` from the running container.
+
+    Uses ``docker inspect`` Config.Env (``docker exec env`` is harness-blocked).
+    Returns 'unknown' / '(unavailable…)' on any error — never raises.
+    """
+    try:
+        res = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{range .Config.Env}}{{println .}}{{end}}",
+                container,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return f"(unavailable: {type(exc).__name__})"
+    if res.returncode != 0:
+        return "unknown"
+    return _deployed_commit_from_env(res.stdout.splitlines())
+
+
+def _app_recent_logs(tail: int = 1000) -> str:
+    """Tail tradeflow-app logs; '' on error (callers degrade gracefully)."""
+    try:
+        res = subprocess.run(
+            ["docker", "logs", "tradeflow-app", "--tail", str(tail)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    return f"{res.stdout or ''}\n{res.stderr or ''}"
+
+
+def _parse_digest_readiness(log_text: str) -> str:
+    """Extract the readiness fragment from the most recent hourly digest line.
+
+    The orchestrator appends ``warmup=… last_bar=… commit=…`` (W-S15.3 Track E)
+    to ``[ALERT] hourly_session_digest``. Returns a placeholder when no digest is
+    present (e.g. fresh boot) or the digest predates this feature.
+    """
+    latest = ""
+    for line in log_text.splitlines():
+        if "hourly_session_digest:" in line:
+            latest = line
+    if not latest:
+        return "(no digest yet — fresh boot or warmup pending)"
+    idx = latest.find("warmup=")
+    if idx == -1:
+        return "(digest predates readiness block)"
+    return latest[idx:].strip()
+
+
+def _count_reconnect_events(log_text: str) -> tuple[int, int]:
+    """``(reconnect_recovered, farm-flap resubscribe)`` counts in the available tail.
+
+    Best-effort: the json-file driver keeps ~3×10m, so this is 'recent', not
+    all-time-since-boot. Surfaced as a flap canary, not an exact metric.
+    """
+    reconnects = log_text.count("[ALERT] reconnect_recovered")
+    flaps = log_text.count("[ALERT] bar_sub_resubscribed_after_farm_flap")
+    return reconnects, flaps
+
+
+async def _broker_resting_orders_async(
+    host: str, port: int, client_id: int, timeout: float
+) -> tuple[bool, str]:
+    """Connect → count ALL resting orders + live positions → disconnect.
+
+    The orphan canary: when flat we expect 0 resting orders. ``reqAllOpenOrders``
+    (not just this client's openTrades) so an orphan placed under any clientId is
+    visible.
+    """
+    ib = IB()
+    try:
+        await asyncio.wait_for(
+            ib.connectAsync(host, port, clientId=client_id, timeout=timeout),
+            timeout=timeout,
+        )
+        if not ib.isConnected():
+            return (False, "connectAsync returned but isConnected=False")
+        orders = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), timeout=timeout)
+        positions = await asyncio.wait_for(ib.reqPositionsAsync(), timeout=timeout)
+        n_orders = len(orders)
+        live = [p for p in positions if getattr(p, "position", 0)]
+        if not live:
+            pos_str = "FLAT"
+        else:
+            pos_str = "+".join(
+                f"{getattr(getattr(p, 'contract', None), 'localSymbol', '?')}"
+                f"x{int(getattr(p, 'position', 0))}"
+                for p in live
+            )
+        if n_orders == 0 and not live:
+            canary = "OK"
+        elif live:
+            canary = "orders+position"
+        else:
+            canary = "ORPHAN? resting orders with no position"
+        return (True, f"{n_orders} resting / pos={pos_str} [{canary}]")
+    except TimeoutError:
+        return (False, "TimeoutError")
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"{type(exc).__name__}: {exc}")
+    finally:
+        try:
+            if ib.isConnected():
+                ib.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _broker_resting_orders(
+    host: str, port: int, client_id: int, timeout: float = IB_PROBE_TIMEOUT_SEC
+) -> str:
+    """Sync wrapper for the resting-order orphan canary. Never raises."""
+    try:
+        ok, detail = asyncio.run(_broker_resting_orders_async(host, port, client_id, timeout))
+    except Exception as exc:  # noqa: BLE001
+        return f"(probe error: {type(exc).__name__})"
+    return detail if ok else f"(unavailable: {detail})"
+
+
 def run_daily_report() -> int:
     """Build a structured all-probes-plus-extras report and Telegram it. Never deduped."""
     host, port, client_id = _ib_env()
@@ -830,6 +971,13 @@ def run_daily_report() -> int:
     seanbot_scorecard = _seanbot_scorecard_today(data_url, data_key)
     app_rc = app_detail.get("restart_count", "?") if isinstance(app_detail, dict) else "?"
     last_log = _last_app_log_line()
+    # W-S15.3 Track E — readiness signals. Host-side / broker-side only; the
+    # in-process warmup + feed detail is surfaced from the latest hourly digest.
+    deployed_commit = _deployed_commit()
+    recent_logs = _app_recent_logs()
+    digest_readiness = _parse_digest_readiness(recent_logs)
+    reconnects, flaps = _count_reconnect_events(recent_logs)
+    resting_orders = _broker_resting_orders(host, port, client_id)
     green = sum(1 for _, ok, _ in probes if ok)
     total = len(probes)
 
@@ -847,7 +995,13 @@ def run_daily_report() -> int:
     lines.append(f"- Open position (DB view): {open_pos}")
     lines.append(f"- SeanBot scorecard: {seanbot_scorecard}")
     lines.append("")
-    lines.append(f"App restart count: {app_rc}")
+    lines.append("READINESS:")
+    lines.append(f"- Deployed commit: {deployed_commit}")
+    lines.append(f"- App restarts since boot: {app_rc}")
+    lines.append(f"- Reconnects / farm-flap resubs (recent logs): {reconnects} / {flaps}")
+    lines.append(f"- Broker resting orders (orphan canary): {resting_orders}")
+    lines.append(f"- Warmup / feed (last digest): {digest_readiness}")
+    lines.append("")
     lines.append(f"App last log: {last_log}")
     msg = "\n".join(lines)
 
