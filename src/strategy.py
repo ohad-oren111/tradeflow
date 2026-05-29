@@ -2,7 +2,9 @@
 
 Strategy LONG: ``MA100 > MA50`` (recent pullback inside a larger uptrend per
 SeanBot ``strategy/ma_bounce.py:122``), price touches MA100 inside a windowed
-band ``low ∈ [MA100-15, MA100+5]``, bullish candle close ``close > open``, and
+band ``low ∈ [MA100-15, MA100+5]``, bullish candle close
+``close >= open - ma_bullish_tolerance_pts`` (W-S14.2 Track 2: tolerance widens
+the strict ``close > open`` to admit flat/near-doji touch bars), and
 ``abs(MA100-MA50) >= MA_MIN_GAP`` (SeanBot V3 default 0.5). Entry at candle
 close. SL = 75 points from entry. TP = 150 points from entry. No ADX filter
 and no regime gate (the operator deferred SeanBot's C1 regime gate
@@ -180,7 +182,10 @@ def evaluate_gates(
     # ``MA100 > MA50`` as a pullback into MA support inside a larger uptrend.
     ma_order_ok = ma_slow > ma_fast
     touch_ok = (l_ >= touch_lower) and (l_ <= touch_upper)
-    bullish_ok = c > o
+    # W-S14.2 Track 2 (D-1 approved): tolerate flat/near-doji touch candles. The
+    # tolerance is a named risk_param (0.0 == prior strict close>open semantics).
+    bull_tol = rp.ma_bullish_tolerance_pts
+    bullish_ok = c >= o - bull_tol
     gap_ok = ma_gap >= gap_min
 
     if not (ma_order_ok and touch_ok and bullish_ok and gap_ok):
