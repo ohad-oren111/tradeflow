@@ -228,8 +228,40 @@ async def test_on_fill_target_transitions_to_exiting_then_closed_with_target():
     assert closed_call.kwargs["pnl_gross"] == pytest.approx(
         (17600.0 - 17500.0) * 2 * MNQ.multiplier
     )
-    # commission_total = qty * commission_rt_usd
+    # W-S14.2 Track 4b: commission is charged on BOTH sides — qty * RT-per-contract
+    # (= qty * 2 * per-side). pnl_net = gross - commission.
     assert closed_call.kwargs["commission_total"] == pytest.approx(2 * MNQ.commission_rt_usd)
+    assert closed_call.kwargs["commission_total"] == pytest.approx(
+        2 * 2 * MNQ.commission_per_side_usd
+    )
+    assert closed_call.kwargs["pnl_net"] == pytest.approx(
+        closed_call.kwargs["pnl_gross"] - closed_call.kwargs["commission_total"]
+    )
+
+
+async def test_closed_round_trip_nets_broker_commission_example():
+    """W-S14.2 Track 4b broker-match: a 2-ct LONG closed at +150.5 pts nets
+    $599.52 (gross 602.00 - both-sides commission 2.48), NOT the old $600.76."""
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    active_lc = _make_lifecycle(State.ACTIVE)
+    active_lc.entry_price = 30257.5  # the live CLOSED lifecycle c44c5f95
+    exiting_lc = _make_lifecycle(State.EXITING)
+    closed_lc = _make_lifecycle(State.CLOSED)
+    sm.transition = AsyncMock(side_effect=[exiting_lc, closed_lc])
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[active_lc.target_order_id] = active_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[active_lc.lifecycle_id] = active_lc
+    router._contracts[active_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(active_lc.target_order_id, qty=2, price=30408.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    closed_call = sm.transition.await_args
+    assert closed_call.kwargs["pnl_gross"] == pytest.approx(602.00)
+    assert closed_call.kwargs["commission_total"] == pytest.approx(2.48)
+    assert closed_call.kwargs["pnl_net"] == pytest.approx(599.52)
 
 
 async def test_on_fill_stop_transitions_to_closed_with_stop_reason():

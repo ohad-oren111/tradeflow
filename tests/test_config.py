@@ -11,7 +11,9 @@ def test_mnq_spec_matches_architecture_brief_v3() -> None:
     assert MNQ.tick_size == 0.25
     assert MNQ.multiplier == 2.0
     assert MNQ.tick_value_usd == 0.50
-    assert MNQ.commission_rt_usd == 0.62
+    # W-S14.2 Track 4b: per-side is the source of truth; RT = 2x (entry + exit).
+    assert MNQ.commission_per_side_usd == 0.62
+    assert MNQ.commission_rt_usd == 1.24
     assert MNQ.margin_intraday_usd == 2000.0
     assert MNQ.quarterly_months == (3, 6, 9, 12)
     assert MNQ.roll_days_before_expiry == 8
