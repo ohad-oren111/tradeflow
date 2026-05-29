@@ -59,6 +59,10 @@ MEM_PCT_THRESHOLD = 90
 DASHBOARD_TIMEOUT_SEC = 5
 SUPABASE_TIMEOUT_SEC = 5
 IB_PROBE_TIMEOUT_SEC = 10
+# W-S14.2 Track 5c — retry the IB-API probe a few times with backoff before
+# declaring FAIL, so a transient farm flap mid-probe doesn't page a false-FAIL.
+IB_PROBE_ATTEMPTS = 3
+IB_PROBE_RETRY_BACKOFF_SEC = 2.0
 AUTO_HEAL_WAIT_SEC = 90
 
 ALERT_IB_API_DOWN = "ib_api_down"
@@ -181,12 +185,33 @@ def probe_ib_api(
     port: int,
     client_id: int,
     timeout: float = IB_PROBE_TIMEOUT_SEC,
+    *,
+    attempts: int = IB_PROBE_ATTEMPTS,
+    retry_backoff_sec: float = IB_PROBE_RETRY_BACKOFF_SEC,
+    sleep_fn: Callable[[float], None] = time.sleep,
 ) -> tuple[bool, str]:
-    """Sync wrapper around the async IB probe. Each call runs its own event loop."""
-    try:
-        return asyncio.run(_probe_ib_api_async(host, port, client_id, timeout))
-    except Exception as exc:  # noqa: BLE001
-        return (False, f"unexpected: {type(exc).__name__}: {exc}")
+    """Sync wrapper around the async IB probe, with retry + linear backoff.
+
+    W-S14.2 Track 5c: the IBKR data farm flaps several times a day; a single
+    failed probe mid-flap previously declared a false FAIL. Retries up to
+    ``attempts`` times (returning on the first success) so the daily report and
+    monitor only declare IB down after the flap has had a chance to recover.
+    Each attempt runs its own event loop.
+    """
+    last_detail = "no attempt made"
+    for attempt in range(1, attempts + 1):
+        try:
+            ok, detail = asyncio.run(_probe_ib_api_async(host, port, client_id, timeout))
+        except Exception as exc:  # noqa: BLE001
+            ok, detail = (False, f"unexpected: {type(exc).__name__}: {exc}")
+        if ok:
+            if attempt > 1:
+                return (True, f"{detail} (recovered on attempt {attempt}/{attempts})")
+            return (True, detail)
+        last_detail = f"{detail} [attempt {attempt}/{attempts}]"
+        if attempt < attempts:
+            sleep_fn(retry_backoff_sec * attempt)
+    return (False, last_detail)
 
 
 def probe_container(name: str) -> tuple[bool, dict]:
@@ -621,6 +646,110 @@ def _count_lifecycles_today(url: str | None, key: str | None) -> str:
     return f"http {resp.status_code}"
 
 
+def _realized_pnl_today(url: str | None, key: str | None) -> str:
+    """Sum pnl_net of lifecycles CLOSED today (UTC) from Supabase, or '?' on error."""
+    if not url or not key:
+        return "?"
+    today_iso = datetime.now(UTC).strftime("%Y-%m-%d")
+    try:
+        resp = httpx.get(
+            f"{url.rstrip('/')}/rest/v1/lifecycles",
+            params={
+                "select": "pnl_net",
+                "state": "eq.CLOSED",
+                "updated_at": f"gte.{today_iso}T00:00:00Z",
+            },
+            headers={"apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json"},
+            timeout=5.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"err:{type(exc).__name__}"
+    if resp.status_code != 200:
+        return f"http {resp.status_code}"
+    try:
+        rows = resp.json()
+        total = sum(float(r.get("pnl_net") or 0.0) for r in rows)
+        return f"${total:.2f} ({len(rows)} closed)"
+    except (ValueError, TypeError):
+        return "parse_err"
+
+
+def _open_position_summary(url: str | None, key: str | None) -> str:
+    """Non-CLOSED lifecycles from Supabase (DB-sourced). 'FLAT' if none, '?' on error.
+
+    The broker is the true source for positions (§0.5.98); the standalone
+    watchdog reports the DB view as a health signal, labelled as such.
+    """
+    if not url or not key:
+        return "?"
+    try:
+        resp = httpx.get(
+            f"{url.rstrip('/')}/rest/v1/lifecycles",
+            params={
+                "select": "symbol,direction,entry_qty,entry_price,state",
+                "state": "neq.CLOSED",
+            },
+            headers={"apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json"},
+            timeout=5.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"err:{type(exc).__name__}"
+    if resp.status_code != 200:
+        return f"http {resp.status_code}"
+    try:
+        rows = resp.json()
+    except ValueError:
+        return "parse_err"
+    if not rows:
+        return "FLAT"
+    parts = [
+        f"{r.get('symbol')} {r.get('direction')} x{r.get('entry_qty')} "
+        f"@{r.get('entry_price')} ({r.get('state')})"
+        for r in rows
+    ]
+    return "; ".join(parts)
+
+
+def _seanbot_scorecard_today() -> str:
+    """AGREE/MISS scorecard for today's SeanBot entries from the in-container
+    reconciliation journal (read via docker exec). '(unavailable)' on any error."""
+    today_iso = datetime.now(UTC).strftime("%Y-%m-%d")
+    try:
+        res = subprocess.run(
+            ["docker", "exec", "tradeflow-app", "cat", "/app/logs/reconciliations.jsonl"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return f"(unavailable: {type(exc).__name__})"
+    if res.returncode != 0:
+        return "(unavailable: journal not found)"
+    agree = 0
+    miss: dict[str, int] = {}
+    total = 0
+    for raw in res.stdout.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not str(rec.get("signal_ts", "")).startswith(today_iso):
+            continue
+        total += 1
+        cls = str(rec.get("classification", ""))
+        if cls.startswith("AGREE"):
+            agree += 1
+        elif cls.startswith("MISS"):
+            miss[cls] = miss.get(cls, 0) + 1
+    if total == 0:
+        return "0 entries today"
+    miss_str = ", ".join(f"{n} {cls}" for cls, n in sorted(miss.items()))
+    return f"{total} entries → {agree} AGREE" + (f", {miss_str}" if miss_str else "")
+
+
 def _last_app_log_line() -> str:
     """Tail tradeflow-app to one line; truncate; return placeholder on any error."""
     try:
@@ -661,6 +790,12 @@ def run_daily_report() -> int:
 
     today_iso = datetime.now(UTC).strftime("%Y-%m-%d")
     lifecycles_today = _count_lifecycles_today(sb_url, sb_key)
+    # Fix 5 — LOG the lifecycle-count query result so a future "0" is
+    # distinguishable from a transient failure (err:/http) in the watchdog log.
+    LOGGER.info("[WATCHDOG] daily_report: lifecycles_today_query=%s", lifecycles_today)
+    realized_pnl = _realized_pnl_today(sb_url, sb_key)
+    open_pos = _open_position_summary(sb_url, sb_key)
+    seanbot_scorecard = _seanbot_scorecard_today()
     app_rc = app_detail.get("restart_count", "?") if isinstance(app_detail, dict) else "?"
     last_log = _last_app_log_line()
     green = sum(1 for _, ok, _ in probes if ok)
@@ -674,7 +809,12 @@ def run_daily_report() -> int:
         mark = "OK" if ok else "FAIL"
         lines.append(f"- {name}: {mark} — {detail}")
     lines.append("")
-    lines.append(f"Lifecycles today: {lifecycles_today}")
+    lines.append("TRADING:")
+    lines.append(f"- Lifecycles today: {lifecycles_today}")
+    lines.append(f"- Realized P&L today: {realized_pnl}")
+    lines.append(f"- Open position (DB view): {open_pos}")
+    lines.append(f"- SeanBot scorecard: {seanbot_scorecard}")
+    lines.append("")
     lines.append(f"App restart count: {app_rc}")
     lines.append(f"App last log: {last_log}")
     msg = "\n".join(lines)

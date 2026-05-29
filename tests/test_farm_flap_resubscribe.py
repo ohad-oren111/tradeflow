@@ -1,9 +1,14 @@
 """Tests for the IB market-data farm-flap auto-resubscribe path (§0.5.181).
 
-The IBKR data farm drops several times a day with a 2103 + 2105 + 10182 trio
-and recovers ~1s later (2104/2106); the keepUpToDate bar subscription dies with
-the 10182 and is never re-armed. ``IBClient`` watches ``ib.errorEvent`` for the
-trio and re-invokes the orchestrator's subscribe callable after a debounce.
+The IBKR data farm drops several times a day with some combination of 2103 /
+2105 / 10182 and recovers ~1s later (2104/2106); the keepUpToDate bar
+subscription dies and is never re-armed. ``IBClient`` watches ``ib.errorEvent``
+and re-invokes the orchestrator's subscribe callable after a debounce.
+
+W-S14.2 Track 3: detection is "ANY of the farm-flap codes", not the full trio —
+the 04:03 UTC flap that blinded the feed for 37 min was 2105 + 10182 with no
+2103, so the old all-of-trio guard never fired. The 30s idempotency guard keeps
+a multi-code flap collapsed to exactly one resubscribe.
 
 Mocked at the IBClient wrapper boundary — no real ib_async network calls. Each
 test gets a fresh mock IB (per the ``mock_ib_factory`` fixture in conftest).
@@ -44,7 +49,7 @@ def _feed(client: IBClient, *codes: int) -> None:
         client._on_ib_error_farm_flap(4, code, f"err {code}", None)
 
 
-# C1 — completed trio re-invokes the subscribe path exactly once.
+# C1 — the full trio still collapses to exactly one resubscribe (guard holds).
 async def test_completed_trio_triggers_single_resubscribe(mock_ib_factory, monkeypatch):
     monkeypatch.setattr(ib_client_mod, "_FARM_FLAP_DEBOUNCE_SEC", 0.0)
     client, fake_ib = _make_client(mock_ib_factory)
@@ -93,14 +98,53 @@ async def test_two_rapid_trios_dedup_to_single_resubscribe(mock_ib_factory, monk
     assert resubscribe.await_count == 1
 
 
-# C4 — a partial sequence (no 10182) must NOT resubscribe.
-async def test_partial_sequence_does_not_resubscribe(mock_ib_factory, monkeypatch):
+# C4a — a 2105-only flap (no 2103) must resubscribe (the 04:03 UTC blind window).
+async def test_2105_only_triggers_resubscribe(mock_ib_factory, monkeypatch):
     monkeypatch.setattr(ib_client_mod, "_FARM_FLAP_DEBOUNCE_SEC", 0.0)
     client, _ = _make_client(mock_ib_factory)
     resubscribe = AsyncMock(return_value=None)
     client.arm_farm_flap_watch(asyncio.get_running_loop(), resubscribe)
 
-    _feed(client, 2103, 2105)  # warning-only flap, no fatal 10182
+    _feed(client, 2105)
+    await asyncio.sleep(0.05)
+
+    assert resubscribe.await_count == 1
+
+
+# C4b — a 10182-only flap must resubscribe.
+async def test_10182_only_triggers_resubscribe(mock_ib_factory, monkeypatch):
+    monkeypatch.setattr(ib_client_mod, "_FARM_FLAP_DEBOUNCE_SEC", 0.0)
+    client, _ = _make_client(mock_ib_factory)
+    resubscribe = AsyncMock(return_value=None)
+    client.arm_farm_flap_watch(asyncio.get_running_loop(), resubscribe)
+
+    _feed(client, 10182)
+    await asyncio.sleep(0.05)
+
+    assert resubscribe.await_count == 1
+
+
+# C4c — the 2105 + 10182 flap (no 2103) collapses to a single resubscribe.
+async def test_2105_plus_10182_collapses_to_one_resubscribe(mock_ib_factory, monkeypatch):
+    monkeypatch.setattr(ib_client_mod, "_FARM_FLAP_DEBOUNCE_SEC", 0.0)
+    client, _ = _make_client(mock_ib_factory)
+    resubscribe = AsyncMock(return_value=None)
+    client.arm_farm_flap_watch(asyncio.get_running_loop(), resubscribe)
+
+    _feed(client, 2105, 10182)  # the exact 04:03 UTC signature
+    await asyncio.sleep(0.05)
+
+    assert resubscribe.await_count == 1
+
+
+# C4d — an unrelated error code must NOT resubscribe.
+async def test_unrelated_error_code_does_not_resubscribe(mock_ib_factory, monkeypatch):
+    monkeypatch.setattr(ib_client_mod, "_FARM_FLAP_DEBOUNCE_SEC", 0.0)
+    client, _ = _make_client(mock_ib_factory)
+    resubscribe = AsyncMock(return_value=None)
+    client.arm_farm_flap_watch(asyncio.get_running_loop(), resubscribe)
+
+    _feed(client, 2104, 2106, 200, 399)  # recovery + benign codes
     await asyncio.sleep(0.05)
 
     assert resubscribe.await_count == 0

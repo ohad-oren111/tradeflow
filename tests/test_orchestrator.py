@@ -575,3 +575,70 @@ async def test_bar_subscription_log_includes_use_rth(caplog):
     assert (
         "use_rth=False" in start_logs[0]
     ), f"start log must include hours mode; got: {start_logs[0]!r}"
+
+
+# ============================================================================
+# W-S14.2 Track 5a — hourly session-status digest (pure builder)
+# ============================================================================
+
+from datetime import UTC as _UTC  # noqa: E402
+from datetime import datetime as _dt  # noqa: E402
+
+from src.orchestrator import build_hourly_digest  # noqa: E402
+
+
+def _digest_window():
+    start = _dt(2026, 5, 29, 14, 0, tzinfo=_UTC)
+    end = _dt(2026, 5, 29, 15, 0, tzinfo=_UTC)
+    return start, end
+
+
+def test_build_hourly_digest_counts_decisions_and_gate_breakdown():
+    start, end = _digest_window()
+    decisions = (
+        [{"decision": "noop_filter", "failed": "touch"}] * 45
+        + [{"decision": "noop_filter", "failed": "bullish"}] * 10
+        + [{"decision": "noop_filter", "failed": "ma_order"}] * 3
+        + [{"decision": "noop_session_edge"}] * 2
+    )
+    line = build_hourly_digest(
+        window_start=start,
+        window_end=end,
+        decisions=decisions,
+        reconciliations=[],
+        pos_str="FLAT",
+        feed_ok=True,
+        suppressed_count=0,
+    )
+    assert "TradeFlow hourly 14:00–15:00Z" in line
+    assert "pos=FLAT" in line
+    assert "evals=60" in line
+    assert "long_signal=0" in line
+    assert "noop_filter=58" in line
+    assert "touch=45 bullish=10 ma_order=3 gap=0" in line
+    assert "edge=2" in line
+    assert "feed OK" in line
+
+
+def test_build_hourly_digest_seanbot_scorecard_and_suppressed():
+    start, end = _digest_window()
+    recon = [
+        {"classification": "AGREE_ENTER"},
+        {"classification": "MISS-filter:touch"},
+        {"classification": "MISS-filter:touch"},
+    ]
+    line = build_hourly_digest(
+        window_start=start,
+        window_end=end,
+        decisions=[{"decision": "long_signal"}],
+        reconciliations=recon,
+        pos_str="MNQM6x2",
+        feed_ok=False,
+        suppressed_count=4,
+    )
+    assert "long_signal=1" in line
+    assert "SeanBot: 3 entries → 1 AGREE" in line
+    assert "2 MISS-filter:touch" in line
+    assert "suppressed_in_position=4" in line
+    assert "feed STALE" in line
+    assert "pos=MNQM6x2" in line

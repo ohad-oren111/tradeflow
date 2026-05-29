@@ -141,24 +141,71 @@ def test_signal_fires_when_ma_gap_at_0_5_boundary():
     assert signal.direction == "LONG"
 
 
-def test_no_signal_when_candle_is_bearish():
-    """All gates pass except bullish — confirms the bullish leg gates correctly."""
-    bars = _pullback_bar_dicts(n=120)
-    df = pd.DataFrame(bars[:-1])
-    df = add_all_indicators(df)
+def _engineer_bullish_offset_bar(bars: list[dict], *, close_minus_open: float) -> float:
+    """Replace ``bars[-1]`` with an exact-touch bar whose ``close - open`` equals
+    ``close_minus_open`` (negative == red candle). Returns the close. Touch and
+    ma_order/gap gates pass so only the bullish leg is under test.
+    """
+    df = add_all_indicators(pd.DataFrame(bars[:-1]))
     ma_slow_prev = float(df["ma_slow"].iloc[-1])
     last_close = ma_slow_prev + 12.0
     bars[-1] = {
         "time": bars[-1]["time"],
-        "open": last_close + 5.0,  # open > close → bearish
+        "open": last_close - close_minus_open,
         "high": last_close + 6.0,
-        "low": ma_slow_prev,
+        "low": ma_slow_prev,  # exact touch — inside [-15, +5] window
         "close": last_close,
     }
+    return last_close
+
+
+def test_no_signal_when_candle_is_bearish():
+    """A 5pt red candle is beyond ``ma_bullish_tolerance_pts`` (2.0) — still blocks.
+
+    W-S14.2 Track 2 relaxed the bullish gate to ``close >= open - tol``; a candle
+    whose close is 5pt below its open is still rejected at the default 2pt tol.
+    """
+    bars = _pullback_bar_dicts(n=120)
+    _engineer_bullish_offset_bar(bars, close_minus_open=-5.0)
 
     strat = Sma100BounceStrategy("MNQM6")
     signal = _stuff_strategy(strat, bars)
     assert signal is None
+
+
+def test_bullish_tolerance_admits_small_red_candle():
+    """W-S14.2 Track 2: a 0.5pt red touch candle (the SeanBot 08:33Z / 23:13Z
+    miss shape) now FIRES under the 2.0pt tolerance but is BLOCKED under the prior
+    strict gate (tol=0.0). Pins the calibration both directions."""
+    bars = _pullback_bar_dicts(n=120)
+    _engineer_bullish_offset_bar(bars, close_minus_open=-0.5)
+
+    # Default params (tol=2.0) → fires.
+    fired = _stuff_strategy(Sma100BounceStrategy("MNQM6"), bars)
+    assert fired is not None
+    assert fired.direction == "LONG"
+
+    # Prior strict behavior (tol=0.0) → blocked. Fresh bars (strategy is stateful).
+    bars_strict = _pullback_bar_dicts(n=120)
+    _engineer_bullish_offset_bar(bars_strict, close_minus_open=-0.5)
+    strict = _stuff_strategy(
+        Sma100BounceStrategy("MNQM6", params=replace(RISK, ma_bullish_tolerance_pts=0.0)),
+        bars_strict,
+    )
+    assert strict is None
+
+
+def test_bullish_tolerance_boundary_is_inclusive():
+    """Close exactly ``tol`` below open passes (``>=``); just beyond it blocks."""
+    bars_at = _pullback_bar_dicts(n=120)
+    _engineer_bullish_offset_bar(bars_at, close_minus_open=-RISK.ma_bullish_tolerance_pts)
+    assert _stuff_strategy(Sma100BounceStrategy("MNQM6"), bars_at) is not None
+
+    bars_past = _pullback_bar_dicts(n=120)
+    _engineer_bullish_offset_bar(
+        bars_past, close_minus_open=-(RISK.ma_bullish_tolerance_pts + 0.25)
+    )
+    assert _stuff_strategy(Sma100BounceStrategy("MNQM6"), bars_past) is None
 
 
 def test_no_signal_when_low_too_far_below_ma_slow():

@@ -199,7 +199,7 @@ def test_probe_ib_api_success(monkeypatch):
 def test_probe_ib_api_connect_timeout(monkeypatch):
     mock_ib = _ib_mock(connect_ok=False, connected=False)
     monkeypatch.setattr(wd, "IB", lambda: mock_ib)
-    ok, detail = wd.probe_ib_api("127.0.0.1", 4002, 96, timeout=1.0)
+    ok, detail = wd.probe_ib_api("127.0.0.1", 4002, 96, timeout=1.0, attempts=1)
     assert ok is False
     assert "TimeoutError" in detail
 
@@ -207,7 +207,7 @@ def test_probe_ib_api_connect_timeout(monkeypatch):
 def test_probe_ib_api_reqcurrenttime_timeout(monkeypatch):
     mock_ib = _ib_mock(time_ok=False)
     monkeypatch.setattr(wd, "IB", lambda: mock_ib)
-    ok, detail = wd.probe_ib_api("127.0.0.1", 4002, 96, timeout=1.0)
+    ok, detail = wd.probe_ib_api("127.0.0.1", 4002, 96, timeout=1.0, attempts=1)
     assert ok is False
     assert "TimeoutError" in detail
 
@@ -215,9 +215,35 @@ def test_probe_ib_api_reqcurrenttime_timeout(monkeypatch):
 def test_probe_ib_api_missing_server_version(monkeypatch):
     mock_ib = _ib_mock(server_version=0)
     monkeypatch.setattr(wd, "IB", lambda: mock_ib)
-    ok, detail = wd.probe_ib_api("127.0.0.1", 4002, 96, timeout=1.0)
+    ok, detail = wd.probe_ib_api("127.0.0.1", 4002, 96, timeout=1.0, attempts=1)
     assert ok is False
     assert "missing server version" in detail
+
+
+def test_probe_ib_api_retries_then_succeeds(monkeypatch):
+    """W-S14.2 Track 5c: a transient failure on attempt 1 recovers on attempt 2
+    rather than declaring a false FAIL. Sleep is stubbed so the test is fast."""
+    fail_ib = _ib_mock(connect_ok=False, connected=False)
+    ok_ib = _ib_mock()
+    ibs = iter([fail_ib, ok_ib])
+    monkeypatch.setattr(wd, "IB", lambda: next(ibs))
+    slept: list[float] = []
+    ok, detail = wd.probe_ib_api(
+        "127.0.0.1", 4002, 96, timeout=1.0, attempts=3, sleep_fn=slept.append
+    )
+    assert ok is True
+    assert "recovered on attempt 2/3" in detail
+    assert slept == [2.0]  # one backoff before the successful 2nd attempt
+
+
+def test_probe_ib_api_all_attempts_fail(monkeypatch):
+    """All attempts fail → FAIL with the attempt counter in the detail."""
+    monkeypatch.setattr(wd, "IB", lambda: _ib_mock(connect_ok=False, connected=False))
+    ok, detail = wd.probe_ib_api(
+        "127.0.0.1", 4002, 96, timeout=1.0, attempts=3, sleep_fn=lambda _s: None
+    )
+    assert ok is False
+    assert "attempt 3/3" in detail
 
 
 # ============================================================================
@@ -792,3 +818,43 @@ def test_load_state_backfills_stable_cycles_on_old_state(tmp_state):
     )
     state = wd.load_state()
     assert state["restart_loop_stable_cycles"] == 0
+
+
+# ============================================================================
+# W-S14.2 Track 5c — daily report TRADING section + Fix 5 logging
+# ============================================================================
+
+
+def test_run_daily_report_includes_trading_section(monkeypatch, caplog):
+    captured: dict = {}
+    monkeypatch.setattr(wd, "send_telegram", lambda msg, *a, **k: captured.update(msg=msg) or True)
+    monkeypatch.setattr(wd, "_ib_env", lambda: ("h", 4002, 96))
+    monkeypatch.setattr(wd, "_supabase_env", lambda: ("https://x", "key"))
+    monkeypatch.setattr(wd, "probe_ib_api", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(wd, "probe_container", lambda name: (True, {"restart_count": 0}))
+    monkeypatch.setattr(wd, "probe_supabase", lambda *a, **k: (True, "http 200"))
+    monkeypatch.setattr(wd, "probe_dashboard", lambda *a, **k: (True, "http 200"))
+    monkeypatch.setattr(wd, "probe_disk", lambda *a, **k: (True, {"/": 13}))
+    monkeypatch.setattr(wd, "probe_memory", lambda *a, **k: (True, {"used_pct": 30.0}))
+    monkeypatch.setattr(wd, "_last_app_log_line", lambda: "tail")
+    monkeypatch.setattr(wd, "_count_lifecycles_today", lambda u, k: "2")
+    monkeypatch.setattr(wd, "_realized_pnl_today", lambda u, k: "$599.52 (1 closed)")
+    monkeypatch.setattr(
+        wd, "_open_position_summary", lambda u, k: "MNQM6 LONG x2 @30413.75 (ACTIVE)"
+    )
+    monkeypatch.setattr(
+        wd, "_seanbot_scorecard_today", lambda: "3 entries → 1 AGREE, 2 MISS-filter:touch"
+    )
+
+    with caplog.at_level(logging.INFO, logger="tradeflow_watchdog"):
+        rc = wd.run_daily_report()
+
+    assert rc == 0
+    msg = captured["msg"]
+    assert "TRADING:" in msg
+    assert "Realized P&L today: $599.52 (1 closed)" in msg
+    assert "Open position (DB view): MNQM6 LONG x2 @30413.75 (ACTIVE)" in msg
+    assert "SeanBot scorecard: 3 entries → 1 AGREE, 2 MISS-filter:touch" in msg
+    assert "Lifecycles today: 2" in msg
+    # Fix 5 — the lifecycle-count query result is logged (0 vs failure distinguishable).
+    assert any("lifecycles_today_query=2" in r.getMessage() for r in caplog.records)
