@@ -15,7 +15,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from ib_async import IB, BarDataList, Contract, Order, PortfolioItem, Position, Trade
+from ib_async import IB, BarDataList, Contract, Fill, Order, PortfolioItem, Position, Trade
 
 LOGGER = logging.getLogger(__name__)
 
@@ -254,6 +254,23 @@ class IBClient:
         trades = self._ib.openTrades()
         LOGGER.info("[ib_client] open_trades — count=%s", len(trades))
         return trades
+
+    async def get_fills(self) -> list[Fill]:
+        """Return the session's executions/fills (``IB.fills()``).
+
+        W-S15.3 — the reconciler uses this to recover the ACTUAL execution price
+        of a bracket leg when the event-driven router missed the fillEvent. Each
+        ``Fill`` carries an ``execution`` (with ``orderId`` / ``shares`` /
+        ``price`` / ``avgPrice``). ``IB.fills()`` is the in-session cache populated
+        by ``execDetailsEvent``; it holds the current session's fills only, so it
+        is empty after a reconnect that post-dates the fill — callers MUST fall
+        back to the order price in that case (never raise).
+        """
+        if not self.is_connected:
+            raise RuntimeError("not connected — call connect() first")
+        fills = self._ib.fills()
+        LOGGER.info("[ib_client] fills — count=%s", len(fills))
+        return list(fills)
 
     async def get_account_summary(self, account: str = "") -> dict[str, float]:
         """Return NetLiquidation / AvailableFunds / BuyingPower keyed by tag."""

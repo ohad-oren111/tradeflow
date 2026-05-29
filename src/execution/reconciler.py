@@ -328,7 +328,7 @@ class Reconciler:
         )
         qty = lifecycle.entry_qty or 0
         entry_price = lifecycle.entry_price or 0.0
-        exit_price = _exit_price_for(lifecycle, exit_reason)
+        exit_price = await self._resolve_exit_price(lifecycle, exit_reason)
         commission_total = float(qty) * MNQ.commission_rt_usd
         pnl_gross = compute_pnl_gross(
             direction=Direction(lifecycle.direction),
@@ -350,6 +350,53 @@ class Reconciler:
             pnl_gross=pnl_gross,
             pnl_net=pnl_net,
         )
+
+    async def _resolve_exit_price(
+        self,
+        lifecycle: Lifecycle,
+        exit_reason: ExitReason,
+    ) -> float:
+        """W-S15.3 — exit price for a reconciler-driven close.
+
+        Prefer the ACTUAL broker fill price of the filled leg; fall back to the
+        order price (:func:`_exit_price_for`) only when no matching fill is
+        visible. Before this fix the reconciler recorded the STOP/TARGET *order*
+        price as the exit (e.g. a stop filled 15pt past its trigger logged the
+        trigger price, ~$60 off on 2ct), biasing the forward P&L scorecard. This
+        is accounting only — entry/sizing/SL-TP distances are unchanged; it
+        affects only ``exit_price`` / ``pnl_*`` recorded at close.
+
+        The fill lookup is best-effort: ``IB.fills()`` is an in-session cache, so
+        after a reconnect that post-dated the fill it's empty and we use the
+        order price (the prior behaviour — no regression). Never raises.
+        """
+        filled_order_id = _filled_order_id_for(lifecycle, exit_reason)
+        if filled_order_id:
+            try:
+                fills = await self._ib.get_fills()
+                actual = _fill_price_for_order(fills, filled_order_id)
+                if actual is not None:
+                    LOGGER.info(
+                        "[RECON] %s: exit_price from broker fill — id=%s order=%s "
+                        "fill=%.2f order_px=%.2f reason=%s",
+                        lifecycle.symbol,
+                        lifecycle.lifecycle_id,
+                        filled_order_id,
+                        actual,
+                        _exit_price_for(lifecycle, exit_reason),
+                        exit_reason.value,
+                    )
+                    return actual
+            except Exception as exc:  # noqa: BLE001 — fill lookup is best-effort
+                LOGGER.warning(
+                    "[RECON] %s: fill_lookup_error — order=%s type=%s msg=%s "
+                    "(falling back to order price)",
+                    lifecycle.symbol,
+                    filled_order_id,
+                    type(exc).__name__,
+                    exc,
+                )
+        return _exit_price_for(lifecycle, exit_reason)
 
     async def _cancel_open_legs(
         self,
@@ -682,12 +729,59 @@ def _resolve_exit_attribution(
 
 
 def _exit_price_for(lifecycle: Lifecycle, exit_reason: ExitReason) -> float:
-    """Best-effort exit price when reconciler can't see the fill itself."""
+    """Order-price fallback when the reconciler can't see the actual fill.
+
+    W-S15.3 — used only when :func:`_fill_price_for_order` finds no matching fill
+    (e.g. the fill predates the current IB session). This deliberately records
+    the STOP/TARGET *order* price; the slippage-accurate path is the fill lookup
+    in :meth:`Reconciler._resolve_exit_price`.
+    """
     if exit_reason is ExitReason.STOP and lifecycle.stop_price is not None:
         return float(lifecycle.stop_price)
     if exit_reason is ExitReason.TARGET and lifecycle.target_price is not None:
         return float(lifecycle.target_price)
     return float(lifecycle.entry_price or 0.0)
+
+
+def _filled_order_id_for(lifecycle: Lifecycle, exit_reason: ExitReason) -> int | None:
+    """The order id whose fill closed the position, by attribution.
+
+    STOP → the protective stop; TARGET → the TP limit; MANUAL/EOD → the separate
+    market exit (``exit_order_id``; 0/None sentinel when the reconciler couldn't
+    attribute it). Mirror of :func:`_exit_price_for`'s leg selection.
+    """
+    if exit_reason is ExitReason.STOP:
+        return lifecycle.stop_order_id
+    if exit_reason is ExitReason.TARGET:
+        return lifecycle.target_order_id
+    return lifecycle.exit_order_id
+
+
+def _fill_price_for_order(fills: list[Any], order_id: int) -> float | None:
+    """Quantity-weighted average execution price of ``order_id`` across ``fills``.
+
+    Returns ``None`` when no execution matches (the caller then uses the order
+    price). Quantity-weighting handles partial fills correctly — a single order
+    can fill in several executions at different prices.
+    """
+    total_qty = 0.0
+    total_notional = 0.0
+    for fill in fills:
+        execution = getattr(fill, "execution", None)
+        if execution is None:
+            continue
+        if getattr(execution, "orderId", None) != order_id:
+            continue
+        shares = float(getattr(execution, "shares", 0.0) or 0.0)
+        price = float(
+            getattr(execution, "price", 0.0) or getattr(execution, "avgPrice", 0.0) or 0.0
+        )
+        if shares and price:
+            total_qty += shares
+            total_notional += shares * price
+    if total_qty > 0:
+        return total_notional / total_qty
+    return None
 
 
 def _now_iso() -> str:

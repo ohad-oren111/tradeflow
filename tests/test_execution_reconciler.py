@@ -26,10 +26,14 @@ from src.execution.dirty_set import DirtySet
 from src.execution.reconciler import (
     ReconcileAction,
     Reconciler,
+    _exit_price_for,
+    _fill_price_for_order,
+    _filled_order_id_for,
     compute_pnl_gross,
 )
 from src.state_machine import (
     Direction,
+    ExitReason,
     InvariantViolationError,
     Lifecycle,
     State,
@@ -864,3 +868,56 @@ async def test_poll_halt_ack_supabase_returns_ack_older_than_raise_no_clear():
     await rec._poll_halt_ack()
 
     orch.clear_halt.assert_not_called()
+
+
+# ----------------------------------------------------- W-S15.3 exit-price helpers
+
+
+def _exec_fill(order_id: int, shares: float, price: float) -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        execution=SimpleNamespace(orderId=order_id, shares=shares, price=price, avgPrice=price)
+    )
+
+
+def test_fill_price_for_order_qty_weights_partial_fills():
+    # Same order, two partial executions at different prices → qty-weighted avg.
+    fills = [_exec_fill(20, 1, 30300.0), _exec_fill(20, 3, 30310.0)]
+    # (1*30300 + 3*30310) / 4 = 30307.5
+    assert _fill_price_for_order(fills, 20) == pytest.approx(30307.5)
+
+
+def test_fill_price_for_order_no_match_returns_none():
+    fills = [_exec_fill(99, 2, 30310.0)]
+    assert _fill_price_for_order(fills, 20) is None
+    assert _fill_price_for_order([], 20) is None
+
+
+def test_filled_order_id_for_attribution():
+    lc = _make_lifecycle(State.ACTIVE)  # stop_order_id=1003, target_order_id=1002
+    lc.exit_order_id = 1009
+    assert _filled_order_id_for(lc, ExitReason.STOP) == lc.stop_order_id
+    assert _filled_order_id_for(lc, ExitReason.TARGET) == lc.target_order_id
+    assert _filled_order_id_for(lc, ExitReason.MANUAL) == lc.exit_order_id
+
+
+async def test_resolve_exit_price_prefers_actual_fill_over_stop_price():
+    lc = _make_lifecycle(State.ACTIVE, stop_price=30325.0)
+    ib = _make_mock_ib()
+    # Stop (1003) actually filled 15pt past trigger.
+    ib.get_fills = AsyncMock(return_value=[_exec_fill(lc.stop_order_id, 2, 30310.0)])
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib)
+    price = await rec._resolve_exit_price(lc, ExitReason.STOP)
+    assert price == 30310.0
+    # Sanity: the order-price fallback would have returned the trigger.
+    assert _exit_price_for(lc, ExitReason.STOP) == 30325.0
+
+
+async def test_resolve_exit_price_falls_back_when_fill_lookup_raises():
+    lc = _make_lifecycle(State.ACTIVE, stop_price=30325.0)
+    ib = _make_mock_ib()
+    ib.get_fills = AsyncMock(side_effect=RuntimeError("not connected"))
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib)
+    price = await rec._resolve_exit_price(lc, ExitReason.STOP)
+    assert price == 30325.0  # order-price fallback, never raises

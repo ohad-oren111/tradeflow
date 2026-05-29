@@ -1,0 +1,310 @@
+"""End-to-end lifecycle integration tests (W-S15.3 Track B + D).
+
+Unlike test_execution_router.py / test_execution_reconciler.py — which mock the
+StateMachine — these drive the REAL OrderRouter + Reconciler + StateMachine
+wiring through full lifecycles, mocking ONLY the two external boundaries:
+
+  * IBClient  → an in-memory ``_FakeIB`` (order placement, cancels, fills)
+  * Supabase  → an in-memory ``_FakeDB`` (the StateMachine's persistence)
+
+This exercises the real W-S15.1 sibling-cancel call path and the W-S15.3
+fill-derived exit-price path that isolated unit mocks can't reach. Three exit
+routes are covered:
+
+  1. TARGET fill (router fillEvent)  → protective STP cancelled, CLOSED.
+  2. STOP fill   (router fillEvent)  → TP LMT cancelled, CLOSED.
+  3. missed event (reconciler close) → position flat broker-side with no router
+     fillEvent → reconciler cancels the surviving leg AND records the *actual*
+     broker fill price (slippage-accurate), not the order price.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+from config.instruments import MNQ
+from config.risk_params import RISK
+from src.execution.dirty_set import DirtySet
+from src.execution.reconciler import Reconciler
+from src.execution.router import OrderRouter
+from src.state_machine import ExitReason, State, StateMachine
+from src.strategy import Signal
+
+STRAT_NAME = "sma100_bounce"
+SYMBOL = "MNQM6"
+
+
+# --------------------------------------------------------------- in-memory fakes
+
+
+class _FakeDB:
+    """Minimal in-memory stand-in for SupabaseClient — the StateMachine's 5 calls."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict[str, Any]] = {}
+        self.events: list[dict[str, Any]] = []
+        self._seq = 0
+
+    async def select_lifecycles_non_closed_for(self, symbol: str, strategy: str) -> list[dict]:
+        return [
+            r
+            for r in self.rows.values()
+            if r["symbol"] == symbol and r["strategy"] == strategy and r["state"] != "CLOSED"
+        ]
+
+    async def insert_lifecycle(self, row: dict[str, Any]) -> list[dict[str, Any]]:
+        self._seq += 1
+        lcid = f"lc-{self._seq:04d}-00000000-0000-0000-0000-000000000000"
+        full = {
+            **row,
+            "lifecycle_id": lcid,
+            "created_at": "2026-05-29T00:00:00+00:00",
+            "updated_at": "2026-05-29T00:00:00+00:00",
+        }
+        self.rows[lcid] = full
+        return [full]
+
+    async def update_lifecycle(self, lifecycle_id: str, updates: dict[str, Any]) -> list[dict]:
+        self.rows[lifecycle_id].update(updates)
+        return [self.rows[lifecycle_id]]
+
+    async def select_lifecycles_non_closed(self) -> list[dict[str, Any]]:
+        return [r for r in self.rows.values() if r["state"] != "CLOSED"]
+
+    async def insert_lifecycle_event(self, row: dict[str, Any]) -> list[dict[str, Any]]:
+        self.events.append(row)
+        return [row]
+
+
+class _FakeIB:
+    """Stateful in-memory IBClient. Tracks placed + cancelled orders and fills."""
+
+    def __init__(self) -> None:
+        self.is_connected = True
+        self._next_oid = 0
+        self.placed: list[tuple[int, Any]] = []
+        self.cancelled: list[int] = []
+        self.positions: list[Any] = []
+        self.open_trades: list[Any] = []
+        self.fills: list[Any] = []
+
+    async def place_order(self, contract: Any, order: Any) -> Any:
+        self._next_oid += 1
+        oid = self._next_oid
+        with contextlib.suppress(Exception):
+            order.orderId = oid
+        self.placed.append((oid, order))
+        return SimpleNamespace(order=SimpleNamespace(orderId=oid), fills=[], contract=contract)
+
+    async def cancel_order(self, order: Any) -> None:
+        self.cancelled.append(int(getattr(order, "orderId", 0) or 0))
+
+    async def get_positions(self) -> list[Any]:
+        return self.positions
+
+    async def get_portfolio(self) -> list[Any]:
+        return []
+
+    async def get_open_trades(self) -> list[Any]:
+        return self.open_trades
+
+    async def get_fills(self) -> list[Any]:
+        return self.fills
+
+
+# --------------------------------------------------------------------- factories
+
+
+def _make_signal(entry: float, target: float, stop: float) -> Signal:
+    return Signal(
+        instrument=SYMBOL,
+        direction="LONG",
+        entry_price=entry,
+        stop_price=stop,
+        target_price=target,
+        ma_fast_value=entry - 20,
+        ma_slow_value=entry - 50,
+        ma_gap=30.0,
+        adx_value=25.0,
+        timestamp=datetime.now(UTC),
+    )
+
+
+def _make_contract() -> MagicMock:
+    c = MagicMock(name="Contract")
+    c.localSymbol = SYMBOL
+    c.symbol = "MNQ"
+    return c
+
+
+def _fill_trade(order_id: int, qty: int, price: float) -> SimpleNamespace:
+    """A Trade carrying one execution — drives router.on_fill."""
+    execution = SimpleNamespace(
+        orderId=order_id, shares=qty, price=price, avgPrice=price, time=datetime.now(UTC)
+    )
+    fill = SimpleNamespace(execution=execution)
+    return SimpleNamespace(order=SimpleNamespace(orderId=order_id), fills=[fill])
+
+
+def _open_trade(order_id: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        order=SimpleNamespace(orderId=order_id),
+        contract=SimpleNamespace(localSymbol=SYMBOL, symbol="MNQ"),
+    )
+
+
+def _broker_fill(order_id: int, qty: int, price: float) -> SimpleNamespace:
+    """A Fill on IB.fills() — drives the reconciler's _resolve_exit_price."""
+    return SimpleNamespace(
+        execution=SimpleNamespace(orderId=order_id, shares=qty, price=price, avgPrice=price)
+    )
+
+
+# ------------------------------------------------------------------------- wiring
+
+
+def _build() -> tuple[_FakeIB, _FakeDB, StateMachine, OrderRouter, Reconciler, DirtySet]:
+    ib = _FakeIB()
+    db = _FakeDB()
+    sm = StateMachine(db, ib)  # type: ignore[arg-type]
+    dirty = DirtySet()
+    router = OrderRouter(ib, sm, strategy_name=STRAT_NAME, dirty_set=dirty)  # type: ignore[arg-type]
+    orchestrator = MagicMock()
+    orchestrator.is_halted.return_value = False
+    orchestrator.halt_raised_at.return_value = None
+    reconciler = Reconciler(ib, sm, dirty, db, orchestrator)  # type: ignore[arg-type]
+    return ib, db, sm, router, reconciler, dirty
+
+
+async def _enter_to_active(
+    ib: _FakeIB, router: OrderRouter, *, entry: float, target: float, stop: float
+) -> Any:
+    """place_entry → parent fill → ACTIVE. Returns the live cached lifecycle.
+
+    Order ids assigned by _FakeIB in sequence: parent=1, tp=2, protective stp=3.
+    """
+    signal = _make_signal(entry, target, stop)
+    contract = _make_contract()
+    lc = await router.place_entry(signal, contract)
+    # Parent (entry) fill — order id 1.
+    await router.on_fill(_fill_trade(lc.entry_order_id, RISK.contracts_per_trade, entry))
+    return router._by_lifecycle_id[lc.lifecycle_id]
+
+
+# --------------------------------------------------------------------- scenario 1
+
+
+async def test_target_fill_cancels_protective_stop_and_closes():
+    ib, db, sm, router, _recon, _dirty = _build()
+    lc = await _enter_to_active(ib, router, entry=30400.0, target=30550.0, stop=30325.0)
+
+    assert State(lc.state) is State.ACTIVE
+    assert lc.target_order_id == 2
+    assert lc.stop_order_id == 3  # protective STP placed on parent fill
+
+    # TARGET (TP LMT, order id 2) fills at the limit.
+    await router.on_fill(_fill_trade(lc.target_order_id, RISK.contracts_per_trade, 30550.0))
+
+    closed = db.rows[lc.lifecycle_id]
+    assert closed["state"] == State.CLOSED.value
+    assert closed["exit_reason"] == ExitReason.TARGET.value
+    assert closed["exit_price"] == 30550.0
+    # The protective STP (3) was cancelled; the filled TP (2) was not re-cancelled.
+    assert 3 in ib.cancelled
+    assert 2 not in ib.cancelled
+
+
+# --------------------------------------------------------------------- scenario 2
+
+
+async def test_stop_fill_cancels_target_and_closes():
+    ib, db, sm, router, _recon, _dirty = _build()
+    lc = await _enter_to_active(ib, router, entry=30400.0, target=30550.0, stop=30325.0)
+
+    # STOP (protective STP, order id 3) fills at the stop price.
+    await router.on_fill(_fill_trade(lc.stop_order_id, RISK.contracts_per_trade, 30325.0))
+
+    closed = db.rows[lc.lifecycle_id]
+    assert closed["state"] == State.CLOSED.value
+    assert closed["exit_reason"] == ExitReason.STOP.value
+    assert closed["exit_price"] == 30325.0
+    # The resting TP LMT (2) was cancelled; the filled STP (3) was not.
+    assert 2 in ib.cancelled
+    assert 3 not in ib.cancelled
+
+
+# --------------------------------------------------------------------- scenario 3
+
+
+async def test_missed_stop_event_reconciler_closes_cancels_leg_and_uses_fill_price():
+    """Router missed the STOP fillEvent → reconciler closes, cancels the resting
+    TP, and records the ACTUAL slipped fill price (W-S15.3), not the stop price."""
+    ib, db, sm, router, recon, _dirty = _build()
+    lc = await _enter_to_active(ib, router, entry=30400.0, target=30550.0, stop=30325.0)
+
+    # Broker reality: position flat (stop filled, never routed), TP still resting.
+    ib.positions = []
+    ib.open_trades = [_open_trade(lc.target_order_id)]  # TP (2) still open
+    # The stop (order 3) actually filled 15pt BELOW its 30325 trigger (slippage).
+    slipped = 30310.0
+    ib.fills = [_broker_fill(lc.stop_order_id, RISK.contracts_per_trade, slipped)]
+
+    active = (await sm.load_non_closed())[0]
+    action = await recon.reconcile_one(active)
+
+    closed = db.rows[lc.lifecycle_id]
+    assert closed["state"] == State.CLOSED.value
+    assert closed["exit_reason"] == ExitReason.STOP.value
+    # Slippage-accurate: records the actual fill (30310), NOT the stop price (30325).
+    assert closed["exit_price"] == slipped
+    expected_pnl_gross = (slipped - 30400.0) * RISK.contracts_per_trade * MNQ.multiplier
+    assert closed["pnl_gross"] == pytest.approx(expected_pnl_gross)
+    assert closed["pnl_net"] == pytest.approx(
+        expected_pnl_gross - RISK.contracts_per_trade * MNQ.commission_rt_usd
+    )
+    # The surviving TP (2) was cancelled by the reconciler — no orphan left.
+    assert lc.target_order_id in ib.cancelled
+    assert action.value == "active_to_closed"
+
+
+async def test_missed_stop_event_clean_fill_unchanged():
+    """A clean (no-slippage) stop fill records the stop price exactly — the fix
+    does not perturb the no-slippage case."""
+    ib, db, sm, router, recon, _dirty = _build()
+    lc = await _enter_to_active(ib, router, entry=30400.0, target=30550.0, stop=30325.0)
+
+    ib.positions = []
+    ib.open_trades = [_open_trade(lc.target_order_id)]
+    # Filled exactly at the 30325 stop trigger — no slippage.
+    ib.fills = [_broker_fill(lc.stop_order_id, RISK.contracts_per_trade, 30325.0)]
+
+    active = (await sm.load_non_closed())[0]
+    await recon.reconcile_one(active)
+
+    closed = db.rows[lc.lifecycle_id]
+    assert closed["exit_price"] == 30325.0
+
+
+async def test_reconciler_falls_back_to_order_price_when_no_fill_visible():
+    """If IB.fills() has no matching execution (e.g. fill predates the session),
+    the reconciler falls back to the STOP/TARGET order price — prior behaviour,
+    no regression."""
+    ib, db, sm, router, recon, _dirty = _build()
+    lc = await _enter_to_active(ib, router, entry=30400.0, target=30550.0, stop=30325.0)
+
+    ib.positions = []
+    ib.open_trades = [_open_trade(lc.target_order_id)]
+    ib.fills = []  # no executions visible this session
+
+    active = (await sm.load_non_closed())[0]
+    await recon.reconcile_one(active)
+
+    closed = db.rows[lc.lifecycle_id]
+    # Falls back to the stop order price.
+    assert closed["exit_price"] == 30325.0
