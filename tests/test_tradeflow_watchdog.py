@@ -843,7 +843,7 @@ def test_run_daily_report_includes_trading_section(monkeypatch, caplog):
         wd, "_open_position_summary", lambda u, k: "MNQM6 LONG x2 @30413.75 (ACTIVE)"
     )
     monkeypatch.setattr(
-        wd, "_seanbot_scorecard_today", lambda: "3 entries → 1 AGREE, 2 MISS-filter:touch"
+        wd, "_seanbot_scorecard_today", lambda u, k: "3 entries → 1 AGREE, 2 MISS-filter:touch"
     )
 
     with caplog.at_level(logging.INFO, logger="tradeflow_watchdog"):
@@ -896,10 +896,49 @@ def test_daily_report_uses_service_role_for_data_reads(monkeypatch):
     monkeypatch.setattr(wd, "probe_disk", lambda *a, **k: (True, {"/": 13}))
     monkeypatch.setattr(wd, "probe_memory", lambda *a, **k: (True, {"used_pct": 30.0}))
     monkeypatch.setattr(wd, "_last_app_log_line", lambda: "tail")
-    monkeypatch.setattr(wd, "_seanbot_scorecard_today", lambda: "0 entries today")
+    monkeypatch.setattr(wd, "_seanbot_scorecard_today", lambda u, k: "0 entries today")
     monkeypatch.setattr(wd, "_count_lifecycles_today", lambda u, k: seen_keys.append(k) or "2")
     monkeypatch.setattr(wd, "_realized_pnl_today", lambda u, k: seen_keys.append(k) or "$0")
     monkeypatch.setattr(wd, "_open_position_summary", lambda u, k: seen_keys.append(k) or "FLAT")
 
     assert wd.run_daily_report() == 0
     assert seen_keys == ["service", "service", "service"]  # never the anon key
+
+
+# ============================================================================
+# W-S15.2 — SeanBot scorecard reads the durable signal_reconciliations table
+# ============================================================================
+
+
+def test_seanbot_scorecard_aggregates_supabase_rows(monkeypatch):
+    """Counts must match the legacy JSONL aggregation for the same input:
+    AGREE_ENTER -> AGREE; MISS-* grouped and sorted."""
+    rows = [
+        {"classification": "AGREE_ENTER", "signal_ts": "2026-05-29T14:00:00+00:00"},
+        {"classification": "MISS-filter:touch", "signal_ts": "2026-05-29T14:01:00+00:00"},
+        {"classification": "MISS-filter:touch", "signal_ts": "2026-05-29T14:02:00+00:00"},
+    ]
+    resp = MagicMock(status_code=200, json=lambda: rows)
+    monkeypatch.setattr(wd.httpx, "get", MagicMock(return_value=resp))
+    out = wd._seanbot_scorecard_today("https://x", "service")
+    assert out == "3 entries → 1 AGREE, 2 MISS-filter:touch"
+
+
+def test_seanbot_scorecard_empty_table_is_zero_not_error(monkeypatch):
+    resp = MagicMock(status_code=200, json=lambda: [])
+    monkeypatch.setattr(wd.httpx, "get", MagicMock(return_value=resp))
+    assert wd._seanbot_scorecard_today("https://x", "service") == "0 entries today"
+
+
+def test_seanbot_scorecard_missing_creds_returns_placeholder(monkeypatch):
+    # No network call when creds are absent.
+    monkeypatch.setattr(
+        wd.httpx, "get", MagicMock(side_effect=AssertionError("should not be called"))
+    )
+    assert wd._seanbot_scorecard_today(None, None) == "?"
+
+
+def test_seanbot_scorecard_http_error_is_unavailable(monkeypatch):
+    resp = MagicMock(status_code=500, json=lambda: [])
+    monkeypatch.setattr(wd.httpx, "get", MagicMock(return_value=resp))
+    assert wd._seanbot_scorecard_today("https://x", "service") == "(unavailable: http 500)"
