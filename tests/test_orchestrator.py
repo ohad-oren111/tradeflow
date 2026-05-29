@@ -642,3 +642,62 @@ def test_build_hourly_digest_seanbot_scorecard_and_suppressed():
     assert "suppressed_in_position=4" in line
     assert "feed STALE" in line
     assert "pos=MNQM6x2" in line
+
+
+def test_build_hourly_digest_appends_readiness_when_present():
+    # W-S15.3 Track E — the readiness fragment is appended when non-empty…
+    start, end = _digest_window()
+    line = build_hourly_digest(
+        window_start=start,
+        window_end=end,
+        decisions=[{"decision": "noop_warmup"}],
+        reconciliations=[],
+        pos_str="FLAT",
+        feed_ok=True,
+        suppressed_count=0,
+        readiness="warmup=warming 40/100 bars (~60m) last_bar=3s commit=abc1234",
+    )
+    assert "| warmup=warming 40/100 bars (~60m) last_bar=3s commit=abc1234" in line
+
+
+def test_build_hourly_digest_omits_readiness_when_empty():
+    # …and the divider is absent when readiness is empty (back-compat default).
+    start, end = _digest_window()
+    line = build_hourly_digest(
+        window_start=start,
+        window_end=end,
+        decisions=[],
+        reconciliations=[],
+        pos_str="FLAT",
+        feed_ok=True,
+        suppressed_count=0,
+    )
+    assert "warmup=warming" not in line
+    assert line.rstrip().endswith("feed OK")
+
+
+def test_readiness_fragment_warming_and_ready(monkeypatch):
+    # _readiness_fragment only reads self._strategy + self._last_bar_at, so a
+    # duck-typed stub exercises it without a full Orchestrator build.
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TRADEFLOW_COMMIT", "abcdef1234567890")
+    now = datetime(2026, 5, 29, 18, 30, tzinfo=UTC)
+
+    warming = SimpleNamespace(
+        _strategy=SimpleNamespace(bar_count=40, last_decision={"decision": "noop_warmup"}),
+        _last_bar_at=now - timedelta(seconds=3),
+    )
+    frag = Orchestrator._readiness_fragment(warming, now)
+    assert "warmup=warming 40/100 bars (~60m)" in frag
+    assert "last_bar=3s" in frag
+    assert "commit=abcdef12" in frag
+
+    ready = SimpleNamespace(
+        _strategy=SimpleNamespace(bar_count=120, last_decision={"decision": "noop_filter"}),
+        _last_bar_at=None,
+    )
+    frag2 = Orchestrator._readiness_fragment(ready, now)
+    assert "warmup=ready (120 bars)" in frag2
+    assert "last_bar=n/a" in frag2

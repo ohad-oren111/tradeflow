@@ -53,6 +53,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # W-S15.3 Track E — pass the deployed commit through to the image so the
+      # readiness block reports what's actually running. Set at build time:
+      # `GIT_COMMIT=$(git rev-parse HEAD) docker compose build tradeflow-app`.
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: tradeflow-app
     restart: unless-stopped
     env_file:
@@ -91,6 +96,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     image: tradeflow-tradeflow-app:latest
     container_name: tradeflow-telegram-listener
     command: python -m src.listeners.telegram_listener

@@ -942,3 +942,57 @@ def test_seanbot_scorecard_http_error_is_unavailable(monkeypatch):
     resp = MagicMock(status_code=500, json=lambda: [])
     monkeypatch.setattr(wd.httpx, "get", MagicMock(return_value=resp))
     assert wd._seanbot_scorecard_today("https://x", "service") == "(unavailable: http 500)"
+
+
+# --------------------------------------------------- W-S15.3 Track E readiness
+
+
+def test_deployed_commit_from_env_extracts_short_hash():
+    env = ["PATH=/usr/bin", "TRADEFLOW_COMMIT=94245ad1163bf2446fc204d", "TZ=UTC"]
+    assert wd._deployed_commit_from_env(env) == "94245ad1"
+
+
+def test_deployed_commit_from_env_missing_returns_unknown():
+    assert wd._deployed_commit_from_env(["PATH=/usr/bin"]) == "unknown"
+    assert wd._deployed_commit_from_env(["TRADEFLOW_COMMIT="]) == "unknown"
+
+
+def test_parse_digest_readiness_extracts_fragment():
+    logs = (
+        "2026-05-29 18:00 INFO [ALERT] hourly_session_digest: \U0001f4ca TradeFlow hourly "
+        "17:00-18:00Z | pos=FLAT | evals=60 | feed OK | "
+        "warmup=ready (120 bars) last_bar=4s commit=94245ad1\n"
+        "2026-05-29 18:01 INFO [STRAT] eval decision=noop_warmup\n"
+    )
+    assert wd._parse_digest_readiness(logs) == (
+        "warmup=ready (120 bars) last_bar=4s commit=94245ad1"
+    )
+
+
+def test_parse_digest_readiness_takes_latest_digest():
+    logs = (
+        "[ALERT] hourly_session_digest: ... "
+        "warmup=warming 10/100 bars (~90m) last_bar=2s commit=aaa\n"
+        "[ALERT] hourly_session_digest: ... warmup=ready (110 bars) last_bar=1s commit=bbb\n"
+    )
+    out = wd._parse_digest_readiness(logs)
+    assert "ready (110 bars)" in out
+    assert "warming" not in out
+
+
+def test_parse_digest_readiness_no_digest_placeholder():
+    assert "no digest yet" in wd._parse_digest_readiness("some unrelated log line\n")
+
+
+def test_count_reconnect_events_counts_both_markers():
+    logs = (
+        "[ALERT] reconnect_recovered: elapsed_sec=3.1\n"
+        "noise\n"
+        "[ALERT] reconnect_recovered: elapsed_sec=5.0\n"
+        "[ALERT] bar_sub_resubscribed_after_farm_flap: elapsed_sec=2.0\n"
+    )
+    assert wd._count_reconnect_events(logs) == (2, 1)
+
+
+def test_count_reconnect_events_none():
+    assert wd._count_reconnect_events("quiet logs\n") == (0, 0)
