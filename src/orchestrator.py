@@ -22,7 +22,7 @@ import socket
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import FrameType
 from typing import Any
 
@@ -32,12 +32,12 @@ from comms.telegram import TelegramAlerter
 from config.instruments import MNQ
 from src.clients.ib_client import BrokerExtendedOutageError, IBClient
 from src.clients.supabase_client import SupabaseClient
-from src.comparison.seanbot_reconciler import SeanbotReconciler
+from src.comparison.seanbot_reconciler import _RECON_JSONL_PATH, SeanbotReconciler
 from src.execution.dirty_set import DirtySet
 from src.execution.force_close import EodForceClose
 from src.execution.reconciler import Reconciler
 from src.execution.router import CloseResult, OrderRouter
-from src.state_machine import Lifecycle, State, StateMachine
+from src.state_machine import InvariantViolationError, Lifecycle, State, StateMachine
 
 # _in_session_edge_window is reused by the bar-liveness watchdog so that the
 # "expected bar window" definition has a single source of truth with the
@@ -60,6 +60,14 @@ _BAR_TIMESTAMP_RING_MAXLEN = 4096
 # on demand; if no logs volume is mounted it is ephemeral (queued follow-up).
 _DECISION_JOURNAL_MAXLEN = 240
 _DECISION_JSONL_PATH = "/app/logs/decisions.jsonl"
+
+# Track 5a — hourly session-status digest. One [ALERT] line per interval during
+# CME session hours, sourced from the decision journal + the SeanBot
+# reconciliation journal (both already in-process). Suppressed during edge
+# windows so maintenance silence never pages the operator. Interval is tunable.
+_HOURLY_DIGEST_INTERVAL_SEC = 60 * 60
+# "Feed OK" if a live bar arrived within this window at digest time.
+_DIGEST_FEED_OK_SEC = 5 * 60
 
 # Transient broker disconnects worth catching mid-loop and triggering a
 # resilient reconnect rather than orchestrator exit. Mirrors the tuple in
@@ -159,6 +167,10 @@ class Orchestrator:
         self._last_bar_alert_at: datetime | None = None
         self._bar_timestamps: deque[datetime] = deque(maxlen=_BAR_TIMESTAMP_RING_MAXLEN)
         self._decision_journal: deque[dict] = deque(maxlen=_DECISION_JOURNAL_MAXLEN)
+        # Track 5b — timestamps of long_signals suppressed because a position was
+        # already open. Aggregated into the hourly digest (NOT alerted per-bar,
+        # which would be ~884/day of noise). Bounded like the decision journal.
+        self._suppressed_entry_ts: deque[datetime] = deque(maxlen=_DECISION_JOURNAL_MAXLEN)
         # Track 4 — SeanBot-vs-TradeFlow reconciler. Reads its decision data
         # from this orchestrator's journal (get_recent_decisions); polls the
         # shared Supabase seanbot_signals table for new entries in its task.
@@ -508,6 +520,75 @@ class Orchestrator:
             items = items[-n:]
         return list(reversed(items))
 
+    # ----------------------------------------------------- Track 5a hourly digest
+
+    async def _hourly_digest_loop(self) -> None:
+        """Emit one session-status digest per ``_HOURLY_DIGEST_INTERVAL_SEC``.
+
+        Waits the interval first (so the first digest covers a full window of
+        data rather than firing empty at startup), then emits. Each pass is
+        wrapped so a transient error never kills the task.
+        """
+        LOGGER.info("[ORCH] hourly_digest: started — interval=%ds", _HOURLY_DIGEST_INTERVAL_SEC)
+        assert self._stop_event is not None
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=_HOURLY_DIGEST_INTERVAL_SEC)
+                break  # stop requested
+            except TimeoutError:
+                pass
+            try:
+                await self._emit_hourly_digest()
+            except Exception as exc:
+                LOGGER.warning(
+                    "[ORCH] hourly_digest: emit error — type=%s msg=%s",
+                    type(exc).__name__,
+                    exc,
+                )
+
+    async def _emit_hourly_digest(self) -> None:
+        """Build + log the [ALERT] hourly session-status line. Edge-suppressed."""
+        now = datetime.now(UTC)
+        if _in_session_edge_window(now, edge_minutes=0):
+            LOGGER.debug("[ORCH] hourly_digest: suppressed — session edge window")
+            return
+        window_start = now - timedelta(seconds=_HOURLY_DIGEST_INTERVAL_SEC)
+
+        decisions = [
+            d
+            for d in self.get_recent_decisions(_DECISION_JOURNAL_MAXLEN)
+            if _ts_in(d.get("ts"), window_start, now)
+        ]
+        reconciliations = _read_recent_reconciliations(window_start, now)
+        suppressed = sum(1 for ts in self._suppressed_entry_ts if window_start <= ts <= now)
+
+        # Position state — broker is source of truth (§0.5.98). Best-effort.
+        pos_str = "?"
+        try:
+            summary = await self.get_broker_status_summary()
+            live = [p for p in summary.get("positions", []) if p.get("qty")]
+            if not live:
+                pos_str = "FLAT"
+            else:
+                pos_str = "+".join(f"{p.get('symbol')}x{p.get('qty')}" for p in live)
+        except Exception as exc:
+            LOGGER.debug("[ORCH] hourly_digest: pos lookup failed — %s", exc)
+
+        feed_ok = (
+            self._last_bar_at is not None
+            and (now - self._last_bar_at).total_seconds() <= _DIGEST_FEED_OK_SEC
+        )
+        line = build_hourly_digest(
+            window_start=window_start,
+            window_end=now,
+            decisions=decisions,
+            reconciliations=reconciliations,
+            pos_str=pos_str,
+            feed_ok=feed_ok,
+            suppressed_count=suppressed,
+        )
+        LOGGER.info("[ALERT] hourly_session_digest: %s", line)
+
     async def _handle_trade_signal(self, signal: Signal) -> None:
         # PR #12 — drop new entries while halted (foreign-position detection
         # by Reconciler raises the flag; operator clears via Supabase halt_acks
@@ -520,6 +601,18 @@ class Orchestrator:
             return
         try:
             await self._router.place_entry(signal, self._contract)
+        except InvariantViolationError:
+            # Track 5b — the strategy agreed (long_signal) but a non-CLOSED
+            # lifecycle already exists for this symbol/strategy: we're already
+            # in a position. create_lifecycle rejects it BEFORE any order is
+            # placed, so no broker state changes. Record it for the hourly
+            # digest aggregate; do NOT alert per-bar.
+            self._suppressed_entry_ts.append(datetime.now(UTC))
+            LOGGER.info(
+                "[ORCH] %s: long_signal suppressed — position already open "
+                "(aggregated into hourly digest)",
+                signal.instrument,
+            )
         except Exception as exc:
             LOGGER.error(
                 "[EXEC] %s: place_entry_dispatch_failed — type=%s msg=%s",
@@ -710,6 +803,14 @@ class Orchestrator:
         )
         self._background_tasks.append(seanbot_task)
         LOGGER.info("[RECON] task_launched — name=tradeflow-seanbot-reconciler")
+        # Track 5a — hourly session-status digest (read-only; emits one [ALERT]
+        # per interval during session hours; the existing alerter relays it).
+        digest_task = asyncio.create_task(
+            self._hourly_digest_loop(),
+            name="tradeflow-hourly-digest",
+        )
+        self._background_tasks.append(digest_task)
+        LOGGER.info("[ORCH] task_launched — name=tradeflow-hourly-digest")
         # PR #14 — telegram subsystem (optional; only when env vars are set).
         if self._telegram is not None and self._loop is not None:
             self._telegram.install_handler(self._loop, logging.getLogger())
@@ -883,6 +984,105 @@ def _build_telegram_if_configured(
     # the caller. Today the alerter goes through the orchestrator coordinator.
     _ = db
     return TelegramAlerter(bot_token=token, operator_chat_id=chat_id, coordinator=orchestrator)
+
+
+def _ts_in(ts_iso: str | None, start: datetime, end: datetime) -> bool:
+    """True if an ISO-8601 timestamp falls within [start, end] (UTC-aware)."""
+    if not ts_iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(ts_iso)
+    except (ValueError, TypeError):
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return start <= dt <= end
+
+
+def _read_recent_reconciliations(
+    start: datetime, end: datetime, *, path: str = _RECON_JSONL_PATH
+) -> list[dict]:
+    """Read the SeanBot reconciliation journal, returning records whose
+    ``signal_ts`` falls in [start, end]. Best-effort — a missing/locked/corrupt
+    journal yields an empty list (the digest still emits its decision stats)."""
+    records: list[dict] = []
+    try:
+        p = pathlib.Path(path)
+        if not p.exists():
+            return records
+        with p.open() as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if _ts_in(rec.get("signal_ts"), start, end):
+                    records.append(rec)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("[ORCH] hourly_digest: reconciliation read skipped — %s", exc)
+    return records
+
+
+def build_hourly_digest(
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    decisions: list[dict],
+    reconciliations: list[dict],
+    pos_str: str,
+    feed_ok: bool,
+    suppressed_count: int,
+) -> str:
+    """Format the one-line hourly session-status digest body (pure, testable).
+
+    Mirrors the [STRAT] eval decision labels (long_signal / noop_filter with
+    per-gate failed breakdown / noop_regime / noop_warmup / noop_cooldown /
+    noop_session_edge) plus the SeanBot AGREE/MISS scorecard for the window.
+    """
+    label = f"{window_start:%H:%M}–{window_end:%H:%M}Z"
+    counts: dict[str, int] = {}
+    gate_fail: dict[str, int] = {}
+    for d in decisions:
+        decision = str(d.get("decision", "unknown"))
+        counts[decision] = counts.get(decision, 0) + 1
+        if decision == "noop_filter":
+            failed = str(d.get("failed", "unknown"))
+            gate_fail[failed] = gate_fail.get(failed, 0) + 1
+
+    evals = len(decisions)
+    long_signal = counts.get("long_signal", 0)
+    noop_filter = counts.get("noop_filter", 0)
+    gate_str = " ".join(
+        f"{g}={gate_fail.get(g, 0)}" for g in ("touch", "bullish", "ma_order", "gap")
+    )
+    regime = counts.get("noop_regime", 0)
+    warmup = counts.get("noop_warmup", 0)
+    cooldown = counts.get("noop_cooldown", 0)
+    edge = counts.get("noop_session_edge", 0)
+
+    # SeanBot scorecard: AGREE_ENTER vs the MISS-* classes, grouped.
+    sb_entries = len(reconciliations)
+    agree = sum(1 for r in reconciliations if str(r.get("classification", "")).startswith("AGREE"))
+    miss_groups: dict[str, int] = {}
+    for r in reconciliations:
+        cls = str(r.get("classification", ""))
+        if cls.startswith("MISS"):
+            miss_groups[cls] = miss_groups.get(cls, 0) + 1
+    miss_str = ", ".join(f"{n} {cls}" for cls, n in sorted(miss_groups.items()))
+    sb_str = f"{sb_entries} entries"
+    if sb_entries:
+        sb_str += f" → {agree} AGREE" + (f", {miss_str}" if miss_str else "")
+
+    return (
+        f"\U0001f4ca TradeFlow hourly {label} | pos={pos_str} | "
+        f"evals={evals}: long_signal={long_signal} noop_filter={noop_filter} ({gate_str}) "
+        f"regime={regime} warmup={warmup} cooldown={cooldown} edge={edge} | "
+        f"SeanBot: {sb_str} | suppressed_in_position={suppressed_count} | "
+        f"feed {'OK' if feed_ok else 'STALE'}"
+    )
 
 
 def _build_contract(instrument: str) -> Contract:
