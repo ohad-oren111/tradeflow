@@ -37,6 +37,7 @@ from src.execution.dirty_set import DirtySet
 from src.execution.force_close import EodForceClose
 from src.execution.reconciler import Reconciler
 from src.execution.router import CloseResult, OrderRouter
+from src.journal_rotation import rotate_jsonl_if_large
 from src.state_machine import InvariantViolationError, Lifecycle, State, StateMachine
 
 # _in_session_edge_window is reused by the bar-liveness watchdog so that the
@@ -504,6 +505,8 @@ class Orchestrator:
         try:
             path = pathlib.Path(_DECISION_JSONL_PATH)
             path.parent.mkdir(parents=True, exist_ok=True)
+            # Track 6b — bound the unbounded JSONL on long-lived containers.
+            rotate_jsonl_if_large(path)
             with path.open("a") as fh:
                 fh.write(json.dumps(record) + "\n")
         except Exception as exc:

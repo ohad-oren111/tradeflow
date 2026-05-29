@@ -30,6 +30,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from src.journal_rotation import rotate_jsonl_if_large
+
 LOGGER = logging.getLogger(__name__)
 
 _TOLERANCE_SEC = 120.0
@@ -191,6 +193,8 @@ class SeanbotReconciler:
         try:
             path = pathlib.Path(self._journal_path)
             path.parent.mkdir(parents=True, exist_ok=True)
+            # Track 6b — bound the unbounded JSONL on long-lived containers.
+            rotate_jsonl_if_large(path)
             with path.open("a") as fh:
                 fh.write(json.dumps(record) + "\n")
         except Exception as exc:

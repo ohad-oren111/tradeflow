@@ -40,6 +40,12 @@ services:
       timeout: 5s
       start_period: 120s
       retries: 3
+    # W-S14.2 Track 6a — cap container log growth (preventive disk hygiene).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - tradeflow-net
 
@@ -68,6 +74,12 @@ services:
       - ib-gateway
     ports:
       - "127.0.0.1:8080:8080"
+    # W-S14.2 Track 6a — cap container log growth (preventive disk hygiene).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - tradeflow-net
 
@@ -88,6 +100,18 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
       ORCH_LOG_LEVEL: ${ORCH_LOG_LEVEL:-INFO}
+    # W-S14.2 Track 6d — the listener runs a different entrypoint than main.py,
+    # so it permanently inherits the app's `main.py in /proc/1/cmdline` HEALTHCHECK
+    # as `unhealthy` (cosmetic; RestartCount=0 confirms it's not a real fault).
+    # Disable it so `docker ps` reflects true state.
+    healthcheck:
+      disable: true
+    # W-S14.2 Track 6a — cap container log growth (preventive disk hygiene).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - tradeflow-net
 
