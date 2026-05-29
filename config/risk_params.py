@@ -30,6 +30,13 @@ class RiskParams:
     ma_slow: int = 100
     ma_touch_buffer_pts: float = 5.0
     ma_min_gap_pts: float = 0.5  # SeanBot V3 config/settings.py:44 (PR #33)
+    # Candle-confirmation tolerance for the LONG bullish gate (W-S14.2 Track 2,
+    # operator-approved D-1). bullish_ok := close >= open - ma_bullish_tolerance_pts.
+    # 0.0 reproduces the prior strict close>=open; the A-S14.1 calibration backtest
+    # showed the strict gate rejected 7/12 captured SeanBot entries on flat/near-doji
+    # 1-min touch bars. 2.0pt recovered 8/12 (from 2/12) at +1 realistic trade/day.
+    # Entry-filter threshold only — regime/stop/SL/TP/kill-switch are unchanged.
+    ma_bullish_tolerance_pts: float = 2.0
     stop_loss_pts: float = 75.0
     take_profit_pts: float = 150.0
     cooldown_bars: int = 10
