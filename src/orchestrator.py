@@ -69,6 +69,10 @@ _DECISION_JSONL_PATH = "/app/logs/decisions.jsonl"
 _HOURLY_DIGEST_INTERVAL_SEC = 60 * 60
 # "Feed OK" if a live bar arrived within this window at digest time.
 _DIGEST_FEED_OK_SEC = 5 * 60
+# W-S15.3 Track E — bars needed before the SMA is warm. ma_slow is SMA100
+# (src/indicators.py: sma_100), so 100 1-min bars (~99 min) seeds the slow MA;
+# the strategy's own indicators-ready gate is authoritative, this is the ETA.
+_WARMUP_BARS_NEEDED = 100
 
 # Transient broker disconnects worth catching mid-loop and triggering a
 # resilient reconnect rather than orchestrator exit. Mirrors the tuple in
@@ -581,6 +585,7 @@ class Orchestrator:
             self._last_bar_at is not None
             and (now - self._last_bar_at).total_seconds() <= _DIGEST_FEED_OK_SEC
         )
+        readiness = self._readiness_fragment(now)
         line = build_hourly_digest(
             window_start=window_start,
             window_end=now,
@@ -589,8 +594,31 @@ class Orchestrator:
             pos_str=pos_str,
             feed_ok=feed_ok,
             suppressed_count=suppressed,
+            readiness=readiness,
         )
         LOGGER.info("[ALERT] hourly_session_digest: %s", line)
+
+    def _readiness_fragment(self, now: datetime) -> str:
+        """W-S15.3 Track E — 'is it ready to trade' at a glance, from in-process
+        state only (no broker round-trip). Warmup (bars-seen / needed + ready or
+        warming), last-bar age, and the deployed commit. Best-effort: any missing
+        field degrades to a placeholder rather than failing the digest."""
+        bars = getattr(self._strategy, "bar_count", 0)
+        last_decision = getattr(self._strategy, "last_decision", None) or {}
+        warming = (
+            str(last_decision.get("decision", "")) == "noop_warmup" or bars < _WARMUP_BARS_NEEDED
+        )
+        if warming:
+            eta_min = max(0, _WARMUP_BARS_NEEDED - bars)
+            warm_str = f"warming {bars}/{_WARMUP_BARS_NEEDED} bars (~{eta_min}m)"
+        else:
+            warm_str = f"ready ({bars} bars)"
+        if self._last_bar_at is not None:
+            bar_age = f"{(now - self._last_bar_at).total_seconds():.0f}s"
+        else:
+            bar_age = "n/a"
+        commit = (os.environ.get("TRADEFLOW_COMMIT") or "unknown")[:8]
+        return f"warmup={warm_str} last_bar={bar_age} commit={commit}"
 
     async def _handle_trade_signal(self, signal: Signal) -> None:
         # PR #12 — drop new entries while halted (foreign-position detection
@@ -1038,12 +1066,16 @@ def build_hourly_digest(
     pos_str: str,
     feed_ok: bool,
     suppressed_count: int,
+    readiness: str = "",
 ) -> str:
     """Format the one-line hourly session-status digest body (pure, testable).
 
     Mirrors the [STRAT] eval decision labels (long_signal / noop_filter with
     per-gate failed breakdown / noop_regime / noop_warmup / noop_cooldown /
     noop_session_edge) plus the SeanBot AGREE/MISS scorecard for the window.
+
+    ``readiness`` (W-S15.3 Track E) is an optional pre-formatted fragment
+    (warmup / last-bar-age / commit); appended when non-empty.
     """
     label = f"{window_start:%H:%M}–{window_end:%H:%M}Z"
     counts: dict[str, int] = {}
@@ -1079,13 +1111,16 @@ def build_hourly_digest(
     if sb_entries:
         sb_str += f" → {agree} AGREE" + (f", {miss_str}" if miss_str else "")
 
-    return (
+    body = (
         f"\U0001f4ca TradeFlow hourly {label} | pos={pos_str} | "
         f"evals={evals}: long_signal={long_signal} noop_filter={noop_filter} ({gate_str}) "
         f"regime={regime} warmup={warmup} cooldown={cooldown} edge={edge} | "
         f"SeanBot: {sb_str} | suppressed_in_position={suppressed_count} | "
         f"feed {'OK' if feed_ok else 'STALE'}"
     )
+    if readiness:
+        body += f" | {readiness}"
+    return body
 
 
 def _build_contract(instrument: str) -> Contract:
