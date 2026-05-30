@@ -778,6 +778,108 @@ def _seanbot_scorecard_today(url: str | None, key: str | None) -> str:
     return f"{total} entries → {agree} AGREE" + (f", {miss_str}" if miss_str else "")
 
 
+def _parse_iso_ts(value: Any) -> datetime | None:
+    """Parse an ISO-8601 string to a UTC-aware datetime, or None on any failure."""
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+def _fetch_supabase_rows_today(
+    url: str,
+    key: str,
+    table: str,
+    select: str,
+    ts_col: str,
+    today_iso: str,
+) -> list[dict] | None:
+    """GET today's rows from ``table`` filtered on ``ts_col >= today`` (service-role).
+
+    Returns the parsed rows, or None on any HTTP/transport/parse error so the
+    caller can render "(unavailable)" rather than a misleading empty result.
+    """
+    try:
+        resp = httpx.get(
+            f"{url.rstrip('/')}/rest/v1/{table}",
+            params={"select": select, ts_col: f"gte.{today_iso}T00:00:00Z"},
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Accept": "application/json",
+            },
+            timeout=5.0,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        rows = resp.json()
+    except ValueError:
+        return None
+    return rows if isinstance(rows, list) else None
+
+
+def _tf_vs_seanbot_today(url: str | None, key: str | None, *, tolerance_sec: float = 120.0) -> str:
+    """TF-vs-SeanBot AGREE / TF-only / SeanBot-only digest for today (PR-D3c).
+
+    Joins the two durable directions:
+      * ``strategy_decisions`` — TF's own entries + near-misses (TF→SeanBot).
+      * ``signal_reconciliations`` — SeanBot signals + TF's decision (SeanBot→TF).
+
+    AGREE and SeanBot-only come straight from the reconciliation classifications
+    (SeanBot signalled; TF entered = AGREE, TF blocked = MISS-<gate>). TF-only is
+    a TF ``long_signal`` whose bar ts is not within ``tolerance_sec`` of any
+    SeanBot signal — TF entered where SeanBot was silent.
+
+    Reads with the service-role key (RLS deny-all; anon sees ``[]``). Both tables
+    empty today → "0 — no comparable decisions today"; an error →
+    "(unavailable: ...)". Never raises.
+    """
+    if not url or not key:
+        return "?"
+    today_iso = datetime.now(UTC).strftime("%Y-%m-%d")
+    decisions = _fetch_supabase_rows_today(
+        url, key, "strategy_decisions", "decision,decision_ts", "decision_ts", today_iso
+    )
+    recons = _fetch_supabase_rows_today(
+        url, key, "signal_reconciliations", "classification,signal_ts", "signal_ts", today_iso
+    )
+    if decisions is None or recons is None:
+        return "(unavailable: query error)"
+    if not decisions and not recons:
+        return "0 — no comparable decisions today"
+
+    agree = sum(1 for r in recons if str(r.get("classification", "")).startswith("AGREE"))
+    miss: dict[str, int] = {}
+    for r in recons:
+        cls = str(r.get("classification", ""))
+        if cls.startswith("MISS"):
+            miss[cls] = miss.get(cls, 0) + 1
+    sb_only = sum(miss.values())
+
+    sb_times = [dt for dt in (_parse_iso_ts(r.get("signal_ts")) for r in recons) if dt]
+    tf_only = 0
+    for d in decisions:
+        if d.get("decision") != "long_signal":
+            continue
+        dt = _parse_iso_ts(d.get("decision_ts"))
+        if dt is None:
+            continue
+        if not any(abs((dt - s).total_seconds()) <= tolerance_sec for s in sb_times):
+            tf_only += 1
+
+    miss_str = ", ".join(f"{n} {cls}" for cls, n in sorted(miss.items()))
+    out = f"{agree} AGREE, {tf_only} TF-only, {sb_only} SeanBot-only"
+    return out + (f" ({miss_str})" if miss_str else "")
+
+
 def _last_app_log_line() -> str:
     """Tail tradeflow-app to one line; truncate; return placeholder on any error."""
     try:
@@ -969,6 +1071,9 @@ def run_daily_report() -> int:
     # W-S15.2 — scorecard now reads the durable signal_reconciliations table
     # (service-role) instead of the ephemeral in-container JSONL journal.
     seanbot_scorecard = _seanbot_scorecard_today(data_url, data_key)
+    # PR-D3c — TF→SeanBot divergence: joins durable strategy_decisions with
+    # signal_reconciliations to report AGREE / TF-only / SeanBot-only.
+    tf_vs_seanbot = _tf_vs_seanbot_today(data_url, data_key)
     app_rc = app_detail.get("restart_count", "?") if isinstance(app_detail, dict) else "?"
     last_log = _last_app_log_line()
     # W-S15.3 Track E — readiness signals. Host-side / broker-side only; the
@@ -994,6 +1099,7 @@ def run_daily_report() -> int:
     lines.append(f"- Realized P&L today: {realized_pnl}")
     lines.append(f"- Open position (DB view): {open_pos}")
     lines.append(f"- SeanBot scorecard: {seanbot_scorecard}")
+    lines.append(f"- TF vs SeanBot (today): {tf_vs_seanbot}")
     lines.append("")
     lines.append("READINESS:")
     lines.append(f"- Deployed commit: {deployed_commit}")

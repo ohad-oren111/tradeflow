@@ -32,6 +32,7 @@ from comms.telegram import TelegramAlerter
 from config.instruments import MNQ
 from src.clients.ib_client import BrokerExtendedOutageError, IBClient
 from src.clients.supabase_client import SupabaseClient
+from src.comparison.decision_journal import DecisionJournal
 from src.comparison.seanbot_reconciler import _RECON_JSONL_PATH, SeanbotReconciler
 from src.execution.dirty_set import DirtySet
 from src.execution.force_close import EodForceClose
@@ -182,6 +183,11 @@ class Orchestrator:
         self._seanbot_reconciler = SeanbotReconciler(
             decisions_getter=lambda: self.get_recent_decisions(_DECISION_JOURNAL_MAXLEN)
         )
+        # PR-D3c — durable TF→SeanBot decision journal. Observe-only mirror of
+        # the analytically-useful subset of last_decision to Supabase
+        # strategy_decisions; buffered here, flushed on the hourly digest tick.
+        # Never raises into the eval/order path.
+        self._decision_writer = DecisionJournal()
 
     async def run(self) -> int:
         """Start orchestrator, loop on healthcheck, return process exit code."""
@@ -445,6 +451,14 @@ class Orchestrator:
             return
         # Track 3 — record every bar's decision (entry or noop) to the journal.
         self._record_decision(self._strategy.last_decision)
+        # PR-D3c — observe-only: buffer the analytically-useful decisions for the
+        # durable strategy_decisions mirror. capture never raises; this reads the
+        # decision the strategy already produced and changes nothing on the path.
+        self._decision_writer.capture(
+            self._strategy.last_decision,
+            symbol=self._instrument,
+            bar_count=self._strategy.bar_count,
+        )
         if signal_or_none is None:
             return
         if self._loop is None:
@@ -597,6 +611,11 @@ class Orchestrator:
             readiness=readiness,
         )
         LOGGER.info("[ALERT] hourly_session_digest: %s", line)
+
+        # PR-D3c — flush the durable decision journal on the same hourly tick
+        # (Constraint 5a default B). flush never raises; a write failure leaves
+        # the buffer intact for the next tick and cannot touch trading.
+        await self._decision_writer.flush(self._db)
 
     def _readiness_fragment(self, now: datetime) -> str:
         """W-S15.3 Track E — 'is it ready to trade' at a glance, from in-process
