@@ -118,6 +118,71 @@ async def test_flush_upserts_with_conflict_key_and_clears_buffer() -> None:
     assert _DECISIONS_ON_CONFLICT == "symbol,decision_ts"
 
 
+async def test_flush_collapses_duplicate_bar_ts_to_one_row() -> None:
+    # PR C bug-repro: two evals on the SAME bar ts buffer two rows with the same
+    # (symbol, decision_ts). Pre-fix the batch upsert 500s (PG 21000 — "ON CONFLICT
+    # ... cannot affect row a second time") and poisons every subsequent flush; the
+    # fix collapses them to the last decision for that bar.
+    journal = DecisionJournal()
+    ts = "2026-05-28T22:05:30+00:00"
+    journal.capture(_enter(ts=ts), symbol="MNQM6", bar_count=120)
+    journal.capture(_near_miss(ts=ts, failed="gap"), symbol="MNQM6", bar_count=120)  # same ts
+    assert journal.buffered == 2
+
+    mock_db = MagicMock()
+    mock_db.upsert = AsyncMock(return_value=[{"id": 1}])  # 1 call
+
+    flushed = await journal.flush(mock_db)
+
+    assert flushed == 1  # collapsed to a single row
+    assert journal.buffered == 0  # both drained from the buffer
+    table, payload = mock_db.upsert.await_args.args
+    assert table == _DECISIONS_TABLE
+    assert len(payload) == 1  # NOT 2 — no duplicate (symbol, decision_ts) in the batch
+    assert payload[0]["decision_ts"] == ts
+    assert payload[0]["decision"] == "noop_filter"  # last write wins (near-miss captured 2nd)
+
+
+async def test_flush_drops_null_decision_ts_row() -> None:
+    # A decision lacking 'ts' sends decision_ts=null → NOT NULL 400 (PG 23502) that
+    # poisons the batch. The fix drops it and still flushes the valid rows.
+    journal = DecisionJournal()
+    no_ts = {**_enter()}
+    del no_ts["ts"]  # decision.get("ts") -> None
+    journal.capture(no_ts, symbol="MNQM6", bar_count=120)
+    journal.capture(_enter(ts="2026-05-28T22:09:00+00:00"), symbol="MNQM6", bar_count=121)
+    assert journal.buffered == 2
+
+    mock_db = MagicMock()
+    mock_db.upsert = AsyncMock(return_value=[{"id": 1}])  # 1 call
+
+    flushed = await journal.flush(mock_db)
+
+    assert flushed == 1
+    assert journal.buffered == 0
+    _table, payload = mock_db.upsert.await_args.args
+    assert len(payload) == 1
+    assert payload[0]["decision_ts"] == "2026-05-28T22:09:00+00:00"
+
+
+async def test_flush_all_null_ts_drains_buffer_without_upsert() -> None:
+    # If every buffered row is unpersistable (null ts), don't call upsert and don't
+    # re-try it forever — drain the buffer.
+    journal = DecisionJournal()
+    no_ts = {**_enter()}
+    del no_ts["ts"]
+    journal.capture(no_ts, symbol="MNQM6", bar_count=120)
+
+    mock_db = MagicMock()
+    mock_db.upsert = AsyncMock(return_value=[])
+
+    flushed = await journal.flush(mock_db)
+
+    assert flushed == 0
+    mock_db.upsert.assert_not_awaited()  # nothing valid to send
+    assert journal.buffered == 0
+
+
 async def test_flush_empty_buffer_is_noop() -> None:
     journal = DecisionJournal()
     mock_db = MagicMock()
