@@ -362,6 +362,42 @@ class IBClient:
             )
             return False
 
+    async def get_historical_bars(
+        self,
+        contract: Contract,
+        *,
+        bar_size: str = "1 min",
+        what_to_show: str = "TRADES",
+        use_rth: bool = False,
+        duration: str = "1 D",
+    ) -> list[Any]:
+        """One-shot historical bars (``keepUpToDate=False``) — for warmup backfill.
+
+        Distinct from :meth:`subscribe_bars` (a live ``keepUpToDate`` subscription):
+        this is a plain snapshot the caller computes a shadow SMA from. Raises if
+        not connected / on a request error — the caller (warmup-shadow seed) wraps
+        it never-raise so a fetch failure can't block boot or trading.
+        """
+        if not self.is_connected:
+            raise RuntimeError("not connected — call connect() first")
+        bars = await self._ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime="",
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow=what_to_show,
+            useRTH=use_rth,
+            formatDate=2,
+            keepUpToDate=False,
+        )
+        LOGGER.info(
+            "[ib_client] get_historical_bars — symbol=%s bar_size=%s bars=%s",
+            getattr(contract, "localSymbol", None) or getattr(contract, "symbol", "?"),
+            bar_size,
+            len(bars),
+        )
+        return list(bars)
+
     async def subscribe_bars(
         self,
         contract: Contract,
