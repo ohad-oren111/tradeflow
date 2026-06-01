@@ -1,24 +1,26 @@
-"""Shadow SMA warmup backfill (PR 1 — instrumentation only, NO trading change).
+"""Live-only shadow SMA + warmup-backfill helpers (warmup-enable PR).
 
-On boot the strategy's SMA buffer starts empty and fills one live 1-min bar at a
-time, so SMA100 isn't ready for ~100 minutes after every restart — the bot sits
-out that window. This module proves we *could* warm the SMA from history WITHOUT
-changing any trading behavior: it keeps a parallel "shadow" close buffer seeded
-from historical bars, and each warmup bar logs the shadow-backfilled SMA100/MA50
-next to the live (buffer-warmed) SMA100 so the future enable can be de-risked
-against real convergence numbers.
+After warmup-enable the STRATEGY trades on a backfilled SMA — its real bar buffer
+is seeded from historical bars at boot so SMA100/MA50 are warm immediately (no
+~100-min live-warmup dead zone). This module:
 
-Observe-only and fire-and-forget — ``seed_from`` and ``observe`` NEVER raise into
-boot or the bar loop, and NOTHING here gates a trade. The trade gate still waits
-for the live buffer to warm. Flipping to *trade* on the backfilled SMA is a
-separate, gated (AUDIT) change.
+  * keeps an independent LIVE-ONLY SMA — accumulating from live bars ONLY, never
+    seeded — and logs it against the strategy's backfilled SMA each bar, so the
+    operator can watch them converge (or catch a bad backfill);
+  * holds the pure helpers that build + sanity-check the historical seed
+    (``hist_bars_to_dicts`` / ``validate_seed``) so a junk SMA can never gate a
+    trade — the caller rejects and falls back to live warmup.
+
+Observe-only and fire-and-forget: nothing here gates a trade and nothing raises
+into boot or the bar loop.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from collections import deque
-from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 LOGGER = logging.getLogger(__name__)
@@ -27,13 +29,19 @@ LOGGER = logging.getLogger(__name__)
 _SMA_PERIOD = 100
 _MA_PERIOD = 50
 _BUFFER_MAX = 150
-# Stop logging a few bars past live warmup — long enough to show convergence once
-# the live SMA appears (~bar 100), then quiet to avoid an endless 1/min log.
-_LOG_UNTIL_BAR = _SMA_PERIOD + 5
+# Log the live-only-vs-backfill diff until the live-only SMA has had a chance to
+# warm + a few bars past, then quiet down (avoids an endless 1/min log).
+_LOG_UNTIL_LIVE_BAR = _SMA_PERIOD + 5
+# A backfilled SMA100 must sit within this many points of the latest close, else
+# the backfill is junk (notional contamination / wrong contract / stale) — reject
+# and fall back to live warmup. MNQ trades ~30k; a 100-bar SMA-vs-price gap is
+# normally tens of points, so 500 is a generous-but-safe ceiling.
+_MAX_SANE_SMA_DISTANCE_PTS = 500.0
 
 
 class WarmupShadow:
-    """Parallel close buffer + shadow SMA, logged against the live SMA. No gate."""
+    """LIVE-ONLY SMA tracker (never seeded), logged against the strategy's
+    backfilled SMA. No gate; never raises."""
 
     def __init__(
         self,
@@ -47,51 +55,17 @@ class WarmupShadow:
         self._sma_period = sma_period
         self._ma_period = ma_period
         self._closes: deque[float] = deque(maxlen=buffer_max)
-        self._seeded = 0
 
     @property
-    def seeded(self) -> int:
-        return self._seeded
+    def live_bars(self) -> int:
+        return len(self._closes)
 
-    async def seed_from(self, fetch: Callable[[], Awaitable[list[Any]]]) -> None:
-        """Backfill the shadow buffer from ``fetch()`` (historical bars). Never raises.
+    def observe(self, bar: dict | None, strategy_decision: dict | None) -> dict | None:
+        """Append the live bar's close to the LIVE-ONLY buffer and log the
+        live-only SMA against the strategy's backfilled SMA. Never raises.
 
-        ``fetch`` returns objects with a ``.close`` attribute (ib_async ``BarData``).
-        A fetch failure (or no entitlement) is logged and skipped — boot/trading
-        are never blocked.
-        """
-        if not self.enabled:
-            return
-        try:
-            bars = await fetch()
-            closes = [float(b.close) for b in bars if getattr(b, "close", None) is not None]
-            for c in closes:
-                self._closes.append(c)
-            self._seeded = len(closes)
-            LOGGER.info(
-                "[WARMUP-SHADOW] seeded backfill_closes=%d buffered=%d sma100_ready=%s",
-                self._seeded,
-                len(self._closes),
-                len(self._closes) >= self._sma_period,
-            )
-        except Exception as exc:  # noqa: BLE001 — backfill must never block boot/trading
-            LOGGER.warning(
-                "[WARMUP-SHADOW] seed failed — %s: %s (skipped, no behavior change)",
-                type(exc).__name__,
-                exc,
-            )
-
-    def observe(
-        self,
-        bar: dict | None,
-        live_decision: dict | None,
-        bar_count: int | None,
-    ) -> dict | None:
-        """Append the live bar's close, log shadow-vs-live SMA. Never raises.
-
-        Returns the shadow measurement dict (for tests) or None. The return value
-        carries ONLY measurements — never a signal/decision — so it cannot affect
-        trading even if a caller inspected it.
+        Returns the measurement dict (for tests) or None — measurements only,
+        never a signal/decision, so it cannot affect trading.
         """
         if not self.enabled:
             return None
@@ -100,29 +74,27 @@ class WarmupShadow:
             if close is None:
                 return None
             self._closes.append(float(close))
-            backfill_sma100 = self._mean(self._sma_period)
-            backfill_ma50 = self._mean(self._ma_period)
-            live_sma100 = (live_decision or {}).get("sma100")
+            live_sma100 = self._mean(self._sma_period)  # LIVE-ONLY (not seeded)
+            raw_backfill = (strategy_decision or {}).get("sma100")
+            backfill_sma100 = float(raw_backfill) if isinstance(raw_backfill, int | float) else None
             diff = (
                 backfill_sma100 - live_sma100
-                if backfill_sma100 is not None and isinstance(live_sma100, int | float)
+                if live_sma100 is not None and backfill_sma100 is not None
                 else None
             )
-            if bar_count is None or bar_count <= _LOG_UNTIL_BAR:
+            live_bar = len(self._closes)
+            if live_bar <= _LOG_UNTIL_LIVE_BAR:
                 LOGGER.info(
-                    "[WARMUP-SHADOW] bar=%s live_sma100=%s backfill_sma100=%s diff=%s "
-                    "backfill_ma50=%s",
-                    bar_count,
+                    "[WARMUP-SHADOW] bar=%s live_sma100=%s backfill_sma100=%s diff=%s",
+                    live_bar,
                     _fmt(live_sma100),
                     _fmt(backfill_sma100),
                     _fmt(diff),
-                    _fmt(backfill_ma50),
                 )
             return {
-                "bar_count": bar_count,
+                "live_bar": live_bar,
                 "live_sma100": live_sma100,
                 "backfill_sma100": backfill_sma100,
-                "backfill_ma50": backfill_ma50,
                 "diff": diff,
             }
         except Exception as exc:  # noqa: BLE001 — observe-only, never break the bar loop
@@ -132,8 +104,78 @@ class WarmupShadow:
     def _mean(self, n: int) -> float | None:
         if len(self._closes) < n:
             return None
-        window = list(self._closes)[-n:]
-        return sum(window) / n
+        return sum(list(self._closes)[-n:]) / n
+
+
+def hist_bars_to_dicts(bars: list[Any]) -> list[dict]:
+    """Convert ib_async ``BarData`` (``.date/.open/.high/.low/.close/.volume``) to
+    the strategy's bar-dict shape. Skips bars with no usable close."""
+    out: list[dict] = []
+    for b in bars:
+        close = getattr(b, "close", None)
+        if close is None:
+            continue
+        try:
+            c = float(close)
+        except (TypeError, ValueError):
+            continue
+        out.append(
+            {
+                "time": _coerce_bar_time(getattr(b, "date", None)),
+                "open": _f(getattr(b, "open", None), c),
+                "high": _f(getattr(b, "high", None), c),
+                "low": _f(getattr(b, "low", None), c),
+                "close": c,
+                "volume": _f(getattr(b, "volume", None), 0.0),
+            }
+        )
+    return out
+
+
+def validate_seed(
+    seed: list[dict], *, needed: int, max_distance: float = _MAX_SANE_SMA_DISTANCE_PTS
+) -> tuple[bool, str, float | None]:
+    """Sanity-gate a historical seed. Returns ``(ok, reason, sma100)``.
+
+    Rejects (so the caller falls back to live warmup, never trading on junk):
+      * fewer than ``needed`` bars (can't form SMA{needed});
+      * a NaN SMA;
+      * an SMA more than ``max_distance`` pts from the latest close.
+    """
+    if len(seed) < needed:
+        return False, f"only {len(seed)} bars (<{needed} for SMA{needed})", None
+    closes = [float(b["close"]) for b in seed[-needed:]]
+    sma = sum(closes) / needed
+    if math.isnan(sma):
+        return False, "SMA is NaN", None
+    last = float(seed[-1]["close"])
+    if abs(sma - last) > max_distance:
+        return False, f"SMA {sma:.1f} is >{max_distance:.0f}pt from last price {last:.1f}", sma
+    return True, "ok", sma
+
+
+def _coerce_bar_time(raw: Any) -> datetime | None:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=UTC)
+    if isinstance(raw, int | float):
+        try:
+            return datetime.fromtimestamp(float(raw), tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    try:
+        dt = datetime.fromisoformat(str(raw))
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+    except (TypeError, ValueError):
+        return None
+
+
+def _f(value: Any, default: float) -> float:
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
 
 
 def _fmt(value: Any) -> str:

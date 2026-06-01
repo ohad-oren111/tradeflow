@@ -438,6 +438,23 @@ class Sma100BounceStrategy:
         """The structured decision record from the most recent ``on_new_bar``."""
         return self._last_decision
 
+    def seed_bars(self, bars: list[dict]) -> int:
+        """Warmup-enable — pre-fill the bar buffer from historical bars so the SMA
+        indicators are warm from boot (removes the ~100-min live-warmup dead zone).
+
+        ``bars`` are oldest-first dicts ``{time, open, high, low, close, volume}``.
+        READINESS ONLY: this does not evaluate any gate, emit a ``Signal``, or set
+        ``_last_decision`` — entry *selection* (touch/bullish/ma_order/gap/regime)
+        is unchanged; the same bars trigger the same entries, just available sooner.
+        Only seeds an empty buffer (boot), so it never disturbs a running buffer.
+        Returns the buffer length after seeding.
+        """
+        if self._bars:
+            return len(self._bars)
+        for b in bars:
+            self._bars.append(dict(b))
+        return len(self._bars)
+
     def on_new_bar(self, bar: dict) -> Signal | None:
         """Append a bar, recompute indicators, apply gates, return a Signal or None.
 
