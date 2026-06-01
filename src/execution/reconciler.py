@@ -28,6 +28,7 @@ from typing import Any, Protocol
 from config.instruments import MNQ
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
+from src.execution.bracket import build_bracket, build_protective_stop
 from src.execution.dirty_set import DirtySet
 from src.execution.router import ensure_protective_stop
 from src.state_machine import (
@@ -65,8 +66,13 @@ class ReconcileAction(StrEnum):
     ACTIVE_TO_CLOSED = "active_to_closed"  # via EXITING
     EXITING_TO_CLOSED = "exiting_to_closed"
     FOREIGN_POSITION = "foreign_position"
+    HEALED = "healed"  # ACTIVE+position: re-placed a missing bracket leg (stop/target)
     WARNING = "warning"  # logged anomaly, no transition
     RACE = "race"  # state machine guard fired (InvariantViolationError)
+
+
+# OCA type for re-placed legs — matches the bracket's existing ocaType (CANCEL_WITH_BLOCK).
+_HEAL_OCA_TYPE = 3
 
 
 class Reconciler:
@@ -146,6 +152,8 @@ class Reconciler:
                     has_position=has_position,
                     stop_order_open=stop_order_open,
                     target_order_open=target_order_open,
+                    positions=positions,
+                    open_trades=open_trades,
                 )
             if current is State.EXITING:
                 return await self._reconcile_exiting(
@@ -285,6 +293,115 @@ class Reconciler:
             path="recon_force_fill",
         )
 
+    async def _heal_missing_legs(
+        self,
+        lifecycle: Lifecycle,
+        *,
+        positions: list[Any],
+        open_trades: list[Any],
+        stop_order_open: bool,
+        target_order_open: bool,
+    ) -> bool:
+        """Re-place any missing bracket leg for an ACTIVE-with-position lifecycle so
+        a redeploy-dropped GTC leg never leaves the position naked (§0.5.T5).
+
+        Uses the RECORDED ``stop_price`` (= entry−75) / ``target_price`` (= entry+150),
+        never live price. New leg(s) are OCA-linked to the surviving leg's group (or a
+        fresh group if both are gone) so a fill on either cancels the sibling
+        broker-side. Persists the new order id(s). Best-effort + never raises; returns
+        whether any leg was re-placed.
+        """
+        position = _broker_position_for(positions, lifecycle.symbol)
+        contract = getattr(position, "contract", None) if position is not None else None
+        if contract is None:
+            LOGGER.warning(
+                "[RECOVER] %s: heal_skipped — no broker contract for id=%s",
+                lifecycle.symbol,
+                lifecycle.lifecycle_id,
+            )
+            return False
+        # IB.positions() contracts omit exchange → Error 321 on placement.
+        if not getattr(contract, "exchange", ""):
+            contract.exchange = "CME"
+        try:
+            qty = abs(int(getattr(position, "position", 0))) or int(lifecycle.entry_qty or 0)
+        except (TypeError, ValueError):
+            qty = int(lifecycle.entry_qty or 0)
+        if qty <= 0:
+            LOGGER.warning(
+                "[RECOVER] %s: heal_skipped — qty unknown for id=%s",
+                lifecycle.symbol,
+                lifecycle.lifecycle_id,
+            )
+            return False
+
+        # OCA group: link new leg(s) to the surviving leg; fresh group if both gone.
+        surviving_oca = None
+        if target_order_open:
+            surviving_oca = _oca_group_of(open_trades, lifecycle.target_order_id)
+        elif stop_order_open:
+            surviving_oca = _oca_group_of(open_trades, lifecycle.stop_order_id)
+        oca_group = surviving_oca or f"heal-{lifecycle.lifecycle_id[:8]}"
+
+        direction = Direction(lifecycle.direction)
+        updates: dict[str, Any] = {}
+        try:
+            if not stop_order_open and lifecycle.stop_price is not None:
+                stp = build_protective_stop(
+                    direction=direction, qty=qty, stop_price=float(lifecycle.stop_price)
+                )
+                stp.ocaGroup = oca_group
+                stp.ocaType = _HEAL_OCA_TYPE
+                trade = await self._ib.place_order(contract, stp)
+                updates["stop_order_id"] = _order_id_of(trade)
+                LOGGER.warning(
+                    "[RECOVER] %s: stop missing — re-placed STP @%.2f oca=%s id=%s",
+                    lifecycle.lifecycle_id,
+                    float(lifecycle.stop_price),
+                    oca_group,
+                    updates["stop_order_id"],
+                )
+            if not target_order_open and lifecycle.target_price is not None:
+                _parent, tp = build_bracket(
+                    direction=direction,
+                    qty=qty,
+                    entry_type="MKT",
+                    entry_lmt_price=None,
+                    target_price=float(lifecycle.target_price),
+                )
+                tp.parentId = 0  # standalone — not stitched to a (non-existent) parent
+                tp.ocaGroup = oca_group
+                tp.ocaType = _HEAL_OCA_TYPE
+                trade = await self._ib.place_order(contract, tp)
+                updates["target_order_id"] = _order_id_of(trade)
+                LOGGER.warning(
+                    "[RECOVER] %s: target missing — re-placed LMT @%.2f oca=%s id=%s",
+                    lifecycle.lifecycle_id,
+                    float(lifecycle.target_price),
+                    oca_group,
+                    updates["target_order_id"],
+                )
+        except Exception as exc:  # noqa: BLE001 — never raise into the reconcile loop
+            LOGGER.error(
+                "[RECOVER] %s: heal_failed — %s: %s (position may be unprotected)",
+                lifecycle.lifecycle_id,
+                type(exc).__name__,
+                exc,
+            )
+            LOGGER.info("[ALERT] recover_heal_failed: id=%s", lifecycle.lifecycle_id)
+
+        if updates:
+            try:
+                await self._db.update_lifecycle(lifecycle.lifecycle_id, updates)
+            except Exception as exc:  # noqa: BLE001 — order placed; DB persist is best-effort
+                LOGGER.warning(
+                    "[RECOVER] %s: persist_failed — %s: %s (new oid not saved to DB)",
+                    lifecycle.lifecycle_id,
+                    type(exc).__name__,
+                    exc,
+                )
+        return bool(updates)
+
     async def _reconcile_active(
         self,
         lifecycle: Lifecycle,
@@ -292,8 +409,23 @@ class Reconciler:
         has_position: bool,
         stop_order_open: bool,
         target_order_open: bool,
+        positions: list[Any],
+        open_trades: list[Any],
     ) -> ReconcileAction:
         if has_position:
+            # Self-heal: a live position whose protective leg is gone (e.g. a GTC
+            # stop that didn't survive a redeploy) is unprotected — re-place any
+            # missing bracket leg. Idempotent: both legs resident → nothing to do.
+            if not (stop_order_open and target_order_open):
+                healed = await self._heal_missing_legs(
+                    lifecycle,
+                    positions=positions,
+                    open_trades=open_trades,
+                    stop_order_open=stop_order_open,
+                    target_order_open=target_order_open,
+                )
+                if healed:
+                    return ReconcileAction.HEALED
             return ReconcileAction.NOOP
 
         # Position is gone — walk ACTIVE → EXITING → CLOSED (state machine
@@ -574,6 +706,13 @@ class Reconciler:
             len(non_closed),
             dict(counts),
         )
+        # Self-heal summary (proves the missing-leg recovery path ran this scan).
+        active = sum(1 for lc in non_closed if lc.state == State.ACTIVE.value)
+        LOGGER.info(
+            "[RECOVER] scan: %d active, %d healed",
+            active,
+            counts.get(ReconcileAction.HEALED, 0),
+        )
         return dict(counts)
 
     # ---------------------------------------------------------------- halt-ack
@@ -763,6 +902,27 @@ def _order_in_open_trades(open_trades: list[Any], order_id: int) -> bool:
         if oid == order_id:
             return True
     return False
+
+
+def _oca_group_of(open_trades: list[Any], order_id: int | None) -> str | None:
+    """The ocaGroup of the resting order ``order_id`` (None if absent/ungrouped)."""
+    if order_id is None:
+        return None
+    for trade in open_trades:
+        order = getattr(trade, "order", None)
+        if order is not None and getattr(order, "orderId", None) == order_id:
+            return getattr(order, "ocaGroup", None) or None
+    return None
+
+
+def _order_id_of(trade: Any) -> int:
+    order = getattr(trade, "order", None)
+    if order is None:
+        return 0
+    try:
+        return int(getattr(order, "orderId", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _resolve_exit_attribution(

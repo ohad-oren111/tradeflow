@@ -935,3 +935,106 @@ async def test_resolve_exit_price_falls_back_when_fill_lookup_raises():
     rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib)
     price = await rec._resolve_exit_price(lc, ExitReason.STOP)
     assert price == 30325.0  # order-price fallback, never raises
+
+
+# -------- self-heal missing bracket leg (ACTIVE + live position) --------
+
+
+def _placed(oid: int) -> MagicMock:
+    t = MagicMock(name=f"Trade<{oid}>")
+    t.order.orderId = oid
+    return t
+
+
+def _open_trade_oca(order_id: int, oca: str) -> MagicMock:
+    t = _make_open_trade(order_id)
+    t.order.ocaGroup = oca
+    return t
+
+
+async def test_heal_replaces_missing_stop_only_oca_into_target_group():
+    ib = _make_mock_ib(
+        positions=[_make_position(qty=2)],
+        open_trades=[_open_trade_oca(1002, "grp-A")],  # target resident; stop 1003 gone
+    )
+    ib.place_order = AsyncMock(return_value=_placed(9001))  # 1 call (stop only)
+    db = _make_mock_db()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, db=db)
+
+    action = await rec.reconcile_one(_make_lifecycle(State.ACTIVE))
+
+    assert action is ReconcileAction.HEALED
+    ib.place_order.assert_awaited_once()
+    placed = ib.place_order.await_args.args[1]
+    assert placed.orderType == "STP" and placed.action == "SELL"
+    assert placed.auxPrice == 17400.0  # recorded stop_price (entry-75), NOT live price
+    assert placed.outsideRth is True
+    assert placed.ocaGroup == "grp-A"  # OCA'd into the surviving target's group
+    db.update_lifecycle.assert_awaited_once()
+    assert db.update_lifecycle.await_args.args[1] == {"stop_order_id": 9001}
+
+
+async def test_heal_replaces_both_missing_legs_as_fresh_oca_bracket():
+    ib = _make_mock_ib(positions=[_make_position(qty=2)], open_trades=[])  # both legs gone
+    ib.place_order = AsyncMock(side_effect=[_placed(9101), _placed(9102)])  # 2 calls: stop, target
+    db = _make_mock_db()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, db=db)
+
+    action = await rec.reconcile_one(_make_lifecycle(State.ACTIVE))
+
+    assert action is ReconcileAction.HEALED
+    assert ib.place_order.await_count == 2
+    stp = ib.place_order.await_args_list[0].args[1]
+    tp = ib.place_order.await_args_list[1].args[1]
+    assert stp.orderType == "STP" and stp.auxPrice == 17400.0
+    assert tp.orderType == "LMT" and tp.lmtPrice == 17600.0
+    assert stp.ocaGroup == tp.ocaGroup and stp.ocaGroup.startswith("heal-")  # one fresh group
+    assert db.update_lifecycle.await_args.args[1] == {
+        "stop_order_id": 9101,
+        "target_order_id": 9102,
+    }
+
+
+async def test_heal_noop_when_both_legs_resident():
+    ib = _make_mock_ib(
+        positions=[_make_position(qty=2)],
+        open_trades=[_make_open_trade(1003), _make_open_trade(1002)],  # both present
+    )
+    ib.place_order = AsyncMock()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib)
+
+    action = await rec.reconcile_one(_make_lifecycle(State.ACTIVE))
+
+    assert action is ReconcileAction.NOOP
+    ib.place_order.assert_not_awaited()  # idempotent — nothing to heal
+
+
+async def test_heal_no_placement_when_flat():
+    ib = _make_mock_ib(positions=[], open_trades=[])  # no live position
+    ib.place_order = AsyncMock()
+    sm = _make_mock_sm()
+    sm.transition = AsyncMock(
+        side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]  # 2 calls
+    )
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, sm=sm)
+
+    await rec.reconcile_one(_make_lifecycle(State.ACTIVE))
+
+    ib.place_order.assert_not_awaited()  # FLAT → never place; the close path owns this
+
+
+async def test_heal_failure_is_swallowed_and_alerts(caplog):
+    ib = _make_mock_ib(
+        positions=[_make_position(qty=2)],
+        open_trades=[_open_trade_oca(1002, "grp-A")],  # stop missing → heal attempt
+    )
+    ib.place_order = AsyncMock(side_effect=RuntimeError("broker reject"))  # 1 call, raises
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib)
+
+    with caplog.at_level(logging.INFO):  # the [ALERT] line is INFO
+        action = await rec.reconcile_one(_make_lifecycle(State.ACTIVE))  # must NOT raise
+
+    ib.place_order.assert_awaited()  # attempt made
+    assert action is ReconcileAction.NOOP  # nothing persisted → not HEALED
+    assert any("heal_failed" in r.message for r in caplog.records)
+    assert any("recover_heal_failed" in r.message for r in caplog.records)
