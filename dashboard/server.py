@@ -123,6 +123,18 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
             {"panel": state.working_orders, "errors": state.errors},
         )
 
+    @app.get("/panel/recent_trades", response_class=HTMLResponse)
+    async def panel_recent_trades(request: Request) -> HTMLResponse:
+        # Live-page trade visibility: last ~10 trades + the latest day's realized
+        # P&L, reusing the same TradesAggregator that powers /trades + /pnl.
+        log = await trades_aggregator.trade_log(limit=10)
+        daily = await trades_aggregator.daily_pnl()
+        return _TEMPLATES.TemplateResponse(
+            request,
+            "partials/recent_trades.html",
+            {"log": log, "daily": daily},
+        )
+
     @app.get("/trades", response_class=HTMLResponse)
     async def trades(request: Request) -> HTMLResponse:
         log = await trades_aggregator.trade_log()

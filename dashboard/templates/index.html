@@ -21,5 +21,10 @@
       <div class="card"><div class="card-body text-muted">loading working orders…</div></div>
     </div>
   </div>
+  <div class="col-12">
+    <div id="panel-recent-trades" hx-get="/panel/recent_trades" hx-trigger="every 30s, load" hx-swap="innerHTML">
+      <div class="card"><div class="card-body text-muted">loading recent trades…</div></div>
+    </div>
+  </div>
 </div>
 {% endblock %}
