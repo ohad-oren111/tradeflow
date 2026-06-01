@@ -19,6 +19,14 @@ class RiskParams:
     max_daily_dd_pct: float = 0.08  # 8% — catastrophic
     max_weekly_dd_pct: float = 0.15  # 15% — catastrophic
     max_consecutive_losses: int = 6  # bug detector
+    # Kill-switch master enable (safety circuit breaker — can only STOP trading).
+    kill_switch_enabled: bool = True
+    # Equity base for the daily/weekly drawdown % triggers. None → use the live
+    # broker NetLiquidation each poll. NOTE: on the ~$1M paper account, 8%/15% of
+    # net-liq is ~$80k/$150k, so the DD triggers are very loose for a 2-contract
+    # MNQ position — the consecutive-loss trigger is the effective brake. Set this
+    # to an allocated capital (e.g. 50_000) to make the DD triggers meaningful.
+    kill_switch_equity_base_usd: float | None = None
 
     # Position limits (per kickoff §3 + Ohad's plan §4.2)
     max_simultaneous_positions: int = 5
