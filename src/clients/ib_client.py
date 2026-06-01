@@ -323,6 +323,45 @@ class IBClient:
         LOGGER.info("[ib_client] cancel_order — order_id=%s", order_id)
         self._ib.cancelOrder(order)
 
+    async def cancel_order_by_id(self, order_id: int) -> bool:
+        """Cancel a working order by id, looked up from live trades. Never raises.
+
+        ``IB.cancelOrder`` reads ``clientId`` / ``permId`` off the order, so it must
+        be handed a REAL ``Order`` — a bare ``orderId``-only stub raises
+        ``AttributeError`` (the W-S15.1 bug). We find the live ``Trade`` whose
+        ``order.orderId == order_id`` among ``IB.openTrades()`` (same client that
+        placed the brackets) and cancel THAT order. If the id is not among live
+        orders (already filled or cancelled) it is a logged no-op. Returns whether
+        a cancel was issued, so callers can never break the fill/reconcile loop.
+        """
+        if not self.is_connected:
+            LOGGER.warning("[ib_client] cancel_order_by_id skipped id=%s — not connected", order_id)
+            return False
+        try:
+            for trade in self._ib.openTrades():
+                order = getattr(trade, "order", None)
+                if order is not None and getattr(order, "orderId", None) == order_id:
+                    self._ib.cancelOrder(order)
+                    LOGGER.info(
+                        "[ib_client] cancel_order_by_id — order_id=%s clientId=%s",
+                        order_id,
+                        getattr(order, "clientId", None),
+                    )
+                    return True
+            LOGGER.info(
+                "[ib_client] cancel_order_by_id skipped id=%s — not live (already gone)",
+                order_id,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 — must never raise into fill/reconcile
+            LOGGER.warning(
+                "[ib_client] cancel_order_by_id error id=%s type=%s msg=%s",
+                order_id,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+
     async def subscribe_bars(
         self,
         contract: Contract,

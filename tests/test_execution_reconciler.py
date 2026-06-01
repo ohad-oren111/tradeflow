@@ -371,15 +371,16 @@ async def test_reconcile_active_no_position_no_child_fills_closes_as_manual():
 
 
 def _cancelled_order_ids(ib: AsyncMock) -> list[int]:
-    """The orderIds passed to ``ib.cancel_order`` (a ``_order_ref`` duck-type)."""
-    return [call.args[0].orderId for call in ib.cancel_order.await_args_list]
+    """The order ids passed to ``ib.cancel_order_by_id`` (PR #72 — the int id
+    directly; the IB client looks up the real Trade internally)."""
+    return [call.args[0] for call in ib.cancel_order_by_id.await_args_list]
 
 
 async def test_recon_active_stop_filled_cancels_orphan_target_leg():
     # Stop filled (1003 missing), target (1002) still resting → reconciler closes
     # AND cancels the orphan target so it can't fill with no position behind it.
     ib = _make_mock_ib(positions=[], open_trades=[_make_open_trade(1002)])
-    ib.cancel_order = AsyncMock()
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
     sm = _make_mock_sm()
     sm.transition = AsyncMock(
         side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]
@@ -395,7 +396,7 @@ async def test_recon_active_stop_filled_cancels_orphan_target_leg():
 async def test_recon_active_target_filled_cancels_orphan_stop_leg():
     # Target filled (1002 missing), stop (1003) still resting → cancel the stop.
     ib = _make_mock_ib(positions=[], open_trades=[_make_open_trade(1003)])
-    ib.cancel_order = AsyncMock()
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
     sm = _make_mock_sm()
     sm.transition = AsyncMock(
         side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]
@@ -411,7 +412,7 @@ async def test_recon_active_target_filled_cancels_orphan_stop_leg():
 async def test_recon_close_with_no_open_legs_cancels_nothing():
     # Both children already gone broker-side → nothing left to cancel.
     ib = _make_mock_ib(positions=[], open_trades=[])
-    ib.cancel_order = AsyncMock()
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
     sm = _make_mock_sm()
     sm.transition = AsyncMock(
         side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]
@@ -420,13 +421,14 @@ async def test_recon_close_with_no_open_legs_cancels_nothing():
 
     await rec.reconcile_one(_make_lifecycle(State.ACTIVE))
 
-    ib.cancel_order.assert_not_awaited()
+    ib.cancel_order_by_id.assert_not_awaited()
 
 
 async def test_recon_orphan_cancel_is_safe_noop_on_error():
     # A cancel reject (e.g. order already filled) must not crash the reconciler.
     ib = _make_mock_ib(positions=[], open_trades=[_make_open_trade(1002)])
-    ib.cancel_order = AsyncMock(side_effect=RuntimeError("Error 10148: cannot cancel"))
+    # one cancel attempt that raises — the reconciler's swallow-guard must absorb it
+    ib.cancel_order_by_id = AsyncMock(side_effect=RuntimeError("Error 10148: cannot cancel"))
     sm = _make_mock_sm()
     sm.transition = AsyncMock(
         side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]

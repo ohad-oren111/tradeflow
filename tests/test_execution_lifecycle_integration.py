@@ -91,6 +91,10 @@ class _FakeIB:
         self._next_oid = 0
         self.placed: list[tuple[int, Any]] = []
         self.cancelled: list[int] = []
+        # PR #72 — the order objects handed to the cancel path, so tests can
+        # assert a REAL Order (with .clientId) was passed, not a bare stub.
+        self.cancelled_orders: list[Any] = []
+        self._live: dict[int, Any] = {}
         self.positions: list[Any] = []
         self.open_trades: list[Any] = []
         self.fills: list[Any] = []
@@ -100,11 +104,18 @@ class _FakeIB:
         oid = self._next_oid
         with contextlib.suppress(Exception):
             order.orderId = oid
+            order.clientId = 1  # real orders carry the placing client's id
         self.placed.append((oid, order))
-        return SimpleNamespace(order=SimpleNamespace(orderId=oid), fills=[], contract=contract)
+        self._live[oid] = order  # live until cancelled (for cancel_order_by_id lookup)
+        return SimpleNamespace(order=order, fills=[], contract=contract)
 
-    async def cancel_order(self, order: Any) -> None:
-        self.cancelled.append(int(getattr(order, "orderId", 0) or 0))
+    async def cancel_order_by_id(self, order_id: int) -> bool:
+        order = self._live.pop(order_id, None)
+        if order is None:
+            return False
+        self.cancelled.append(order_id)
+        self.cancelled_orders.append(order)
+        return True
 
     async def get_positions(self) -> list[Any]:
         return self.positions
@@ -222,6 +233,25 @@ async def test_target_fill_cancels_protective_stop_and_closes():
 
 
 # --------------------------------------------------------------------- scenario 2
+
+
+async def test_stop_fill_cancels_sibling_via_real_order_with_clientid():
+    """PR #72 bug-reproduction: the sibling cancel must hand ``IB.cancelOrder`` a
+    REAL Order carrying ``.clientId`` — the W-S15.1 ``_OrderIdRef`` stub (orderId
+    only) raised AttributeError. Pre-fix this assertion fails (no clientId)."""
+    ib, db, sm, router, _recon, _dirty = _build()
+    lc = await _enter_to_active(ib, router, entry=30400.0, target=30550.0, stop=30325.0)
+
+    await router.on_fill(_fill_trade(lc.stop_order_id, RISK.contracts_per_trade, 30325.0))
+
+    # The resting TP sibling was cancelled through our in-process path...
+    assert lc.target_order_id in ib.cancelled
+    # ...with a real Order object (carries clientId), not a bare orderId stub.
+    assert ib.cancelled_orders, "no cancelled order captured"
+    cancelled = ib.cancelled_orders[-1]
+    assert hasattr(cancelled, "clientId")
+    assert cancelled.clientId == 1
+    assert getattr(cancelled, "orderId", None) == lc.target_order_id
 
 
 async def test_stop_fill_cancels_target_and_closes():

@@ -451,15 +451,8 @@ class OrderRouter:
             if oid is None or oid == filled_order_id:
                 continue
             try:
-                await self._ib.cancel_order(_order_handle(oid))
-                LOGGER.info(
-                    "[ROUTER] %s: cancelled sibling %s @%s — %s fill",
-                    lc.lifecycle_id,
-                    leg,
-                    f"{px:.2f}" if px is not None else "?",
-                    reason.value,
-                )
-            except Exception as exc:  # noqa: BLE001 — cancel is idempotent; never raise
+                cancelled = await self._ib.cancel_order_by_id(oid)
+            except Exception as exc:  # noqa: BLE001 — never raise into the fill-event loop
                 LOGGER.warning(
                     "[ROUTER] %s: cancel_sibling_error — leg=%s order=%s type=%s msg=%s",
                     lc.lifecycle_id,
@@ -467,6 +460,24 @@ class OrderRouter:
                     oid,
                     type(exc).__name__,
                     exc,
+                )
+                continue
+            if cancelled:
+                LOGGER.info(
+                    "[ROUTER] %s: cancelled sibling %s order id=%s @%s — %s fill",
+                    lc.lifecycle_id,
+                    leg,
+                    oid,
+                    f"{px:.2f}" if px is not None else "?",
+                    reason.value,
+                )
+            else:
+                LOGGER.info(
+                    "[ROUTER] %s: cancel skipped %s id=%s — not live (already gone) — %s fill",
+                    lc.lifecycle_id,
+                    leg,
+                    oid,
+                    reason.value,
                 )
 
     async def cancel_all_for(self, lifecycle: Lifecycle) -> None:
@@ -484,12 +495,13 @@ class OrderRouter:
             if oid is None:
                 continue
             try:
-                await self._ib.cancel_order(_order_handle(oid))
+                cancelled = await self._ib.cancel_order_by_id(oid)
                 LOGGER.info(
-                    "[EXEC] %s: cancel_order — lifecycle=%s order=%s",
+                    "[EXEC] %s: cancel_order — lifecycle=%s order=%s issued=%s",
                     lifecycle.symbol,
                     lifecycle.lifecycle_id,
                     oid,
+                    cancelled,
                 )
             except Exception as exc:
                 LOGGER.warning(
@@ -785,22 +797,6 @@ def _pnl_gross(*, direction: Direction, entry_price: float, exit_price: float, q
     """LONG: (exit - entry) * qty * multiplier; SHORT mirrors. MNQ multiplier = 2.0."""
     delta = exit_price - entry_price if direction is Direction.LONG else entry_price - exit_price
     return delta * qty * MNQ.multiplier
-
-
-def _order_handle(order_id: int) -> Any:
-    """Cheap stand-in object for ``IB.cancelOrder``: the real API takes an Order,
-    but only reads ``.orderId``. Avoids holding a long-lived Order reference in
-    the router cache.
-    """
-    handle = _OrderIdRef()
-    handle.orderId = order_id
-    return handle
-
-
-class _OrderIdRef:
-    """Minimal duck-type for ``IB.cancelOrder``. ``orderId`` is the only field read."""
-
-    orderId: int = 0  # noqa: N815 — IB-API attribute name, must match ib_async
 
 
 def _build_market_exit(direction: Direction, qty: int) -> Order:

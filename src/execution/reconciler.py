@@ -475,15 +475,8 @@ class Reconciler:
             if not is_open or oid is None:
                 continue
             try:
-                await self._ib.cancel_order(_order_ref(oid))
-                LOGGER.info(
-                    "[RECON] %s: cancelled orphan %s @%s — id=%s position flat broker-side",
-                    lifecycle.symbol,
-                    leg,
-                    f"{px:.2f}" if px is not None else "?",
-                    lifecycle.lifecycle_id,
-                )
-            except Exception as exc:  # noqa: BLE001 — cancel is idempotent; never raise
+                cancelled = await self._ib.cancel_order_by_id(oid)
+            except Exception as exc:  # noqa: BLE001 — never raise into the reconcile loop
                 LOGGER.warning(
                     "[RECON] %s: cancel_orphan_error — leg=%s order=%s type=%s msg=%s",
                     lifecycle.symbol,
@@ -491,6 +484,22 @@ class Reconciler:
                     oid,
                     type(exc).__name__,
                     exc,
+                )
+                continue
+            if cancelled:
+                LOGGER.info(
+                    "[RECON] %s: cancelled orphan %s order id=%s @%s — position flat broker-side",
+                    lifecycle.symbol,
+                    leg,
+                    oid,
+                    f"{px:.2f}" if px is not None else "?",
+                )
+            else:
+                LOGGER.info(
+                    "[RECON] %s: cancel skipped %s id=%s — not live (already gone)",
+                    lifecycle.symbol,
+                    leg,
+                    oid,
                 )
 
     # -------------------------------------------------------------- drains + scan
@@ -692,23 +701,6 @@ def compute_pnl_gross(
     """
     delta = exit_price - entry_price if direction is Direction.LONG else entry_price - exit_price
     return delta * qty * MNQ.multiplier
-
-
-class _OrderIdRef:
-    """Minimal duck-type for ``IBClient.cancel_order``: only ``orderId`` is read.
-
-    Mirrors ``router._OrderIdRef`` deliberately — the reconciler avoids importing
-    a sibling module's private surface (same convention as the duplicated
-    :func:`compute_pnl_gross`).
-    """
-
-    orderId: int = 0  # noqa: N815 — IB-API attribute name, must match ib_async
-
-
-def _order_ref(order_id: int) -> Any:
-    ref = _OrderIdRef()
-    ref.orderId = order_id
-    return ref
 
 
 def _broker_qty_for(positions: list[Any], symbol: str) -> int | None:
