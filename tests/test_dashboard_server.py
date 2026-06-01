@@ -312,3 +312,79 @@ def test_scoreboard_read_error_surfaces_not_500(_env):
     r = client.get("/scoreboard", auth=(_TEST_USER, _TEST_PASS))
     assert r.status_code == 200
     assert "Failed to load" in r.text
+
+
+# --------------------------------------- PR 2: decision divergence panel
+
+_DIV_TF = [
+    {"decision_ts": "2026-06-01T13:00:00+00:00", "decision": "long_signal", "failed_gate": None},
+    {
+        "decision_ts": "2026-06-01T13:05:00+00:00",
+        "decision": "noop_filter",
+        "failed_gate": "ma_order",
+    },
+    {"decision_ts": "2026-06-01T13:10:00+00:00", "decision": "long_signal", "failed_gate": None},
+    {"decision_ts": "2026-06-01T13:15:00+00:00", "decision": "noop_filter", "failed_gate": "gap"},
+]
+_DIV_SB = [
+    {
+        "ts": "2026-06-01T13:00:30+00:00",
+        "type": "entry",
+    },  # → agree-enter (matches 13:00 long_signal)
+    {"ts": "2026-06-01T13:05:45+00:00", "type": "entry"},  # → SeanBot-only, TF skipped on ma_order
+    {
+        "ts": "2026-06-01T14:00:00+00:00",
+        "type": "entry",
+    },  # → SeanBot-only, no TF decision in window
+]
+
+
+def test_divergence_requires_auth(_env):
+    client = TestClient(create_app(_make_orch()))
+    assert client.get("/divergence").status_code == 401
+
+
+def test_divergence_classify_counts_and_gate_breakdown():
+    from dashboard.divergence import _classify
+
+    d = _classify(_DIV_TF, _DIV_SB, 120.0)
+    assert d.agree_enter == 1  # 13:00 long_signal ↔ 13:00:30 entry
+    assert d.seanbot_only == 2  # the ma_order skip + the no-TF-record 14:00 entry
+    assert d.seanbot_only_no_tf_record == 1
+    assert d.tf_only == 1  # 13:10 long_signal, no SeanBot entry on the bar
+    assert d.agree_skip == 1  # 13:15 noop_filter, SeanBot also didn't enter
+    assert [(g.gate, g.count) for g in d.skip_gate_breakdown] == [("ma_order", 1)]
+
+
+def test_divergence_route_renders_classification(_env):
+    orch = _make_orch()
+    # 2 calls: strategy_decisions then seanbot_signals.
+    orch._db.select = AsyncMock(side_effect=[_DIV_TF, _DIV_SB])
+    client = TestClient(create_app(orch))
+    r = client.get("/divergence", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    body = r.text
+    assert "agree-enter" in body
+    assert "SeanBot-only" in body
+    assert "TF-only" in body
+    assert "ma_order" in body  # gate breakdown rendered
+    assert "no TF decision in window" in body  # the 14:00 entry note
+    assert "Sparse until forward decisions accumulate" in body  # caveat
+
+
+def test_divergence_empty_data_no_crash(_env):
+    orch = _make_orch()
+    orch._db.select = AsyncMock(side_effect=[[], []])  # 2 calls, both empty
+    client = TestClient(create_app(orch))
+    r = client.get("/divergence", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    assert "accumulating" in r.text
+
+
+def test_divergence_read_error_surfaces_not_500(_env):
+    orch = _make_orch()
+    orch._db.select = AsyncMock(side_effect=RuntimeError("supabase down"))  # 1 call (TF read)
+    client = TestClient(create_app(orch))
+    r = client.get("/divergence", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    assert "Failed to load" in r.text
