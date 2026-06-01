@@ -29,6 +29,7 @@ from config.instruments import MNQ
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.execution.dirty_set import DirtySet
+from src.execution.router import ensure_protective_stop
 from src.state_machine import (
     Direction,
     ExitReason,
@@ -136,6 +137,7 @@ class Reconciler:
                     qty_matches=qty_matches,
                     broker_qty=broker_qty,
                     positions=positions,
+                    open_trades=open_trades,
                     entry_order_open=entry_order_open,
                 )
             if current is State.ACTIVE:
@@ -184,20 +186,38 @@ class Reconciler:
         qty_matches: bool,
         broker_qty: int | None,
         positions: list[Any],
+        open_trades: list[Any],
         entry_order_open: bool,
     ) -> ReconcileAction:
         # Position present (any qty) → transition to ACTIVE with broker-sourced fields.
         if has_position:
             avg_cost = _broker_avg_cost_for(positions, lifecycle.symbol)
             qty = abs(broker_qty) if broker_qty is not None else lifecycle.entry_qty or 0
+            # avgCost is NOTIONAL for futures (price × multiplier). Store the
+            # per-contract entry price, mirroring the router fill-price path —
+            # otherwise pnl is computed off a 2× price (the b39a4def bug:
+            # 60890.12 stored for a ~30445 fill).
+            entry_price = avg_cost / MNQ.multiplier if MNQ.multiplier else avg_cost
+            # §0.5.T5 — the router never saw the parent fillEvent on this path, so
+            # it never placed the protective STP. Place it here (idempotent,
+            # outsideRth=True) BEFORE the transition so stop_order_id lands in the
+            # same ACTIVE row the normal router path produces. No completion path
+            # may leave a position stop-less.
+            stop_order_id = await self._ensure_protective_stop_on_force_fill(
+                lifecycle, positions=positions, open_trades=open_trades, qty=qty
+            )
+            extra: dict[str, Any] = {}
+            if stop_order_id is not None:
+                extra["stop_order_id"] = stop_order_id
             await self._sm.transition(
                 lifecycle,
                 State.ACTIVE,
                 reason="recon_entering_to_active",
                 payload={"broker_qty": broker_qty, "qty_matches": qty_matches},
                 entry_qty=qty,
-                entry_price=avg_cost,
+                entry_price=entry_price,
                 entry_filled_at=_now_iso(),
+                **extra,
             )
             self._log_action(lifecycle, ReconcileAction.ENTERING_TO_ACTIVE)
             return ReconcileAction.ENTERING_TO_ACTIVE
@@ -227,6 +247,43 @@ class Reconciler:
         )
         self._log_action(lifecycle, ReconcileAction.ENTERING_TO_CLOSED)
         return ReconcileAction.ENTERING_TO_CLOSED
+
+    async def _ensure_protective_stop_on_force_fill(
+        self,
+        lifecycle: Lifecycle,
+        *,
+        positions: list[Any],
+        open_trades: list[Any],
+        qty: int,
+    ) -> int | None:
+        """Place the protective STP for a reconciler force-filled entry (§0.5.T5).
+
+        Uses the broker position's qualified contract (the reconciler keeps no
+        contract cache of its own). Idempotent: if the lifecycle already tracks a
+        STP still resting at the broker, places nothing. Returns the stop order id
+        (existing or new), or ``None`` if no contract / stop_price is available.
+        """
+        position = _broker_position_for(positions, lifecycle.symbol)
+        contract = getattr(position, "contract", None) if position is not None else None
+        if contract is None:
+            LOGGER.warning(
+                "[RECON] %s: protective_stop_skipped — no broker contract for id=%s",
+                lifecycle.symbol,
+                lifecycle.lifecycle_id,
+            )
+            return None
+        existing_stop_is_live = lifecycle.stop_order_id is not None and _order_in_open_trades(
+            open_trades, lifecycle.stop_order_id
+        )
+        return await ensure_protective_stop(
+            self._ib,
+            contract,
+            lifecycle,
+            qty=qty,
+            existing_stop_is_live=existing_stop_is_live,
+            component="RECON",
+            path="recon_force_fill",
+        )
 
     async def _reconcile_active(
         self,
@@ -686,6 +743,23 @@ def _broker_avg_cost_for(positions: list[Any], symbol: str) -> float:
         except (TypeError, ValueError):
             return 0.0
     return 0.0
+
+
+def _broker_position_for(positions: list[Any], symbol: str) -> Any | None:
+    """Return the broker Position object for ``symbol`` (None if absent).
+
+    Unlike :func:`_broker_avg_cost_for` this hands back the whole position so the
+    caller can read its qualified ``contract`` for order placement.
+    """
+    for pos in positions:
+        contract = getattr(pos, "contract", None)
+        if contract is None:
+            continue
+        local = getattr(contract, "localSymbol", None)
+        base = getattr(contract, "symbol", None)
+        if symbol in {local, base}:
+            return pos
+    return None
 
 
 def _order_in_open_trades(open_trades: list[Any], order_id: int) -> bool:

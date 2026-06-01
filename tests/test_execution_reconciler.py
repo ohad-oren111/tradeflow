@@ -114,6 +114,12 @@ def _make_mock_ib(
     ib.get_positions = AsyncMock(return_value=positions or [])
     ib.get_portfolio = AsyncMock(return_value=portfolio or [])
     ib.get_open_trades = AsyncMock(return_value=open_trades or [])
+    # The reconciler force-fill path now places a protective STP via
+    # ensure_protective_stop → ib.place_order; return a Trade-shaped stub with an
+    # int orderId so the helper can read it.
+    placed = MagicMock(name="StpTrade")
+    placed.order.orderId = 9001
+    ib.place_order = AsyncMock(return_value=placed)
     return ib
 
 
@@ -239,7 +245,7 @@ async def test_reconcile_entering_with_matching_position_transitions_to_active_w
     sm = _make_mock_sm()
     active_lc = _make_lifecycle(State.ACTIVE)
     sm.transition.return_value = active_lc
-    rec, _ib, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm)
+    rec, ib_ref, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm)
     lc = _make_lifecycle(State.ENTERING)
 
     action = await rec.reconcile_one(lc)
@@ -249,8 +255,14 @@ async def test_reconcile_entering_with_matching_position_transitions_to_active_w
     call = sm.transition.await_args
     assert call.args[1] is State.ACTIVE
     assert call.kwargs["entry_qty"] == 2
-    assert call.kwargs["entry_price"] == 17501.25
+    # PR #69 — entry_price is the per-contract price, NOT the notional avgCost
+    # (avgCost = price × multiplier for futures). 17501.25 / 2 = 8750.625.
+    assert call.kwargs["entry_price"] == pytest.approx(17501.25 / MNQ.multiplier)
     assert call.kwargs["entry_filled_at"]  # iso string populated
+    # PR #69 — the force-fill path now also places the protective STP (the
+    # router never saw the fillEvent), and stamps its id onto the ACTIVE row.
+    ib_ref.place_order.assert_awaited_once()
+    assert call.kwargs["stop_order_id"] == 9001
 
 
 async def test_reconcile_entering_no_order_no_position_transitions_to_closed_manual():

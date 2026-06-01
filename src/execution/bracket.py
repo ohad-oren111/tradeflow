@@ -74,6 +74,11 @@ def build_bracket(
     # gap window under 24/5 trading — paired with the GTC STP placed after
     # parent fill in :func:`build_protective_stop`.
     tp_child.tif = "GTC"
+    # outsideRth=True so the leg is eligible during the overnight Globex session,
+    # not only the RTH window (09:30-16:00 ET). A 24/5 bot routinely holds
+    # positions overnight; an RTH-only protective leg is dormant exactly when an
+    # overnight move would hit it (see build_protective_stop for the incident).
+    tp_child.outsideRth = True
     # parentId is left as the default 0 — OrderRouter stitches it after
     # IB.placeOrder assigns the parent orderId.
 
@@ -104,4 +109,10 @@ def build_protective_stop(
     stp.tif = "GTC"
     stp.parentId = 0
     stp.transmit = True
+    # outsideRth=True is load-bearing for a 24/5 Globex bot. With the ib_async
+    # default (False) the STP only triggers during RTH (09:30-16:00 ET). On
+    # 2026-06-01 price breached a 30483.50 stop at 08:09 UTC overnight; the
+    # RTH-only STP could not fire and only armed at the 13:30 UTC RTH open,
+    # filling ~155pt late (-$1.85k vs ~-$600 for a clean stop). §0.5.T5.
+    stp.outsideRth = True
     return stp

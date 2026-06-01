@@ -30,10 +30,11 @@ import pytest
 
 from config.instruments import MNQ
 from config.risk_params import RISK
+from src.execution.bracket import build_bracket, build_protective_stop
 from src.execution.dirty_set import DirtySet
 from src.execution.reconciler import Reconciler
-from src.execution.router import OrderRouter
-from src.state_machine import ExitReason, State, StateMachine
+from src.execution.router import OrderRouter, ensure_protective_stop
+from src.state_machine import Direction, ExitReason, State, StateMachine
 from src.strategy import Signal
 
 STRAT_NAME = "sma100_bounce"
@@ -308,3 +309,115 @@ async def test_reconciler_falls_back_to_order_price_when_no_fill_visible():
     closed = db.rows[lc.lifecycle_id]
     # Falls back to the stop order price.
     assert closed["exit_price"] == 30325.0
+
+
+# ----------------------------------------------------- PR #69: protective stop
+
+
+def _position(qty: int, avg_cost: float) -> SimpleNamespace:
+    """A broker Position. ``avg_cost`` is NOTIONAL (per-contract price × mult)."""
+    return SimpleNamespace(
+        contract=SimpleNamespace(localSymbol=SYMBOL, symbol="MNQ"),
+        position=qty,
+        avgCost=avg_cost,
+    )
+
+
+def _lc_stub(stop_price: float | None, stop_order_id: int | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        direction="LONG",
+        stop_price=stop_price,
+        stop_order_id=stop_order_id,
+        symbol=SYMBOL,
+        lifecycle_id="lc-stub",
+    )
+
+
+def test_protective_stop_built_with_outsidertth():
+    # The STP must be eligible overnight (Globex), not RTH-only.
+    stp = build_protective_stop(direction=Direction.LONG, qty=2, stop_price=30325.0)
+    assert stp.orderType == "STP"
+    assert stp.outsideRth is True
+
+
+def test_bracket_tp_built_with_outsidertth():
+    _parent, tp = build_bracket(
+        direction=Direction.LONG,
+        qty=2,
+        entry_type="MKT",
+        entry_lmt_price=None,
+        target_price=30550.0,
+    )
+    assert tp.outsideRth is True
+
+
+async def test_ensure_protective_stop_places_outsidertth_when_absent():
+    ib = _FakeIB()
+    lc = _lc_stub(stop_price=30325.0, stop_order_id=None)
+
+    result = await ensure_protective_stop(
+        ib,  # type: ignore[arg-type]
+        _make_contract(),
+        lc,  # type: ignore[arg-type]
+        qty=2,
+        existing_stop_is_live=False,
+        component="ROUTER",
+        path="unit",
+    )
+
+    assert len(ib.placed) == 1
+    _oid, order = ib.placed[0]
+    assert order.orderType == "STP"
+    assert order.auxPrice == 30325.0
+    assert order.outsideRth is True
+    assert result == _oid
+
+
+async def test_ensure_protective_stop_idempotent_when_stop_already_live():
+    ib = _FakeIB()
+    lc = _lc_stub(stop_price=30325.0, stop_order_id=77)
+
+    result = await ensure_protective_stop(
+        ib,  # type: ignore[arg-type]
+        _make_contract(),
+        lc,  # type: ignore[arg-type]
+        qty=2,
+        existing_stop_is_live=True,
+        component="RECON",
+        path="unit",
+    )
+
+    # No second stop placed; the existing id is returned.
+    assert ib.placed == []
+    assert result == 77
+
+
+async def test_reconciler_force_fill_places_protective_stop_and_per_contract_entry():
+    """The bug: a parent fill the router missed → reconciler force-fills ACTIVE
+    but (pre-PR-69) placed NO stop and stored the NOTIONAL avgCost as entry."""
+    ib, db, sm, router, recon, _dirty = _build()
+    signal = _make_signal(entry=30445.0, target=30595.0, stop=30370.0)
+    contract = _make_contract()
+    lc = await router.place_entry(signal, contract)  # ENTERING; parent=1, tp=2
+    assert State(lc.state) is State.ENTERING
+
+    # Broker shows the position filled; the router never saw the fillEvent.
+    notional = 30445.0 * MNQ.multiplier
+    ib.positions = [_position(RISK.contracts_per_trade, notional)]
+    ib.open_trades = []
+
+    active = (await sm.load_non_closed())[0]
+    action = await recon.reconcile_one(active)
+
+    assert action.value == "entering_to_active"
+    row = db.rows[lc.lifecycle_id]
+    assert row["state"] == State.ACTIVE.value
+    # Per-contract entry price, NOT the notional avgCost.
+    assert row["entry_price"] == pytest.approx(30445.0)
+    # A protective STP was placed (previously skipped on this path) with
+    # outsideRth=True, and its id stamped onto the ACTIVE row.
+    stps = [order for _oid, order in ib.placed if getattr(order, "orderType", None) == "STP"]
+    assert len(stps) == 1
+    assert stps[0].outsideRth is True
+    assert stps[0].auxPrice == 30370.0
+    assert row["stop_order_id"] is not None

@@ -311,21 +311,19 @@ class OrderRouter:
 
         fill_qty, fill_price, fill_time = self._extract_fill(trade)
 
-        # Place the protective STP synchronously per §0.5.T5.
-        stp = build_protective_stop(
-            direction=Direction(lc.direction),
+        # Place the protective STP synchronously per §0.5.T5, via the shared
+        # idempotent helper so this path and the reconciler force-fill path
+        # cannot diverge (both place an outsideRth=True stop). Fresh parent fill
+        # → no stop exists yet, so existing_stop_is_live=False.
+        stp_order_id = await ensure_protective_stop(
+            self._ib,
+            contract,
+            lc,
             qty=fill_qty or self._contracts_per_signal(),
-            stop_price=float(lc.stop_price) if lc.stop_price is not None else 0.0,
+            existing_stop_is_live=False,
+            component="ROUTER",
+            path="parent_fill",
         )
-        LOGGER.info(
-            "[EXEC] %s: place_stp — lifecycle=%s stop=%.2f qty=%s",
-            lc.symbol,
-            lc.lifecycle_id,
-            stp.auxPrice,
-            stp.totalQuantity,
-        )
-        stp_trade = await self._ib.place_order(contract, stp)
-        stp_order_id = self._order_id_of(stp_trade)
 
         lc = await self._sm.transition(
             lc,
@@ -716,6 +714,71 @@ class OrderRouter:
         qty = int(getattr(status, "filled", 0) or 0) if status else 0
         price = float(getattr(status, "avgFillPrice", 0.0) or 0.0) if status else 0.0
         return qty, price, datetime.now(UTC).isoformat()
+
+
+async def ensure_protective_stop(
+    ib: IBClient,
+    contract: Contract,
+    lifecycle: Lifecycle,
+    *,
+    qty: int,
+    existing_stop_is_live: bool,
+    component: str,
+    path: str,
+) -> int | None:
+    """Idempotently guarantee a broker-resident protective STP for ``lifecycle``.
+
+    Called from BOTH entry-completion paths — the router parent-fill handler
+    (:meth:`OrderRouter._handle_parent_fill`) and the reconciler force-fill
+    (``recon_entering_to_active``) — so neither path can leave a position
+    stop-less (§0.5.T5). Built via :func:`build_protective_stop`, which sets
+    ``outsideRth=True`` so the stop is live during the overnight Globex session.
+
+    Idempotent: when ``existing_stop_is_live`` is True (a STP for this lifecycle
+    already rests at the broker) it returns the existing id and places nothing,
+    so concurrent completion paths never double-place. Returns the stop order id
+    (existing or newly placed), or ``None`` when ``stop_price`` is unknown.
+    """
+    if existing_stop_is_live and lifecycle.stop_order_id is not None:
+        LOGGER.info(
+            "[%s] %s: protective STP already resting — id=%s (no-op) — %s",
+            component,
+            lifecycle.symbol,
+            lifecycle.stop_order_id,
+            path,
+        )
+        return lifecycle.stop_order_id
+    if lifecycle.stop_price is None:
+        LOGGER.warning(
+            "[%s] %s: protective_stop_skipped — no stop_price on lifecycle id=%s — %s",
+            component,
+            lifecycle.symbol,
+            lifecycle.lifecycle_id,
+            path,
+        )
+        return None
+    stp = build_protective_stop(
+        direction=Direction(lifecycle.direction),
+        qty=qty,
+        stop_price=float(lifecycle.stop_price),
+    )
+    stp_trade = await ib.place_order(contract, stp)
+    order = getattr(stp_trade, "order", None)
+    raw_oid = getattr(order, "orderId", 0) if order is not None else 0
+    try:
+        stop_order_id = int(raw_oid or 0)
+    except (TypeError, ValueError):
+        stop_order_id = 0
+    LOGGER.info(
+        "[%s] %s: placed protective STP @%.2f outsideRth=True qty=%s id=%s — %s",
+        component,
+        lifecycle.symbol,
+        float(lifecycle.stop_price),
+        qty,
+        stop_order_id,
+        path,
+    )
+    return stop_order_id
 
 
 def _pnl_gross(*, direction: Direction, entry_price: float, exit_price: float, qty: int) -> float:
