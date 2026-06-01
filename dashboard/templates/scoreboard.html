@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span class="fw-bold">Scoreboard — TF vs SeanBot (daily realized P&amp;L)</span>
+    <span class="badge bg-warning text-dark">{{ board.caveat }}</span>
+  </div>
+  <div class="card-body">
+  {% if board.error %}
+    <div class="alert alert-danger mb-0">Failed to load scoreboard: {{ board.error }}</div>
+  {% elif not board.rows %}
+    <div class="text-muted">No realized P&amp;L yet.</div>
+  {% else %}
+    <div class="d-flex gap-4 mb-3 align-items-baseline flex-wrap">
+      <span class="h4 mb-0
+        {% if board.leader == 'TF' %}text-success{% elif board.leader == 'SeanBot' %}text-danger{% endif %}">
+        {{ board.headline }}
+      </span>
+      <span class="text-muted">
+        cumulative — TF
+        <span class="{% if board.tf_total < 0 %}text-danger{% elif board.tf_total > 0 %}text-success{% endif %}">{{ "%.2f"|format(board.tf_total) }}</span>
+        · SeanBot
+        <span class="{% if board.sb_total < 0 %}text-danger{% elif board.sb_total > 0 %}text-success{% endif %}">{{ "%.2f"|format(board.sb_total) }}</span>
+        · Δ
+        <span class="{% if board.delta_total < 0 %}text-danger{% elif board.delta_total > 0 %}text-success{% endif %}">{{ "%.2f"|format(board.delta_total) }}</span>
+      </span>
+    </div>
+    <div class="table-responsive">
+    <table class="table table-sm table-striped mb-0 align-middle">
+      <thead>
+        <tr>
+          <th>Date (UTC)</th>
+          <th class="text-end">TF P&amp;L</th>
+          <th class="text-end">SeanBot P&amp;L</th>
+          <th class="text-end">Daily Δ (TF−SB)</th>
+          <th>Winner</th>
+          <th class="text-end">TF cum</th>
+          <th class="text-end">SeanBot cum</th>
+          <th class="text-end">Δ cum</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in board.rows %}
+        <tr>
+          <td>{{ r.day }}</td>
+          <td class="text-end {% if r.tf_pnl < 0 %}text-danger{% elif r.tf_pnl > 0 %}text-success{% endif %}">{{ "%.2f"|format(r.tf_pnl) }}</td>
+          <td class="text-end {% if r.sb_pnl < 0 %}text-danger{% elif r.sb_pnl > 0 %}text-success{% endif %}">{{ "%.2f"|format(r.sb_pnl) }}</td>
+          <td class="text-end {% if r.delta < 0 %}text-danger{% elif r.delta > 0 %}text-success{% endif %}">{{ "%.2f"|format(r.delta) }}</td>
+          <td>
+            {% if r.winner == 'TF' %}<span class="badge bg-success">TF</span>
+            {% elif r.winner == 'SeanBot' %}<span class="badge bg-danger">SeanBot</span>
+            {% else %}<span class="badge bg-secondary">tie</span>{% endif %}
+          </td>
+          <td class="text-end">{{ "%.2f"|format(r.tf_cum) }}</td>
+          <td class="text-end">{{ "%.2f"|format(r.sb_cum) }}</td>
+          <td class="text-end">{{ "%.2f"|format(r.delta_cum) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  {% endif %}
+  </div>
+</div>
+{% endblock %}

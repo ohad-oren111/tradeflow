@@ -227,3 +227,88 @@ def test_pnl_read_error_surfaces_not_500(_env):
     r = client.get("/pnl", auth=(_TEST_USER, _TEST_PASS))
     assert r.status_code == 200
     assert "Failed to load" in r.text
+
+
+# ----------------------------------------- PR #71: TF-vs-SeanBot scoreboard
+
+
+def test_scoreboard_requires_auth(_env):
+    client = TestClient(create_app(_make_orch()))
+    assert client.get("/scoreboard").status_code == 401
+
+
+def test_scoreboard_seanbot_dollars_from_points(_env):
+    orch = _make_orch()
+    # 2 select calls: lifecycles (TF, none) then seanbot_signals (one exit).
+    orch._db.select = AsyncMock(
+        side_effect=[
+            [],
+            [{"type": "exit", "pnl_points": 48, "contracts": 2, "ts": "2026-05-31T22:52:05+00:00"}],
+        ]
+    )
+    client = TestClient(create_app(orch))
+    r = client.get("/scoreboard", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    body = r.text
+    assert "192.00" in body  # 48pt × $2 × 2ct
+    assert "2026-05-31" in body
+    assert "SeanBot leads" in body  # TF 0 vs SeanBot +192 → SeanBot ahead
+    assert "Different books" in body  # caveat
+
+
+def test_scoreboard_compares_two_days_with_winner_and_cumulative(_env):
+    orch = _make_orch()
+    tf_rows = [
+        {"state": "CLOSED", "pnl_net": 100.0, "exit_filled_at": "2026-05-30T15:00:00+00:00"},
+        {"state": "CLOSED", "pnl_net": -30.0, "exit_filled_at": "2026-05-31T15:00:00+00:00"},
+    ]
+    sb_rows = [
+        {
+            "type": "exit",
+            "pnl_points": 20,
+            "contracts": 2,
+            "ts": "2026-05-30T16:00:00+00:00",
+        },  # $80
+        {
+            "type": "exit",
+            "pnl_points": -10,
+            "contracts": 2,
+            "ts": "2026-05-31T16:00:00+00:00",
+        },  # -$40
+    ]
+    orch._db.select = AsyncMock(side_effect=[tf_rows, sb_rows])  # 2 calls: lifecycles, seanbot
+    client = TestClient(create_app(orch))
+    r = client.get("/scoreboard", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    body = r.text
+    # day 05-30: TF 100 vs SB 80 → TF +20; day 05-31: TF -30 vs SB -40 → TF +10 (lost less)
+    assert "100.00" in body and "80.00" in body
+    assert "-30.00" in body and "-40.00" in body
+    # cumulative TF 70 vs SB 40 → TF leads by 30
+    assert "TF leads by $30.00" in body
+
+
+def test_scoreboard_one_sided_day_renders_other_side_zero(_env):
+    orch = _make_orch()
+    orch._db.select = AsyncMock(
+        side_effect=[
+            [{"state": "CLOSED", "pnl_net": 50.0, "exit_filled_at": "2026-06-01T15:00:00+00:00"}],
+            [],  # SeanBot silent that day → $0, must not crash
+        ]
+    )
+    client = TestClient(create_app(orch))
+    r = client.get("/scoreboard", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    body = r.text
+    assert "2026-06-01" in body
+    assert "50.00" in body
+    assert "0.00" in body  # SeanBot side rendered as zero
+
+
+def test_scoreboard_read_error_surfaces_not_500(_env):
+    orch = _make_orch()
+    orch._db.select = AsyncMock(side_effect=RuntimeError("supabase down"))  # 1 call (TF read)
+    client = TestClient(create_app(orch))
+    r = client.get("/scoreboard", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    assert "Failed to load" in r.text
