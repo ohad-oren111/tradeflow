@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from dashboard.state import DashboardAggregator
+from dashboard.trades import TradesAggregator
 
 if TYPE_CHECKING:
     from src.orchestrator import Orchestrator
@@ -69,6 +70,7 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         dependencies=[Depends(verify)],
     )
     aggregator = DashboardAggregator(orchestrator)
+    trades_aggregator = TradesAggregator(orchestrator)
 
     app.mount(
         "/static",
@@ -116,6 +118,16 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
             "partials/working_orders.html",
             {"panel": state.working_orders, "errors": state.errors},
         )
+
+    @app.get("/trades", response_class=HTMLResponse)
+    async def trades(request: Request) -> HTMLResponse:
+        log = await trades_aggregator.trade_log()
+        return _TEMPLATES.TemplateResponse(request, "trades.html", {"log": log})
+
+    @app.get("/pnl", response_class=HTMLResponse)
+    async def pnl(request: Request) -> HTMLResponse:
+        daily = await trades_aggregator.daily_pnl()
+        return _TEMPLATES.TemplateResponse(request, "pnl.html", {"daily": daily})
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

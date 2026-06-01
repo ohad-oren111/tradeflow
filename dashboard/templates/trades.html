@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span class="fw-bold">Trade Log <span class="text-muted small">(last {{ log.rows|length }})</span></span>
+    <span class="badge bg-warning text-dark">{{ log.caveat }}</span>
+  </div>
+  <div class="card-body p-0">
+  {% if log.error %}
+    <div class="alert alert-danger m-3 mb-0">Failed to load trade log: {{ log.error }}</div>
+  {% elif not log.rows %}
+    <div class="p-3 text-muted">No trades yet.</div>
+  {% else %}
+    <div class="table-responsive">
+    <table class="table table-sm table-striped mb-0 align-middle">
+      <thead>
+        <tr>
+          <th>Entry (UTC)</th>
+          <th>Exit (UTC)</th>
+          <th>Dir</th>
+          <th>Symbol</th>
+          <th class="text-end">Entry</th>
+          <th class="text-end">Exit</th>
+          <th class="text-end">Qty</th>
+          <th class="text-end">P&amp;L net</th>
+          <th>Reason</th>
+          <th>State</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for t in log.rows %}
+        <tr>
+          <td class="small">{{ t.entry_time or "—" }}</td>
+          <td class="small">
+            {% if t.is_open %}<span class="badge bg-info text-dark">OPEN</span>
+            {% else %}{{ t.exit_time or "—" }}{% endif %}
+          </td>
+          <td>{{ t.direction }}</td>
+          <td>{{ t.symbol }}</td>
+          <td class="text-end">{% if t.entry_price is not none %}{{ "%.2f"|format(t.entry_price) }}{% else %}—{% endif %}</td>
+          <td class="text-end">{% if t.exit_price is not none %}{{ "%.2f"|format(t.exit_price) }}{% else %}—{% endif %}</td>
+          <td class="text-end">{{ t.qty if t.qty is not none else "—" }}</td>
+          <td class="text-end {% if t.pnl_net is not none and t.pnl_net < 0 %}text-danger{% elif t.pnl_net is not none and t.pnl_net > 0 %}text-success{% endif %}">
+            {% if t.pnl_net is not none %}{{ "%.2f"|format(t.pnl_net) }}{% else %}—{% endif %}
+          </td>
+          <td>{{ t.exit_reason or "—" }}</td>
+          <td><span class="badge bg-secondary">{{ t.state }}</span></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  {% endif %}
+  </div>
+</div>
+{% endblock %}

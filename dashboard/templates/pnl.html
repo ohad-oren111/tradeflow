@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span class="fw-bold">Daily Realized P&amp;L <span class="text-muted small">(closed lifecycles by UTC day)</span></span>
+    <span class="badge bg-warning text-dark">{{ daily.caveat }}</span>
+  </div>
+  <div class="card-body p-0">
+  {% if daily.error %}
+    <div class="alert alert-danger m-3 mb-0">Failed to load daily P&amp;L: {{ daily.error }}</div>
+  {% elif not daily.days %}
+    <div class="p-3 text-muted">No closed trades yet.</div>
+  {% else %}
+    <div class="table-responsive">
+    <table class="table table-sm table-striped mb-0 align-middle">
+      <thead>
+        <tr>
+          <th>Date (UTC)</th>
+          <th class="text-end"># Closed</th>
+          <th class="text-end">Wins</th>
+          <th class="text-end">Losses</th>
+          <th class="text-end">Realized P&amp;L net</th>
+          <th class="text-end">Running total</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for d in daily.days %}
+        <tr>
+          <td>{{ d.day }}</td>
+          <td class="text-end">{{ d.closed_count }}</td>
+          <td class="text-end text-success">{{ d.wins }}</td>
+          <td class="text-end text-danger">{{ d.losses }}</td>
+          <td class="text-end {% if d.pnl_net < 0 %}text-danger{% elif d.pnl_net > 0 %}text-success{% endif %}">{{ "%.2f"|format(d.pnl_net) }}</td>
+          <td class="text-end {% if d.running_total < 0 %}text-danger{% elif d.running_total > 0 %}text-success{% endif %}">{{ "%.2f"|format(d.running_total) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  {% endif %}
+  </div>
+</div>
+{% endblock %}
