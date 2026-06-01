@@ -132,6 +132,80 @@ def test_no_mutation_endpoints_exist(_env):
         assert r.status_code in (404, 405), f"POST {path} returned {r.status_code}"
 
 
+# ----------------------------------- Live page: nav + recent-trades summary
+
+
+def test_index_renders_full_nav_and_recent_trades_panel(_env):
+    client = TestClient(create_app(_make_orch()))
+    r = client.get("/", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    body = r.text
+    for href in (
+        'href="/"',
+        'href="/trades"',
+        'href="/pnl"',
+        'href="/scoreboard"',
+        'href="/divergence"',
+    ):
+        assert href in body, f"nav link missing: {href}"
+    assert 'hx-get="/panel/recent_trades"' in body  # trades visible on the Live page
+
+
+def test_panel_recent_trades_requires_auth(_env):
+    client = TestClient(create_app(_make_orch()))
+    assert client.get("/panel/recent_trades").status_code == 401
+
+
+def test_panel_recent_trades_renders_rows_and_latest_pnl(_env):
+    orch = _make_orch()
+    log_rows = [
+        {
+            "lifecycle_id": "a",
+            "direction": "LONG",
+            "symbol": "MNQM6",
+            "entry_price": 30559.25,
+            "exit_price": 30328.62,
+            "entry_qty": 2,
+            "pnl_net": -924.98,
+            "exit_reason": "STOP",
+            "state": "CLOSED",
+            "entry_filled_at": "2026-06-01T04:16:06+00:00",
+            "exit_filled_at": "2026-06-01T13:30:00+00:00",
+        }
+    ]
+    daily_rows = [
+        {"pnl_net": -924.98, "exit_filled_at": "2026-06-01T13:30:00+00:00", "state": "CLOSED"}
+    ]
+    # 2 calls: trade_log (limit 10) then daily_pnl.
+    orch._db.select = AsyncMock(side_effect=[log_rows, daily_rows])
+    client = TestClient(create_app(orch))
+    r = client.get("/panel/recent_trades", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    body = r.text
+    assert "30559.25" in body  # entry price
+    assert "-924.98" in body  # realized pnl
+    assert "STOP" in body
+    assert "Latest realized" in body  # today's figure
+    assert "2026-06-01" in body
+    assert "DB view" in body  # caveat
+
+
+def test_panel_recent_trades_empty_no_crash(_env):
+    client = TestClient(create_app(_make_orch()))  # default select -> []
+    r = client.get("/panel/recent_trades", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    assert "No trades yet" in r.text
+
+
+def test_panel_recent_trades_read_error_no_500(_env):
+    orch = _make_orch()
+    orch._db.select = AsyncMock(side_effect=RuntimeError("supabase down"))  # raises on each call
+    client = TestClient(create_app(orch))
+    r = client.get("/panel/recent_trades", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    assert "Failed to load" in r.text
+
+
 # --------------------------------------------------- PR #70: trade log + P&L
 
 
