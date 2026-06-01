@@ -30,12 +30,14 @@ from ib_async import Contract, Future
 
 from comms.telegram import TelegramAlerter
 from config.instruments import MNQ
+from config.risk_params import RISK
 from src.clients.ib_client import BrokerExtendedOutageError, IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.comparison.decision_journal import DecisionJournal
 from src.comparison.seanbot_reconciler import _RECON_JSONL_PATH, SeanbotReconciler
 from src.execution.dirty_set import DirtySet
 from src.execution.force_close import EodForceClose
+from src.execution.kill_switch import KillSwitch
 from src.execution.reconciler import Reconciler
 from src.execution.router import CloseResult, OrderRouter
 from src.journal_rotation import rotate_jsonl_if_large
@@ -161,6 +163,17 @@ class Orchestrator:
             dirty_set=self._dirty_set,
             db=db,
             orchestrator=self,
+        )
+        # Kill switch — halt-on-loss/drawdown circuit breaker (stop-only). Reuses
+        # the existing halt (blocks entries) + flatten_all (safe cancel+exit) +
+        # the Supabase halt_acks manual reset. Computes triggers from lifecycles
+        # (§0.5.98), never an in-memory counter. Polled in a background task.
+        self._kill_switch = KillSwitch(
+            db=db,
+            is_halted=self.is_halted,
+            raise_halt=lambda reason: self.raise_halt(symbol=reason),
+            flatten=self.flatten_all,
+            equity_base=self._kill_switch_equity_base,
         )
         # PR #14 — optional Telegram alerter + command bot. Disabled when env
         # vars are absent so unit tests and pre-activation runs don't crash.
@@ -890,6 +903,15 @@ class Orchestrator:
         """Return whether the global halt is currently raised."""
         return self._halt_new_entries
 
+    async def _kill_switch_equity_base(self) -> float:
+        """Equity base for the kill-switch drawdown %s. Configured override if set,
+        else the live broker NetLiquidation (§0.5.98). Raises on net-liq failure —
+        the kill switch treats that as 'base unknown' (skips DD this poll)."""
+        if RISK.kill_switch_equity_base_usd is not None:
+            return float(RISK.kill_switch_equity_base_usd)
+        summary = await self._ib.get_account_summary(self._paper_account)
+        return float(summary.get("NetLiquidation") or 0.0)
+
     def halt_raised_at(self) -> datetime | None:
         """Return the timestamp the current halt was raised, or None if clear."""
         return self._halt_raised_at
@@ -908,6 +930,13 @@ class Orchestrator:
         )
         self._background_tasks.append(recon_task)
         LOGGER.info("[RECON] task_launched — name=tradeflow-reconciler")
+        # Kill switch — halt-on-loss/drawdown circuit breaker poll loop.
+        kill_task = asyncio.create_task(
+            self._kill_switch.run_until_stopped(self._stop_event),
+            name="tradeflow-kill-switch",
+        )
+        self._background_tasks.append(kill_task)
+        LOGGER.info("[KILL] task_launched — name=tradeflow-kill-switch")
         # Track 4 — SeanBot reconciliation poll loop (read-only; never trades).
         seanbot_task = asyncio.create_task(
             self._seanbot_reconciler.run_until_stopped(self._stop_event, self._db),
