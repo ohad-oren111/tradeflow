@@ -50,7 +50,7 @@ from src.strategy import (
     Sma100BounceStrategy,
     _in_session_edge_window,
 )
-from src.warmup_shadow import WarmupShadow
+from src.warmup_shadow import WarmupShadow, hist_bars_to_dicts, validate_seed
 
 # Bar-liveness watchdog tunables.
 _WATCHDOG_STALE_THRESHOLD_SEC = 5 * 60
@@ -189,12 +189,23 @@ class Orchestrator:
         # strategy_decisions; buffered here, flushed on the hourly digest tick.
         # Never raises into the eval/order path.
         self._decision_writer = DecisionJournal()
-        # PR 1 (shadow) — backfill the SMA from history and log shadow-vs-live each
-        # warmup bar. Observe-only: NEVER gates a trade, never blocks boot. Default
-        # on; disable with WARMUP_SHADOW_ENABLED=0.
+        # PR 1 (shadow) — LIVE-ONLY SMA, logged against the strategy's backfilled
+        # SMA each bar. Observe-only: NEVER gates a trade. Default on; disable with
+        # WARMUP_SHADOW_ENABLED=0.
         self._warmup_shadow = WarmupShadow(
             enabled=os.environ.get("WARMUP_SHADOW_ENABLED", "true").lower()
             not in ("0", "false", "no", "")
+        )
+        # warmup-enable — seed the strategy's real buffer from history at boot so
+        # the SMA is warm immediately (no ~100-min dead zone). Default on; disable
+        # with WARMUP_BACKFILL_TRADE=0 to fall back to the pre-PR live warmup.
+        self._warmup_backfill_trade = os.environ.get(
+            "WARMUP_BACKFILL_TRADE", "true"
+        ).lower() not in (
+            "0",
+            "false",
+            "no",
+            "",
         )
 
     async def run(self) -> int:
@@ -322,11 +333,10 @@ class Orchestrator:
         if self._enable_strategy:
             self._wire_fill_event()
             await self._start_bar_subscription()
-            # PR 1 (shadow) — seed the shadow SMA from history once at boot (not on
-            # farm-flap resubscribe). Never raises; pure instrumentation.
-            await self._warmup_shadow.seed_from(
-                lambda: self._ib.get_historical_bars(self._contract, bar_size=self._bar_size)
-            )
+            # warmup-enable — seed the strategy's REAL buffer from history once at
+            # boot (not on farm-flap resubscribe) so it trades from the first live
+            # bar. Fail-safe + never raises (see _seed_strategy_warmup).
+            await self._seed_strategy_warmup()
             self._arm_farm_flap_resubscribe()
             self._launch_background_tasks()
 
@@ -423,6 +433,42 @@ class Orchestrator:
         # silent darkness.
         self._last_bar_at = datetime.now(UTC)
 
+    async def _seed_strategy_warmup(self) -> None:
+        """warmup-enable — seed the strategy's real bar buffer from history so the
+        SMA is warm from boot (no ~100-min live-warmup dead zone). Behind
+        ``WARMUP_BACKFILL_TRADE``. FAIL-SAFE: a failed / short / absurd backfill is
+        rejected and we fall back to the existing live warmup — a junk SMA never
+        gates a trade. Never raises into boot. Called once in ``_startup`` (not on
+        farm-flap resubscribe).
+        """
+        if not self._warmup_backfill_trade:
+            LOGGER.info("[WARMUP-ENABLE] disabled (WARMUP_BACKFILL_TRADE off) — live warmup")
+            return
+        try:
+            bars = await self._ib.get_historical_bars(self._contract, bar_size=self._bar_size)
+            seed = hist_bars_to_dicts(bars)
+            ok, reason, sma = validate_seed(seed, needed=_WARMUP_BARS_NEEDED)
+            if not ok:
+                LOGGER.warning(
+                    "[WARMUP-ENABLE] backfill rejected (%s) — falling back to live warmup",
+                    reason,
+                )
+                return
+            seeded = self._strategy.seed_bars(seed)
+            LOGGER.info(
+                "[WARMUP-ENABLE] strategy buffer seeded from backfill — bars=%d sma100=%.2f "
+                "indicators_ready=%s (trades from first live bar)",
+                seeded,
+                sma if sma is not None else float("nan"),
+                seeded >= _WARMUP_BARS_NEEDED,
+            )
+        except Exception as exc:  # noqa: BLE001 — backfill must never block boot/trading
+            LOGGER.warning(
+                "[WARMUP-ENABLE] seed failed — %s: %s (falling back to live warmup)",
+                type(exc).__name__,
+                exc,
+            )
+
     def _arm_farm_flap_resubscribe(self) -> None:
         """Wire the IB client's farm-flap watcher to re-arm the bar sub.
 
@@ -472,9 +518,9 @@ class Orchestrator:
             symbol=self._instrument,
             bar_count=self._strategy.bar_count,
         )
-        # PR 1 (shadow) — log backfilled SMA vs live SMA this bar. Observe-only:
-        # the trade decision above is already made; this never gates it.
-        self._warmup_shadow.observe(bar, self._strategy.last_decision, self._strategy.bar_count)
+        # warmup-enable — log the live-only SMA vs the strategy's backfilled SMA
+        # this bar. Observe-only: the trade decision above is already made.
+        self._warmup_shadow.observe(bar, self._strategy.last_decision)
         if signal_or_none is None:
             return
         if self._loop is None:

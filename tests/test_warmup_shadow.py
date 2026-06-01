@@ -1,83 +1,105 @@
-"""Tests for src.warmup_shadow.WarmupShadow — shadow SMA backfill, observe-only.
+"""Tests for src.warmup_shadow — live-only shadow SMA + seed sanity helpers.
 
-asyncio_mode=auto (pyproject) → async tests need no decorator, mirroring
-tests/test_durable_decision_journal.py. No IB, no network — bars are plain stubs.
+asyncio_mode=auto (pyproject) → async tests need no decorator. No IB, no network.
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
-from src.warmup_shadow import WarmupShadow
+from src.warmup_shadow import (
+    WarmupShadow,
+    hist_bars_to_dicts,
+    validate_seed,
+)
+
+# ----------------------------------------------------- live-only shadow
 
 
-def _bars(closes: list[float]) -> list[Any]:
-    return [SimpleNamespace(close=c) for c in closes]
-
-
-def _fetch(bars: list[Any]) -> Callable[[], Awaitable[list[Any]]]:
-    async def fetch() -> list[Any]:
-        return bars
-
-    return fetch
-
-
-async def test_seed_from_computes_backfill_sma_from_history() -> None:
+def test_observe_live_sma_none_before_warm_backfill_shown() -> None:
     sh = WarmupShadow()
-    # 120 closes; the last 100 are 100.0 → sma100 == 100.0, last 50 → ma50 == 100.0
-    await sh.seed_from(_fetch(_bars([50.0] * 20 + [100.0] * 100)))
-    assert sh.seeded == 120
-    out = sh.observe({"close": 100.0}, {"sma100": None}, bar_count=1)
+    out = sh.observe({"close": 100.0}, {"sma100": 99.5})
     assert out is not None
-    assert out["backfill_sma100"] == pytest.approx(100.0)
-    assert out["backfill_ma50"] == pytest.approx(100.0)
+    assert out["live_sma100"] is None  # 1 live bar < 100 → live-only SMA not ready
+    assert out["backfill_sma100"] == pytest.approx(99.5)  # strategy's seeded SMA
+    assert out["diff"] is None
 
 
-async def test_seed_failure_is_swallowed_no_raise() -> None:
+def test_observe_live_only_sma_and_diff_vs_backfill() -> None:
     sh = WarmupShadow()
-
-    async def boom() -> list[Any]:
-        raise RuntimeError("no historical entitlement")
-
-    await sh.seed_from(boom)  # must NOT raise
-    assert sh.seeded == 0
-    # no seed → backfill not ready off a single live bar
-    out = sh.observe({"close": 100.0}, {"sma100": None}, bar_count=1)
+    out = None
+    for _ in range(100):  # 100 live bars of 100.0 → live-only SMA == 100.0
+        out = sh.observe({"close": 100.0}, {"sma100": 99.5})
     assert out is not None
-    assert out["backfill_sma100"] is None
-
-
-async def test_observe_diff_vs_live_when_both_available() -> None:
-    sh = WarmupShadow()
-    await sh.seed_from(_fetch(_bars([100.0] * 100)))
-    out = sh.observe({"close": 100.0}, {"sma100": 99.5}, bar_count=101)
-    assert out is not None
-    assert out["backfill_sma100"] == pytest.approx(100.0)
-    assert out["diff"] == pytest.approx(0.5)  # backfill 100.0 - live 99.5
-
-
-def test_observe_returns_only_measurements_never_a_signal() -> None:
-    # Gate-unchanged guard: observe can NEVER hand back a trade signal/decision.
-    sh = WarmupShadow()
-    out = sh.observe({"close": 100.0}, {"sma100": None}, bar_count=1)
-    assert out is not None
-    assert set(out) == {"bar_count", "live_sma100", "backfill_sma100", "backfill_ma50", "diff"}
-    assert "signal" not in out and "decision" not in out
+    assert out["live_sma100"] == pytest.approx(100.0)
+    assert out["backfill_sma100"] == pytest.approx(99.5)
+    assert out["diff"] == pytest.approx(-0.5)  # backfill - live = 99.5 - 100.0
+    assert sh.live_bars == 100
 
 
 def test_observe_never_raises_on_garbage() -> None:
     sh = WarmupShadow()
-    assert sh.observe(None, None, None) is None
-    assert sh.observe({"no_close": 1}, None, 5) is None
-    assert sh.observe({"close": "not-a-number"}, None, 5) is None  # float() raises → swallowed
+    assert sh.observe(None, None) is None
+    assert sh.observe({"no_close": 1}, None) is None
+    assert sh.observe({"close": "x"}, {"sma100": 1.0}) is None
 
 
-async def test_disabled_is_total_noop() -> None:
+def test_observe_disabled_is_noop() -> None:
     sh = WarmupShadow(enabled=False)
-    await sh.seed_from(_fetch(_bars([100.0] * 100)))
-    assert sh.seeded == 0
-    assert sh.observe({"close": 100.0}, {"sma100": 100.0}, bar_count=1) is None
+    assert sh.observe({"close": 100.0}, {"sma100": 100.0}) is None
+    assert sh.live_bars == 0
+
+
+# ----------------------------------------------------- validate_seed (fail-safe)
+
+
+def test_validate_seed_accepts_sane() -> None:
+    ok, reason, sma = validate_seed([{"close": 30000.0}] * 100, needed=100)
+    assert ok
+    assert reason == "ok"
+    assert sma == pytest.approx(30000.0)
+
+
+def test_validate_seed_rejects_short() -> None:
+    ok, reason, sma = validate_seed([{"close": 30000.0}] * 50, needed=100)
+    assert not ok
+    assert "only 50 bars" in reason
+    assert sma is None
+
+
+def test_validate_seed_rejects_absurd_distance() -> None:
+    # last close 30000 but the window is dominated by a notional ~60000 → reject.
+    seed = [{"close": 60000.0}] * 99 + [{"close": 30000.0}]
+    ok, reason, sma = validate_seed(seed, needed=100)
+    assert not ok
+    assert "from last price" in reason
+
+
+# ----------------------------------------------------- hist_bars_to_dicts
+
+
+def test_hist_bars_to_dicts_converts_bardata() -> None:
+    bars = [
+        SimpleNamespace(
+            date=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
+            open=30000.0,
+            high=30010.0,
+            low=29990.0,
+            close=30005.0,
+            volume=42,
+        )
+    ]
+    out = hist_bars_to_dicts(bars)
+    assert len(out) == 1
+    assert out[0]["close"] == 30005.0
+    assert out[0]["open"] == 30000.0
+    assert out[0]["low"] == 29990.0
+    assert out[0]["time"] == datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+
+
+def test_hist_bars_to_dicts_skips_closeless_bars() -> None:
+    out = hist_bars_to_dicts([SimpleNamespace(close=None), SimpleNamespace(close=30000.0)])
+    assert len(out) == 1

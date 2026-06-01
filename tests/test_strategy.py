@@ -331,6 +331,48 @@ def test_cooldown_suppresses_signal_for_configured_bars():
         assert suppressed is None
 
 
+def test_seed_bars_warms_indicators_so_signal_fires_on_first_live_bar():
+    """warmup-enable: seeding the buffer from history makes the strategy ready
+    immediately — the engineered fire bar (which only fires when warm) triggers on
+    the FIRST live bar, no ~100-bar warmup wait. Same fire bar, just available sooner."""
+    bars = _pullback_bar_dicts(n=120)
+    last_close = _engineer_fire_bar(bars)
+
+    strat = Sma100BounceStrategy("MNQM6")
+    seeded = strat.seed_bars(bars[:-1])  # seed the 119 history bars
+    assert seeded == 119
+    assert strat.bar_count == 119
+
+    signal = strat.on_new_bar(bars[-1])  # first LIVE bar → ready at once
+    assert signal is not None
+    assert signal.direction == "LONG"
+    assert signal.entry_price == last_close
+    assert signal.stop_price == last_close - RISK.stop_loss_pts
+    assert signal.target_price == last_close + RISK.take_profit_pts
+
+
+def test_without_seed_first_bar_is_warmup_noop():
+    """Pre-PR / fallback behavior: with no seed, the first bar is noop_warmup —
+    proving seeding changes READINESS only, not which bar fires."""
+    bars = _pullback_bar_dicts(n=120)
+    _engineer_fire_bar(bars)
+
+    strat = Sma100BounceStrategy("MNQM6")
+    signal = strat.on_new_bar(bars[-1])  # single live bar, no seed → not ready
+    assert signal is None
+    assert strat.last_decision["decision"] == "noop_warmup"
+
+
+def test_seed_bars_only_seeds_an_empty_buffer():
+    """Seeding never disturbs a buffer that already has live/seeded bars."""
+    bars = _pullback_bar_dicts(n=120)
+    strat = Sma100BounceStrategy("MNQM6")
+    strat.on_new_bar(bars[0])  # one live bar present
+    n = strat.seed_bars(bars)  # must refuse
+    assert n == 1
+    assert strat.bar_count == 1
+
+
 def test_less_than_two_bars_returns_none():
     df = pd.DataFrame([{"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0}])
     df = add_all_indicators(df)
