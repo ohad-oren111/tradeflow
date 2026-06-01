@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import socket
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -99,6 +99,32 @@ async def test_get_open_trades_raises_when_not_connected(mock_ib_factory):
     client = IBClient(host="h", port=4002, client_id=1, ib_factory=lambda: fake_ib)
     with pytest.raises(RuntimeError, match="not connected"):
         await client.get_open_trades()
+
+
+# ------------------------------------------ PR 1: get_historical_bars (shadow)
+
+
+async def test_get_historical_bars_returns_snapshot_not_keepuptodate(mock_ib_factory):
+    fake_ib = mock_ib_factory()
+    fake_ib.isConnected.return_value = True
+    fake_ib.reqHistoricalDataAsync = AsyncMock(return_value=["b1", "b2", "b3"])
+
+    client = IBClient(host="h", port=4002, client_id=1, ib_factory=lambda: fake_ib)
+    out = await client.get_historical_bars(MagicMock(localSymbol="MNQM6"))
+
+    assert out == ["b1", "b2", "b3"]
+    fake_ib.reqHistoricalDataAsync.assert_awaited_once()
+    # A snapshot, NOT a live subscription — must not keepUpToDate.
+    assert fake_ib.reqHistoricalDataAsync.await_args.kwargs["keepUpToDate"] is False
+
+
+async def test_get_historical_bars_raises_when_not_connected(mock_ib_factory):
+    fake_ib = mock_ib_factory()
+    fake_ib.isConnected.return_value = False
+
+    client = IBClient(host="h", port=4002, client_id=1, ib_factory=lambda: fake_ib)
+    with pytest.raises(RuntimeError, match="not connected"):
+        await client.get_historical_bars(MagicMock())
 
 
 # ----------------------------------------------- PR #72: cancel_order_by_id

@@ -50,6 +50,7 @@ from src.strategy import (
     Sma100BounceStrategy,
     _in_session_edge_window,
 )
+from src.warmup_shadow import WarmupShadow
 
 # Bar-liveness watchdog tunables.
 _WATCHDOG_STALE_THRESHOLD_SEC = 5 * 60
@@ -188,6 +189,13 @@ class Orchestrator:
         # strategy_decisions; buffered here, flushed on the hourly digest tick.
         # Never raises into the eval/order path.
         self._decision_writer = DecisionJournal()
+        # PR 1 (shadow) — backfill the SMA from history and log shadow-vs-live each
+        # warmup bar. Observe-only: NEVER gates a trade, never blocks boot. Default
+        # on; disable with WARMUP_SHADOW_ENABLED=0.
+        self._warmup_shadow = WarmupShadow(
+            enabled=os.environ.get("WARMUP_SHADOW_ENABLED", "true").lower()
+            not in ("0", "false", "no", "")
+        )
 
     async def run(self) -> int:
         """Start orchestrator, loop on healthcheck, return process exit code."""
@@ -314,6 +322,11 @@ class Orchestrator:
         if self._enable_strategy:
             self._wire_fill_event()
             await self._start_bar_subscription()
+            # PR 1 (shadow) — seed the shadow SMA from history once at boot (not on
+            # farm-flap resubscribe). Never raises; pure instrumentation.
+            await self._warmup_shadow.seed_from(
+                lambda: self._ib.get_historical_bars(self._contract, bar_size=self._bar_size)
+            )
             self._arm_farm_flap_resubscribe()
             self._launch_background_tasks()
 
@@ -459,6 +472,9 @@ class Orchestrator:
             symbol=self._instrument,
             bar_count=self._strategy.bar_count,
         )
+        # PR 1 (shadow) — log backfilled SMA vs live SMA this bar. Observe-only:
+        # the trade decision above is already made; this never gates it.
+        self._warmup_shadow.observe(bar, self._strategy.last_decision, self._strategy.bar_count)
         if signal_or_none is None:
             return
         if self._loop is None:
