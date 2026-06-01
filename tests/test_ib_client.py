@@ -101,6 +101,72 @@ async def test_get_open_trades_raises_when_not_connected(mock_ib_factory):
         await client.get_open_trades()
 
 
+# ----------------------------------------------- PR #72: cancel_order_by_id
+
+
+def _trade_with_order(order_id: int, client_id: int = 1) -> MagicMock:
+    order = MagicMock(name=f"Order<{order_id}>")
+    order.orderId = order_id
+    order.clientId = client_id
+    trade = MagicMock(name=f"Trade<{order_id}>")
+    trade.order = order
+    return trade
+
+
+async def test_cancel_order_by_id_cancels_real_order_with_clientid(mock_ib_factory):
+    # The W-S15.1 fix: a REAL Order (carrying .clientId) is handed to cancelOrder,
+    # not a bare orderId stub (which raised AttributeError inside ib_async).
+    fake_ib = mock_ib_factory()
+    fake_ib.isConnected.return_value = True
+    trade = _trade_with_order(1003)
+    fake_ib.openTrades.return_value = [_trade_with_order(1002), trade]
+
+    client = IBClient(host="h", port=4002, client_id=1, ib_factory=lambda: fake_ib)
+    result = await client.cancel_order_by_id(1003)
+
+    assert result is True
+    fake_ib.cancelOrder.assert_called_once_with(trade.order)
+    passed = fake_ib.cancelOrder.call_args.args[0]
+    assert hasattr(passed, "clientId")  # would be False for the old _OrderIdRef stub
+    assert passed is trade.order
+
+
+async def test_cancel_order_by_id_noop_when_not_live(mock_ib_factory):
+    fake_ib = mock_ib_factory()
+    fake_ib.isConnected.return_value = True
+    fake_ib.openTrades.return_value = [_trade_with_order(1002)]
+
+    client = IBClient(host="h", port=4002, client_id=1, ib_factory=lambda: fake_ib)
+    result = await client.cancel_order_by_id(9999)  # not among live trades
+
+    assert result is False
+    fake_ib.cancelOrder.assert_not_called()
+
+
+async def test_cancel_order_by_id_noop_when_not_connected(mock_ib_factory):
+    fake_ib = mock_ib_factory()
+    fake_ib.isConnected.return_value = False
+
+    client = IBClient(host="h", port=4002, client_id=1, ib_factory=lambda: fake_ib)
+    result = await client.cancel_order_by_id(1003)  # must not raise
+
+    assert result is False
+    fake_ib.cancelOrder.assert_not_called()
+
+
+async def test_cancel_order_by_id_never_raises_on_broker_error(mock_ib_factory):
+    fake_ib = mock_ib_factory()
+    fake_ib.isConnected.return_value = True
+    trade = _trade_with_order(1003)
+    fake_ib.openTrades.return_value = [trade]
+    fake_ib.cancelOrder.side_effect = RuntimeError("Error 10148")  # 1 raising call
+
+    client = IBClient(host="h", port=4002, client_id=1, ib_factory=lambda: fake_ib)
+    result = await client.cancel_order_by_id(1003)  # must not raise
+
+    assert result is False
+
+
 def test_disconnect_is_idempotent_when_already_disconnected(mock_ib_factory):
     fake_ib = mock_ib_factory()
     fake_ib.isConnected.return_value = False

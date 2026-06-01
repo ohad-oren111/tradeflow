@@ -348,11 +348,11 @@ async def test_cancel_all_for_calls_ib_cancel_per_non_null_order_id():
     active_lc = _make_lifecycle(State.ACTIVE)
     # ACTIVE lifecycle has entry_order_id, target_order_id, stop_order_id all populated.
     router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
-    ib.cancel_order = AsyncMock()
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
 
     await router.cancel_all_for(active_lc)
 
-    assert ib.cancel_order.await_count == 3
+    assert ib.cancel_order_by_id.await_count == 3
 
 
 async def test_cancel_all_for_skips_none_order_ids():
@@ -360,10 +360,10 @@ async def test_cancel_all_for_skips_none_order_ids():
     sm = _make_mock_sm()
     idle_lc = _make_lifecycle(State.IDLE)  # all order ids None
     router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
-    ib.cancel_order = AsyncMock()
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
 
     await router.cancel_all_for(idle_lc)
-    ib.cancel_order.assert_not_awaited()
+    ib.cancel_order_by_id.assert_not_awaited()
 
 
 async def test_cancel_all_for_swallows_errors():
@@ -371,31 +371,33 @@ async def test_cancel_all_for_swallows_errors():
     sm = _make_mock_sm()
     active_lc = _make_lifecycle(State.ACTIVE)
     # 3 cancel attempts; raise on the second to confirm subsequent ones still run.
-    ib.cancel_order = AsyncMock(side_effect=[None, RuntimeError("cancel rejected"), None])
+    # 3 cancel attempts; raise on the second to confirm the router's swallow-guard
+    # keeps the subsequent ones running.
+    ib.cancel_order_by_id = AsyncMock(side_effect=[True, RuntimeError("cancel rejected"), True])
 
     router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
     await router.cancel_all_for(active_lc)  # must not raise
 
-    assert ib.cancel_order.await_count == 3
+    assert ib.cancel_order_by_id.await_count == 3
 
 
 # ------------------------------------------------ W-S15.1 sibling-cancel on exit
 
 
 def _cancelled_order_ids(ib: AsyncMock) -> list[int]:
-    """The orderIds passed to ``ib.cancel_order``, in call order.
+    """The order ids passed to ``ib.cancel_order_by_id``, in call order.
 
-    ``cancel_order`` receives an ``_order_handle`` duck-type whose only field is
-    ``orderId``; assert on identity, not call index.
+    ``cancel_order_by_id`` takes the int order id directly (PR #72 — it looks up
+    the real ``Trade`` internally), so ``call.args[0]`` is the id itself.
     """
-    return [call.args[0].orderId for call in ib.cancel_order.await_args_list]
+    return [call.args[0] for call in ib.cancel_order_by_id.await_args_list]
 
 
 async def test_target_fill_cancels_resting_stop_sibling():
     # W-S15.1: a TARGET (LMT) fill must cancel the standalone protective STP so
     # no SELL leg is left resting with no position behind it.
     ib = _make_mock_ib()
-    ib.cancel_order = AsyncMock()
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
     sm = _make_mock_sm()
     active_lc = _make_lifecycle(State.ACTIVE)  # target=1002, stop=1003
     sm.transition = AsyncMock(
@@ -417,7 +419,7 @@ async def test_target_fill_cancels_resting_stop_sibling():
 async def test_stop_fill_cancels_resting_target_sibling():
     # W-S15.1: a STOP fill must cancel the resting TP LMT.
     ib = _make_mock_ib()
-    ib.cancel_order = AsyncMock()
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
     sm = _make_mock_sm()
     active_lc = _make_lifecycle(State.ACTIVE)
     sm.transition = AsyncMock(
@@ -438,7 +440,7 @@ async def test_stop_fill_cancels_resting_target_sibling():
 async def test_manual_market_exit_cancels_both_remaining_children():
     # W-S15.1: a MANUAL/EOD market exit (separate order) clears BOTH children.
     ib = _make_mock_ib()
-    ib.cancel_order = AsyncMock()
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
     sm = _make_mock_sm()
     exiting_lc = _make_lifecycle(State.EXITING)  # target=1002, stop=1003
     sm.transition = AsyncMock(
@@ -461,9 +463,10 @@ async def test_manual_market_exit_cancels_both_remaining_children():
 
 
 async def test_sibling_cancel_is_safe_noop_when_order_already_gone():
-    # W-S15.1: cancelling an already-filled/cancelled sibling must not raise.
+    # W-S15.1: an already-filled/cancelled sibling is a no-op (cancel_order_by_id
+    # returns False when the id isn't among live trades) — must not raise.
     ib = _make_mock_ib()
-    ib.cancel_order = AsyncMock(side_effect=RuntimeError("Error 10148: cannot cancel filled"))
+    ib.cancel_order_by_id = AsyncMock(return_value=False)  # not live / already gone
     sm = _make_mock_sm()
     active_lc = _make_lifecycle(State.ACTIVE)
     sm.transition = AsyncMock(
@@ -479,7 +482,7 @@ async def test_sibling_cancel_is_safe_noop_when_order_already_gone():
     await router.on_fill(trade, None)  # must not raise
 
     # Cancel was attempted, the close still completed (CLOSED transition ran).
-    assert ib.cancel_order.await_count == 1
+    assert ib.cancel_order_by_id.await_count == 1
     assert sm.transition.await_args.args[1] is State.CLOSED
 
 
