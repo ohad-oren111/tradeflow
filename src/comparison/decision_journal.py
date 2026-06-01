@@ -69,6 +69,28 @@ def decision_to_row(decision: dict, *, symbol: str, bar_count: int | None) -> di
     }
 
 
+def _dedupe_for_upsert(rows: list[dict]) -> tuple[list[dict], int, int]:
+    """Make ``rows`` safe for a single ON CONFLICT upsert on (symbol, decision_ts).
+
+    Drops rows with a null ``decision_ts`` (unpersistable — NOT NULL + can't be a
+    conflict key) and collapses duplicates on (symbol, decision_ts) to the LAST
+    occurrence (the most recent decision for that bar). Returns
+    ``(deduped_rows, null_ts_dropped, dupes_collapsed)``. Insertion order of the
+    surviving keys is preserved.
+    """
+    by_key: dict[tuple[Any, Any], dict] = {}
+    null_ts = 0
+    for row in rows:
+        ts = row.get("decision_ts")
+        if ts is None:
+            null_ts += 1
+            continue
+        by_key[(row.get("symbol"), ts)] = row  # last write wins
+    deduped = list(by_key.values())
+    collapsed = (len(rows) - null_ts) - len(deduped)
+    return deduped, null_ts, collapsed
+
+
 class DecisionJournal:
     """Bounded buffer of TF's analytically-useful decisions + a durable flush.
 
@@ -141,8 +163,17 @@ class DecisionJournal:
             return 0
         pending = list(self._buffer)
         dropped = self._dropped_since_flush
+        # Collapse to the on-conflict key before upserting. PostgREST's
+        # ON CONFLICT cannot touch the same (symbol, decision_ts) twice in one
+        # command (PG 21000), and a null decision_ts violates NOT NULL (PG 23502)
+        # — either 400/500s the whole batch and, because the buffer is re-sent
+        # every tick, poisons EVERY subsequent flush. Multiple evals can land on
+        # one bar ts (e.g. a feed re-deliver after a farm-flap resubscribe), so
+        # keep the last decision per bar and skip null-ts rows.
+        rows, null_ts, collapsed = _dedupe_for_upsert(pending)
         try:
-            await db.upsert(_DECISIONS_TABLE, pending, on_conflict=_DECISIONS_ON_CONFLICT)
+            if rows:
+                await db.upsert(_DECISIONS_TABLE, rows, on_conflict=_DECISIONS_ON_CONFLICT)
         except Exception as exc:  # noqa: BLE001 — observability must never break the loop
             LOGGER.warning(
                 "[DECJRNL] flush failed — %s: %d buffered, %d dropped (swallowed)",
@@ -151,7 +182,7 @@ class DecisionJournal:
                 dropped,
             )
             return 0
-        # Remove exactly the rows we flushed; any captured during the await stay.
+        # Remove exactly the rows we drained; any captured during the await stay.
         for _ in range(n):
             try:
                 self._buffer.popleft()
@@ -159,9 +190,12 @@ class DecisionJournal:
                 break
         self._dropped_since_flush = 0
         LOGGER.info(
-            "[DECJRNL] flushed %d rows → %s (dropped=%d)",
-            n,
+            "[DECJRNL] flushed %d rows → %s (buffered=%d collapsed_dupes=%d null_ts=%d dropped=%d)",
+            len(rows),
             _DECISIONS_TABLE,
+            n,
+            collapsed,
+            null_ts,
             dropped,
         )
-        return n
+        return len(rows)
