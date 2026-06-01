@@ -21,6 +21,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from dashboard.divergence import DivergenceAggregator
 from dashboard.scoreboard import ScoreboardAggregator
 from dashboard.state import DashboardAggregator
 from dashboard.trades import TradesAggregator
@@ -73,6 +74,7 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     aggregator = DashboardAggregator(orchestrator)
     trades_aggregator = TradesAggregator(orchestrator)
     scoreboard_aggregator = ScoreboardAggregator(orchestrator)
+    divergence_aggregator = DivergenceAggregator(orchestrator)
 
     app.mount(
         "/static",
@@ -135,6 +137,11 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     async def scoreboard(request: Request) -> HTMLResponse:
         board = await scoreboard_aggregator.scoreboard()
         return _TEMPLATES.TemplateResponse(request, "scoreboard.html", {"board": board})
+
+    @app.get("/divergence", response_class=HTMLResponse)
+    async def divergence(request: Request) -> HTMLResponse:
+        div = await divergence_aggregator.divergence()
+        return _TEMPLATES.TemplateResponse(request, "divergence.html", {"div": div})
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

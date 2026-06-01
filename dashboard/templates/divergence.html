@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span class="fw-bold">Decision Divergence — TF vs SeanBot
+      <span class="text-muted small">(±{{ div.tolerance_sec }}s bar match)</span></span>
+    <span class="badge bg-warning text-dark">{{ div.caveat }}</span>
+  </div>
+  <div class="card-body">
+  {% if div.error %}
+    <div class="alert alert-danger mb-0">Failed to load divergence: {{ div.error }}</div>
+  {% else %}
+    <div class="row g-2 mb-3">
+      <div class="col-6 col-md-3">
+        <div class="border rounded p-2 text-center">
+          <div class="h4 mb-0 text-success">{{ div.agree_enter }}</div>
+          <div class="small text-muted">agree-enter</div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="border rounded p-2 text-center">
+          <div class="h4 mb-0 text-danger">{{ div.seanbot_only }}</div>
+          <div class="small text-muted">SeanBot-only (TF missed)</div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="border rounded p-2 text-center">
+          <div class="h4 mb-0 text-primary">{{ div.tf_only }}</div>
+          <div class="small text-muted">TF-only</div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="border rounded p-2 text-center">
+          <div class="h4 mb-0 text-secondary">{{ div.agree_skip }}</div>
+          <div class="small text-muted">agree-skip</div>
+        </div>
+      </div>
+    </div>
+
+    <h6>Where TF skipped a bar SeanBot entered — by blocking gate</h6>
+    {% if div.skip_gate_breakdown %}
+      <table class="table table-sm w-auto">
+        <thead><tr><th>failed_gate</th><th class="text-end">count</th></tr></thead>
+        <tbody>
+        {% for g in div.skip_gate_breakdown %}
+          <tr><td>{{ g.gate }}</td><td class="text-end">{{ g.count }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <div class="text-muted small mb-3">No SeanBot-only-vs-TF-skip bars yet.</div>
+    {% endif %}
+    {% if div.seanbot_only_no_tf_record %}
+      <div class="small text-muted mb-3">
+        ({{ div.seanbot_only_no_tf_record }} SeanBot entries had no TF decision in window —
+        TF in warmup / touch-failed / pre-PR-C gap.)
+      </div>
+    {% endif %}
+
+    <h6>Recent classified bars</h6>
+    {% if div.examples %}
+      <div class="table-responsive">
+      <table class="table table-sm table-striped mb-0 align-middle">
+        <thead><tr><th>Bar (UTC)</th><th>Class</th><th>TF decision</th><th>TF failed_gate</th></tr></thead>
+        <tbody>
+        {% for e in div.examples %}
+          <tr>
+            <td class="small">{{ e.ts }}</td>
+            <td>{{ e.classification }}</td>
+            <td>{{ e.tf_decision or "—" }}</td>
+            <td>{{ e.tf_failed_gate or "—" }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% else %}
+      <div class="text-muted">No overlapping decisions yet — accumulating.</div>
+    {% endif %}
+  {% endif %}
+  </div>
+</div>
+{% endblock %}
