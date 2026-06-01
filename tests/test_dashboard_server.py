@@ -40,6 +40,11 @@ def _make_orch() -> MagicMock:
     )
     orch._ib.get_portfolio = AsyncMock(return_value=[])
     orch._ib.get_open_trades = AsyncMock(return_value=[])
+    # PR #70 — the trade-log / daily-P&L views read lifecycles via the
+    # orchestrator's service-role SupabaseClient. Default to an empty result;
+    # per-test overrides set a fake payload.
+    orch._db = MagicMock(name="SupabaseClient")
+    orch._db.select = AsyncMock(return_value=[])
     return orch
 
 
@@ -125,3 +130,100 @@ def test_no_mutation_endpoints_exist(_env):
     for path in ("/api/flatten", "/api/halt", "/api/exit", "/"):
         r = client.post(path, auth=(_TEST_USER, _TEST_PASS))
         assert r.status_code in (404, 405), f"POST {path} returned {r.status_code}"
+
+
+# --------------------------------------------------- PR #70: trade log + P&L
+
+
+def test_trades_requires_auth(_env):
+    client = TestClient(create_app(_make_orch()))
+    assert client.get("/trades").status_code == 401
+
+
+def test_pnl_requires_auth(_env):
+    client = TestClient(create_app(_make_orch()))
+    assert client.get("/pnl").status_code == 401
+
+
+def test_trades_renders_closed_and_open_rows(_env):
+    orch = _make_orch()
+    orch._db.select = AsyncMock(
+        return_value=[
+            {
+                "lifecycle_id": "aaaa1111",
+                "direction": "LONG",
+                "symbol": "MNQM6",
+                "entry_price": 30559.25,
+                "exit_price": 30328.62,
+                "entry_qty": 2,
+                "pnl_net": -924.98,
+                "exit_reason": "STOP",
+                "state": "CLOSED",
+                "entry_filled_at": "2026-06-01T04:16:06+00:00",
+                "exit_filled_at": "2026-06-01T13:30:00+00:00",
+            },
+            {
+                "lifecycle_id": "bbbb2222",
+                "direction": "LONG",
+                "symbol": "MNQM6",
+                "entry_price": 30444.75,
+                "exit_price": None,
+                "entry_qty": 2,
+                "pnl_net": None,
+                "exit_reason": None,
+                "state": "ACTIVE",
+                "entry_filled_at": "2026-06-01T13:36:19+00:00",
+                "exit_filled_at": None,
+            },
+        ]
+    )
+    client = TestClient(create_app(orch))
+    r = client.get("/trades", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    body = r.text
+    assert "30559.25" in body  # closed-row entry price mapped
+    assert "-924.98" in body  # closed-row realized pnl
+    assert "STOP" in body  # exit reason
+    assert "OPEN" in body  # the ACTIVE lifecycle renders as OPEN, no pnl
+    assert "DB view" in body  # accuracy caveat present
+
+
+def test_pnl_aggregates_by_utc_day_open_contributes_zero(_env):
+    orch = _make_orch()
+    orch._db.select = AsyncMock(
+        return_value=[
+            # 2026-05-30: one win (+100) + one loss (-40) → sum 60
+            {"pnl_net": 100.0, "exit_filled_at": "2026-05-30T15:00:00+00:00", "state": "CLOSED"},
+            {"pnl_net": -40.0, "exit_filled_at": "2026-05-30T18:00:00+00:00", "state": "CLOSED"},
+            # 2026-05-31: one loss (-25)
+            {"pnl_net": -25.0, "exit_filled_at": "2026-05-31T14:00:00+00:00", "state": "CLOSED"},
+            # an open lifecycle (no exit) contributes 0 realized — excluded
+            {"pnl_net": None, "exit_filled_at": None, "state": "ACTIVE"},
+        ]
+    )
+    client = TestClient(create_app(orch))
+    r = client.get("/pnl", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    body = r.text
+    assert "2026-05-30" in body
+    assert "2026-05-31" in body
+    assert "60.00" in body  # day-1 realized sum (100 - 40)
+    assert "-25.00" in body  # day-2 realized sum
+    assert "35.00" in body  # running total through day-2 (60 - 25)
+    assert "DB view" in body
+
+
+def test_trades_handles_empty_without_crash(_env):
+    client = TestClient(create_app(_make_orch()))  # default select → []
+    r = client.get("/trades", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    assert "No trades yet" in r.text
+
+
+def test_pnl_read_error_surfaces_not_500(_env):
+    orch = _make_orch()
+    orch._db.select = AsyncMock(side_effect=RuntimeError("supabase down"))  # 1 call
+    client = TestClient(create_app(orch))
+    r = client.get("/pnl", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    assert "Failed to load" in r.text
