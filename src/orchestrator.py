@@ -58,6 +58,12 @@ from src.warmup_shadow import WarmupShadow, hist_bars_to_dicts, validate_seed
 # Bar-liveness watchdog tunables.
 _WATCHDOG_STALE_THRESHOLD_SEC = 5 * 60
 _WATCHDOG_ALERT_COOLDOWN_SEC = 15 * 60
+# PR D — when the watchdog sees a stale feed but the socket is healthy (the
+# silent "blind feed" outage), attempt at most one bounded resubscribe per this
+# interval. Longer than one healthcheck so each resubscribe has time to take
+# effect before the next attempt; shorter than the 15-min alert cooldown so the
+# self-heal is prompt.
+_WATCHDOG_FEED_HEAL_COOLDOWN_SEC = 5 * 60
 _BAR_TIMESTAMP_RING_MAXLEN = 4096
 
 # Track 3 — decision journal. Bounded in-memory ring of the most recent
@@ -227,6 +233,8 @@ class Orchestrator:
         # 5-min staleness clock starts there. None means "not yet armed".
         self._last_bar_at: datetime | None = None
         self._last_bar_alert_at: datetime | None = None
+        # PR D — last time the stale-feed self-heal resubscribe fired (cooldown).
+        self._last_feed_heal_at: datetime | None = None
         self._bar_timestamps: deque[datetime] = deque(maxlen=_BAR_TIMESTAMP_RING_MAXLEN)
         # PR C — bar-gap detection after reconnect/resubscribe. _start_bar_subscription
         # arms _pending_gap_check on any RE-subscribe (not the initial boot one); the
@@ -673,34 +681,73 @@ class Orchestrator:
         finally:
             self._reseed_in_progress = False
 
-    def _watchdog_check_bar_liveness(self) -> None:
+    def _watchdog_check_bar_liveness(self) -> bool:
         """Alert if no bar arrived in >5 min during an expected CME session.
 
         Suppressed during edge windows (Saturday, Sunday pre-open, daily CME
         break, Friday cutoff, IB Gateway restart band) so maintenance silence
-        never wakes the operator. ALERT-only; does NOT auto-halt. Re-fires
-        every ``_WATCHDOG_ALERT_COOLDOWN_SEC`` while stale to avoid log spam.
+        never wakes the operator. ALERT-only here; does NOT auto-halt. The ALERT
+        re-fires every ``_WATCHDOG_ALERT_COOLDOWN_SEC`` while stale to avoid log
+        spam.
+
+        Returns True when the feed is stale during an expected session — the
+        caller (PR D) may then attempt a bounded self-heal resubscribe. Returns
+        False when not yet armed, within an edge window, or the feed is fresh.
         """
         if self._last_bar_at is None:
-            return
+            return False
         now = datetime.now(UTC)
         if _in_session_edge_window(now, edge_minutes=0):
-            return
+            return False
         stale_sec = (now - self._last_bar_at).total_seconds()
         if stale_sec <= _WATCHDOG_STALE_THRESHOLD_SEC:
-            return
-        if (
+            return False
+        alert_suppressed = (
             self._last_bar_alert_at is not None
             and (now - self._last_bar_alert_at).total_seconds() < _WATCHDOG_ALERT_COOLDOWN_SEC
+        )
+        if not alert_suppressed:
+            stale_min = int(stale_sec // 60)
+            LOGGER.warning(
+                "[WATCHDOG] no live bar in %dm during session — feed delayed/dead",
+                stale_min,
+            )
+            LOGGER.info("[ALERT] watchdog_stale_bars: stale_min=%d", stale_min)
+            self._last_bar_alert_at = now
+        return True
+
+    async def _maybe_heal_stale_feed(self) -> None:
+        """PR D — self-heal the socket-alive-but-feed-silently-dead outage.
+
+        The healthcheck just confirmed the socket is up (``reqCurrentTimeAsync``
+        succeeded) yet the bar feed is stale, so neither the socket-reconnect path
+        (needs a dead socket) nor the §0.5.181 farm-flap path (needs an
+        errorEvent) will fire — the historical "blind feed" silent outage. Attempt
+        ONE bounded resubscribe via the existing tested ``_start_bar_subscription``
+        path, rate-limited to once per ``_WATCHDOG_FEED_HEAL_COOLDOWN_SEC``.
+
+        Bounded + low-risk: reuses the resubscribe path (no new reconnection
+        logic), only acts when the socket is healthy + feed stale + in session, and
+        composes with PR C — the resubscribe arms the gap check, so a gapped buffer
+        is re-seeded before any signal. Never raises into the healthcheck loop.
+        """
+        now = datetime.now(UTC)
+        if (
+            self._last_feed_heal_at is not None
+            and (now - self._last_feed_heal_at).total_seconds() < _WATCHDOG_FEED_HEAL_COOLDOWN_SEC
         ):
             return
-        stale_min = int(stale_sec // 60)
-        LOGGER.warning(
-            "[WATCHDOG] no live bar in %dm during session — feed delayed/dead",
-            stale_min,
-        )
-        LOGGER.info("[ALERT] watchdog_stale_bars: stale_min=%d", stale_min)
-        self._last_bar_alert_at = now
+        self._last_feed_heal_at = now
+        LOGGER.warning("[FEED] stale-feed self-heal — resubscribing bar feed (socket healthy)")
+        LOGGER.info("[ALERT] feed_self_heal_resubscribe")
+        try:
+            await self._start_bar_subscription()
+        except Exception as exc:  # noqa: BLE001 — self-heal must never crash the loop
+            LOGGER.warning(
+                "[FEED] stale-feed self-heal failed — type=%s msg=%s",
+                type(exc).__name__,
+                exc,
+            )
 
     def _count_live_bars_last_60m(self) -> int:
         """Return number of bars whose arrival ts is within the last 60 minutes.
@@ -1131,7 +1178,11 @@ class Orchestrator:
     async def _healthcheck_once(self) -> None:
         ib_time = await self._ib._ib.reqCurrentTimeAsync()
         LOGGER.info("[ORCH] healthcheck: ok — ib_time=%s", self._format_ib_time(ib_time))
-        self._watchdog_check_bar_liveness()
+        # Socket is confirmed healthy above; if the feed is nonetheless stale,
+        # PR D attempts a bounded resubscribe self-heal (the silent-outage class).
+        stale = self._watchdog_check_bar_liveness()
+        if stale and self._enable_strategy:
+            await self._maybe_heal_stale_feed()
 
     async def _shutdown(self, exit_code: int) -> None:
         await self._cancel_background_tasks()

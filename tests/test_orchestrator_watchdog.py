@@ -18,6 +18,7 @@ from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.orchestrator import (
     _WATCHDOG_ALERT_COOLDOWN_SEC,
+    _WATCHDOG_FEED_HEAL_COOLDOWN_SEC,
     _WATCHDOG_STALE_THRESHOLD_SEC,
     Orchestrator,
 )
@@ -241,3 +242,80 @@ class _FrozenDatetime:
 
     def __getattr__(self, name: str):
         return getattr(datetime, name)
+
+
+# ----------------------------------- PR D — stale-feed self-heal (resubscribe)
+
+
+def test_watchdog_returns_true_when_stale_during_session(monkeypatch):
+    orch = _make_orch()
+    orch._last_bar_at = _IN_SESSION - timedelta(seconds=_WATCHDOG_STALE_THRESHOLD_SEC + 60)
+    monkeypatch.setattr("src.orchestrator.datetime", _FrozenDatetime(_IN_SESSION))
+    assert orch._watchdog_check_bar_liveness() is True
+
+
+def test_watchdog_returns_false_when_fresh(monkeypatch):
+    orch = _make_orch()
+    orch._last_bar_at = _IN_SESSION - timedelta(seconds=3)
+    monkeypatch.setattr("src.orchestrator.datetime", _FrozenDatetime(_IN_SESSION))
+    assert orch._watchdog_check_bar_liveness() is False
+
+
+def test_watchdog_returns_false_in_edge_window(monkeypatch):
+    orch = _make_orch()
+    orch._last_bar_at = _SATURDAY - timedelta(hours=2)
+    monkeypatch.setattr("src.orchestrator.datetime", _FrozenDatetime(_SATURDAY))
+    assert orch._watchdog_check_bar_liveness() is False
+
+
+def test_watchdog_returns_false_before_first_bar():
+    orch = _make_orch()
+    assert orch._last_bar_at is None
+    assert orch._watchdog_check_bar_liveness() is False
+
+
+async def test_maybe_heal_resubscribes_when_stale(caplog, monkeypatch):
+    caplog.set_level(logging.INFO)
+    orch = _make_orch()
+    orch._start_bar_subscription = AsyncMock()
+    monkeypatch.setattr("src.orchestrator.datetime", _FrozenDatetime(_IN_SESSION))
+
+    await orch._maybe_heal_stale_feed()
+
+    orch._start_bar_subscription.assert_awaited_once()
+    assert orch._last_feed_heal_at == _IN_SESSION
+    assert any("[FEED] stale-feed self-heal" in r.getMessage() for r in caplog.records)
+    assert any("[ALERT] feed_self_heal_resubscribe" in r.getMessage() for r in caplog.records)
+
+
+async def test_maybe_heal_respects_cooldown(monkeypatch):
+    orch = _make_orch()
+    orch._start_bar_subscription = AsyncMock()
+    # Last heal was 60s ago — inside the cooldown → no resubscribe.
+    orch._last_feed_heal_at = _IN_SESSION - timedelta(seconds=60)
+    monkeypatch.setattr("src.orchestrator.datetime", _FrozenDatetime(_IN_SESSION))
+
+    await orch._maybe_heal_stale_feed()
+
+    orch._start_bar_subscription.assert_not_awaited()
+
+
+async def test_maybe_heal_fires_again_after_cooldown(monkeypatch):
+    orch = _make_orch()
+    orch._start_bar_subscription = AsyncMock()
+    orch._last_feed_heal_at = _IN_SESSION - timedelta(seconds=_WATCHDOG_FEED_HEAL_COOLDOWN_SEC + 60)
+    monkeypatch.setattr("src.orchestrator.datetime", _FrozenDatetime(_IN_SESSION))
+
+    await orch._maybe_heal_stale_feed()
+
+    orch._start_bar_subscription.assert_awaited_once()
+
+
+async def test_maybe_heal_never_raises_on_resubscribe_failure(monkeypatch):
+    orch = _make_orch()
+    orch._start_bar_subscription = AsyncMock(side_effect=RuntimeError("subscribe boom"))
+    monkeypatch.setattr("src.orchestrator.datetime", _FrozenDatetime(_IN_SESSION))
+
+    # Must not raise — self-heal failure can't crash the healthcheck loop.
+    await orch._maybe_heal_stale_feed()
+    assert orch._last_feed_heal_at == _IN_SESSION
