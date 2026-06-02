@@ -160,10 +160,8 @@ def _engineer_bullish_offset_bar(bars: list[dict], *, close_minus_open: float) -
 
 
 def test_no_signal_when_candle_is_bearish():
-    """A 5pt red candle is beyond ``ma_bullish_tolerance_pts`` (2.0) — still blocks.
-
-    W-S14.2 Track 2 relaxed the bullish gate to ``close >= open - tol``; a candle
-    whose close is 5pt below its open is still rejected at the default 2pt tol.
+    """A 5pt red candle fails the bullish gate (``close >= open - tol``) at the
+    default tol=0.0 (SeanBot strict close>=open) — and at any tol < 5 — so it blocks.
     """
     bars = _pullback_bar_dicts(n=120)
     _engineer_bullish_offset_bar(bars, close_minus_open=-5.0)
@@ -173,26 +171,27 @@ def test_no_signal_when_candle_is_bearish():
     assert signal is None
 
 
-def test_bullish_tolerance_admits_small_red_candle():
-    """W-S14.2 Track 2: a 0.5pt red touch candle (the SeanBot 08:33Z / 23:13Z
-    miss shape) now FIRES under the 2.0pt tolerance but is BLOCKED under the prior
-    strict gate (tol=0.0). Pins the calibration both directions."""
+def test_bullish_default_is_strict_close_ge_open_blocks_small_red_candle():
+    """PR-1 parity: the DEFAULT bullish gate is now strict (tol=0.0 == SeanBot
+    close>=open), so a 0.5pt red touch candle is BLOCKED. The W-S14.2 2.0pt
+    tolerance is still reachable via the env knob and FIRES on the same shape —
+    pins the parity flip both directions. (W-S14.2 conflict flagged in the PR.)"""
     bars = _pullback_bar_dicts(n=120)
     _engineer_bullish_offset_bar(bars, close_minus_open=-0.5)
 
-    # Default params (tol=2.0) → fires.
-    fired = _stuff_strategy(Sma100BounceStrategy("MNQM6"), bars)
+    # Default params (tol=0.0, the new SeanBot-parity default) → blocked.
+    blocked = _stuff_strategy(Sma100BounceStrategy("MNQM6"), bars)
+    assert blocked is None
+
+    # Restoring the W-S14.2 tolerance (2.0) → fires. Fresh bars (strategy is stateful).
+    bars_tol = _pullback_bar_dicts(n=120)
+    _engineer_bullish_offset_bar(bars_tol, close_minus_open=-0.5)
+    fired = _stuff_strategy(
+        Sma100BounceStrategy("MNQM6", params=replace(RISK, ma_bullish_tolerance_pts=2.0)),
+        bars_tol,
+    )
     assert fired is not None
     assert fired.direction == "LONG"
-
-    # Prior strict behavior (tol=0.0) → blocked. Fresh bars (strategy is stateful).
-    bars_strict = _pullback_bar_dicts(n=120)
-    _engineer_bullish_offset_bar(bars_strict, close_minus_open=-0.5)
-    strict = _stuff_strategy(
-        Sma100BounceStrategy("MNQM6", params=replace(RISK, ma_bullish_tolerance_pts=0.0)),
-        bars_strict,
-    )
-    assert strict is None
 
 
 def test_bullish_tolerance_boundary_is_inclusive():
@@ -206,6 +205,23 @@ def test_bullish_tolerance_boundary_is_inclusive():
         bars_past, close_minus_open=-(RISK.ma_bullish_tolerance_pts + 0.25)
     )
     assert _stuff_strategy(Sma100BounceStrategy("MNQM6"), bars_past) is None
+
+
+def test_seanbot_parity_default_config_fires_clean_setup_rejects_bearish():
+    """PR-1 end-to-end parity under the DEFAULT (aligned) config — regime gate
+    excluded, bullish strict (tol 0), gap 0.5, touch band [-15,+5], cooldown 10.
+    A clean SeanBot LONG setup (MA100>MA50 pullback, touch, bullish, gap) FIRES;
+    the same setup with a bearish candle is REJECTED."""
+    # SeanBot would take this — fires under default TF config.
+    bars_yes = _pullback_bar_dicts(n=120)
+    _engineer_bullish_offset_bar(bars_yes, close_minus_open=2.0)  # green candle
+    fired = _stuff_strategy(Sma100BounceStrategy("MNQM6"), bars_yes)
+    assert fired is not None and fired.direction == "LONG"
+
+    # SeanBot would reject (bearish candle) — rejected under default TF config.
+    bars_no = _pullback_bar_dicts(n=120)
+    _engineer_bullish_offset_bar(bars_no, close_minus_open=-2.0)  # red candle
+    assert _stuff_strategy(Sma100BounceStrategy("MNQM6"), bars_no) is None
 
 
 def test_no_signal_when_low_too_far_below_ma_slow():
@@ -559,14 +575,16 @@ def _thirty_minute_close_frame(
 
 
 def test_regime_gate_blocks_long_when_price_below_30m_ema200(caplog):
-    """C1: when last 30-min price is at or below 30m EMA200, block."""
+    """C1 (opt-in after PR-1): with the gate ENABLED, a last 30-min price at or
+    below the 30m EMA200 blocks. The gate is excluded by default now, so this
+    test enables it explicitly to exercise the retained mechanics."""
     # 250 30-min bars in a strong downtrend so the latest close is well below
     # the EMA200 of the resampled series. 250 >= 202 → past warmup.
     closes = [18000.0 - i * 5.0 for i in range(250)]
     df = _thirty_minute_close_frame(closes)
 
     with caplog.at_level(logging.INFO, logger="src.strategy"):
-        ok = _regime_ok(df, RISK)
+        ok = _regime_ok(df, replace(RISK, regime_gate_enabled=True))
 
     assert ok is False
     blocked = [r.getMessage() for r in caplog.records if "regime gate BLOCKED" in r.getMessage()]
@@ -578,12 +596,13 @@ def test_regime_gate_fails_open_during_warmup():
     """A 1-min bar stream of 150 bars resamples to ~5 30-min bars → fail-open.
 
     The strategy fixture flow is exactly what production sees, so this also
-    confirms the gate doesn't accidentally block when other gates would fire.
+    confirms the gate (explicitly ENABLED here — it is excluded by default after
+    PR-1) doesn't accidentally block when other gates would fire.
     """
     bars = _pullback_bar_dicts(n=120)
     _engineer_fire_bar(bars)
 
-    strat = Sma100BounceStrategy("MNQM6")
+    strat = Sma100BounceStrategy("MNQM6", params=replace(RISK, regime_gate_enabled=True))
     signal = _stuff_strategy(strat, bars)
     # If the regime gate were not failing-open during warmup the strategy would
     # have rejected this otherwise-firing bar and signal would be None.
@@ -601,13 +620,23 @@ def test_regime_gate_disabled_flag_bypasses_check():
 
 
 def test_regime_gate_allows_long_when_price_above_30m_ema200():
-    """C1: when last 30-min price is above the 30m EMA200, allow."""
+    """C1 (opt-in after PR-1): with the gate ENABLED, a last 30-min price above
+    the 30m EMA200 allows. Enabled explicitly since the default now excludes it."""
     # Strong uptrend over 250 30-min bars so the latest close is well above
     # the EMA200 level. 250 >= 202 → past warmup.
     closes = [18000.0 + i * 5.0 for i in range(250)]
     df = _thirty_minute_close_frame(closes)
 
-    assert _regime_ok(df, RISK) is True
+    assert _regime_ok(df, replace(RISK, regime_gate_enabled=True)) is True
+
+
+def test_regime_gate_excluded_by_default_after_pr1():
+    """PR-1 parity: the DEFAULT config EXCLUDES the regime gate — even a 30-min
+    downtrend that C1 would block returns True (gate skipped) under RISK."""
+    closes = [18000.0 - i * 5.0 for i in range(250)]  # C1 would block this
+    df = _thirty_minute_close_frame(closes)
+    assert RISK.regime_gate_enabled is False
+    assert _regime_ok(df, RISK) is True  # excluded → never blocks
 
 
 # ----------------------------------------- PR-D3a — per-bar [STRAT] eval log
@@ -669,7 +698,8 @@ def test_evaluate_gates_entry_returns_all_gates_true():
 
 
 def test_evaluate_gates_regime_block_returns_regime_false():
-    """A 30-min downtrend (>=202 bars) past warmup blocks at the regime gate."""
+    """A 30-min downtrend (>=202 bars) past warmup blocks at the regime gate when
+    the gate is ENABLED (opt-in after PR-1; the default excludes it)."""
     base = datetime(2026, 5, 1, 0, 0, tzinfo=UTC)
     closes = [18000.0 - i * 5.0 for i in range(250)]
     bars = [
@@ -684,7 +714,7 @@ def test_evaluate_gates_regime_block_returns_regime_false():
     ]
     df = add_all_indicators(pd.DataFrame(bars))
 
-    ge = evaluate_gates(df, "MNQM6")
+    ge = evaluate_gates(df, "MNQM6", params=replace(RISK, regime_gate_enabled=True))
 
     assert ge.signal is None
     assert ge.regime_ok is False
