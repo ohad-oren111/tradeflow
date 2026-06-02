@@ -106,12 +106,17 @@ class RiskParams:
     cooldown_bars: int = 10
 
     # PR B — exit mode for the take-profit leg of the native OCA entry bracket.
-    # "trailing" (default): TP is a TRAIL stop trailing `trail_offset_pts` behind
-    # the peak, locking in profit (SeanBot V3 handoff §13). "fixed": legacy LMT
-    # take-profit @ entry+take_profit_pts (no regression / kill-switch revert).
+    # "fixed" (default): LMT take-profit @ entry+take_profit_pts, a valid native
+    # OCA bracket child alongside the fixed STP — this delivers PR B's core win
+    # (the protective STP is now a native bracket child, so it SURVIVES a client
+    # disconnect/redeploy, the root-cause fix for the naked-stop incident).
+    # "trailing" is NOT currently usable: IBKR rejects a TRAIL order as a bracket
+    # child of a MKT parent (Error 328 — "Trailing stop orders can be attached to
+    # limit or stop-limit orders only"; observed live 2026-06-02 02:21Z). A native
+    # trailing TP needs a standalone post-fill placement redesign (queued).
     # The fixed protective STP @ entry-stop_loss_pts is ALWAYS present and NEVER
     # trails, in either mode. Env: EXIT_MODE, TRAIL_OFFSET.
-    exit_mode: str = "trailing"
+    exit_mode: str = "fixed"
     trail_offset_pts: float = 150.0
 
     # PR C — max tolerated gap (in missing bars) in the live feed after a
@@ -153,7 +158,9 @@ class RiskParams:
 
 
 def _load_exit_mode() -> str:
-    mode = _env_str("EXIT_MODE", "trailing").strip().lower()
+    # Default "fixed": "trailing" is IB-rejected as a MKT-bracket child (Error 328);
+    # see RiskParams.exit_mode. Kept selectable for the future standalone redesign.
+    mode = _env_str("EXIT_MODE", "fixed").strip().lower()
     if mode not in ("trailing", "fixed"):
         raise RuntimeError(f"Invalid EXIT_MODE={mode!r}; must be 'trailing' or 'fixed'.")
     return mode
