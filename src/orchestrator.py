@@ -28,6 +28,7 @@ from typing import Any
 
 from ib_async import Contract, Future
 
+from comms.alert_format import daily_summary_fields
 from comms.telegram import TelegramAlerter
 from config.instruments import MNQ
 from config.risk_params import RISK
@@ -233,6 +234,9 @@ class Orchestrator:
         # 5-min staleness clock starts there. None means "not yet armed".
         self._last_bar_at: datetime | None = None
         self._last_bar_alert_at: datetime | None = None
+        # Part 3 — the UTC day the daily P&L summary was last emitted for. Set on
+        # the first digest tick; the summary fires once when the day rolls over.
+        self._last_daily_summary_day: str | None = None
         # PR D — last time the stale-feed self-heal resubscribe fired (cooldown).
         self._last_feed_heal_at: datetime | None = None
         self._bar_timestamps: deque[datetime] = deque(maxlen=_BAR_TIMESTAMP_RING_MAXLEN)
@@ -903,6 +907,59 @@ class Orchestrator:
         # (Constraint 5a default B). flush never raises; a write failure leaves
         # the buffer intact for the next tick and cannot touch trading.
         await self._decision_writer.flush(self._db)
+
+        # Part 3 — once per UTC day, post TF's own daily P&L summary.
+        await self._maybe_emit_daily_summary(now)
+
+    async def _maybe_emit_daily_summary(self, now: datetime) -> None:
+        """Emit TF's daily P&L summary once when the UTC day rolls over.
+
+        Best-effort: seeds the cursor to today on the first tick (no emit for a
+        partial day), then on the first tick of a NEW day emits the just-completed
+        day's realized P&L from ``lifecycles`` (pnl_net). Never raises into the loop.
+        """
+        today = now.strftime("%Y-%m-%d")
+        if self._last_daily_summary_day is None:
+            self._last_daily_summary_day = today
+            return
+        if today == self._last_daily_summary_day:
+            return
+        day = self._last_daily_summary_day  # the day that just completed
+        self._last_daily_summary_day = today
+        try:
+            day_start = f"{day}T00:00:00+00:00"
+            day_end = f"{today}T00:00:00+00:00"
+            rows = await self._db.select(
+                "lifecycles",
+                filters={
+                    "state": "eq.CLOSED",
+                    "exit_filled_at": f"gte.{day_start}",
+                    "order": "exit_filled_at.asc",
+                },
+                columns="pnl_net,exit_filled_at",
+            )
+            # PostgREST dict-filters can't AND two bounds on one column; apply the
+            # upper bound client-side so the bucket is exactly [day_start, day_end).
+            pnls = [
+                float(r["pnl_net"])
+                for r in rows
+                if r.get("pnl_net") is not None
+                and day_start <= str(r.get("exit_filled_at")) < day_end
+            ]
+            wins, losses, net = daily_summary_fields(pnls)
+            LOGGER.info(
+                "[ALERT] daily_summary: day=%s wins=%d losses=%d net=%.2f",
+                day,
+                wins,
+                losses,
+                net,
+            )
+        except Exception as exc:  # noqa: BLE001 — observability, never break the loop
+            LOGGER.warning(
+                "[ORCH] daily_summary: emit error — type=%s msg=%s",
+                type(exc).__name__,
+                exc,
+            )
 
     def _readiness_fragment(self, now: datetime) -> str:
         """W-S15.3 Track E — 'is it ready to trade' at a glance, from in-process

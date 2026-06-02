@@ -29,10 +29,63 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
+from comms.alert_format import (
+    format_daily_summary,
+    format_entry,
+    format_exit,
+    format_stop_moved,
+)
+
 if TYPE_CHECKING:
     from src.orchestrator import ExitResult, FlattenResult
 
 LOGGER = logging.getLogger(__name__)
+
+_KV_RE = re.compile(r"(\w+)=(\S+)")
+
+
+def _pretty_alert(body: str) -> str | None:
+    """Render the known trade events in SeanBot style (Part 3); None → caller
+    falls back to the plain ``🤖 TradeFlow — <body>`` line. Parses the
+    ``<event>: k=v k=v`` body the emit sites already log."""
+    event, _, rest = body.partition(":")
+    kv = dict(_KV_RE.findall(rest))
+    try:
+        if event.strip() == "entry_placed":
+            return format_entry(
+                direction=kv.get("direction", "LONG"),
+                entry=float(kv["entry"]),
+                stop=float(kv["stop"]),
+                contracts=int(float(kv.get("qty", "2"))),
+                target_info=f"{float(kv['target']):,.2f}",
+            )
+        if event.strip() == "trailing_stop_ratcheted":
+            return format_stop_moved(
+                entry=float(kv["entry"]),
+                old_stop=float(kv["old"]),
+                new_stop=float(kv["new"]),
+                contracts=2,
+            )
+        if event.strip() == "exit_filled":
+            entry = float(kv["entry"])
+            exit_px = float(kv["exit_price"])
+            return format_exit(
+                exit_price=exit_px,
+                points=round(exit_px - entry, 2),
+                reason=kv.get("exit_reason", "?"),
+                pnl_usd=float(kv["pnl_net"]),
+            )
+        if event.strip() == "daily_summary":
+            return format_daily_summary(
+                day=kv["day"],
+                wins=int(kv["wins"]),
+                losses=int(kv["losses"]),
+                net=float(kv["net"]),
+            )
+    except (KeyError, ValueError):
+        return None
+    return None
+
 
 ALERT_PREFIX = "[ALERT]"
 ALERT_QUEUE_MAX = 500
@@ -199,6 +252,12 @@ class TelegramAlerter:
     @staticmethod
     def _format_alert(msg: str) -> str:
         body = msg.replace(f"{ALERT_PREFIX} ", "", 1)
+        # Part 3 — render the trade events (entry/stop-moved/exit/daily-summary)
+        # in SeanBot's clean titled+emoji style; everything else keeps the plain
+        # one-liner. Pure formatting; the dedup key is parsed off the raw body.
+        pretty = _pretty_alert(body)
+        if pretty is not None:
+            return pretty
         # PR #15 — plain text only; legacy Markdown italicizes `_word_` and eats
         # underscores in Python identifiers like `open_trades` / `net_liq`. See
         # handoff §0.5.143.

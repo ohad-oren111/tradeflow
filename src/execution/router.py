@@ -341,11 +341,12 @@ class OrderRouter:
         self._mark_dirty(lc.lifecycle_id)
         # PR #14 — operator alert (Telegram picks this up via the [ALERT] log handler).
         LOGGER.info(
-            "[ALERT] entry_placed: symbol=%s direction=%s qty=%s target=%.2f stop=%.2f "
+            "[ALERT] entry_placed: symbol=%s direction=%s qty=%s entry=%.2f target=%.2f stop=%.2f "
             "lifecycle_id=%s",
             signal.instrument,
             direction.value,
             qty,
+            signal.entry_price,
             signal.target_price,
             signal.stop_price,
             lc.lifecycle_id,
@@ -779,10 +780,11 @@ class OrderRouter:
         )
         # PR #14 — operator alert sibling line.
         LOGGER.info(
-            "[ALERT] exit_filled: symbol=%s qty=%s exit_price=%.2f pnl_net=%.2f "
+            "[ALERT] exit_filled: symbol=%s qty=%s entry=%.2f exit_price=%.2f pnl_net=%.2f "
             "exit_reason=%s lifecycle_id=%s",
             lc.symbol,
             fill_qty,
+            entry_price,
             fill_price,
             pnl_net,
             reason.value,
