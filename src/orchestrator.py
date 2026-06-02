@@ -51,6 +51,7 @@ from src.strategy import (
     Signal,
     Sma100BounceStrategy,
     _in_session_edge_window,
+    _normalise_bar_time,
 )
 from src.warmup_shadow import WarmupShadow, hist_bars_to_dicts, validate_seed
 
@@ -77,6 +78,47 @@ _DIGEST_FEED_OK_SEC = 5 * 60
 # (src/indicators.py: sma_100), so 100 1-min bars (~99 min) seeds the slow MA;
 # the strategy's own indicators-ready gate is authoritative, this is the ETA.
 _WARMUP_BARS_NEEDED = 100
+
+
+def _bar_size_seconds(bar_size: str) -> float:
+    """Parse an IB bar-size string (e.g. ``"1 min"``, ``"5 secs"``) to seconds.
+
+    Defaults to 60.0 (one minute) on any malformed input — the strategy runs on
+    1-min bars, so the default is the safe assumption for PR C's gap maths.
+    """
+    parts = str(bar_size).strip().split()
+    try:
+        n = float(parts[0])
+        unit = parts[1].lower()
+    except (IndexError, ValueError):
+        return 60.0
+    per_unit = {
+        "sec": 1.0,
+        "secs": 1.0,
+        "second": 1.0,
+        "seconds": 1.0,
+        "min": 60.0,
+        "mins": 60.0,
+        "minute": 60.0,
+        "minutes": 60.0,
+        "hour": 3600.0,
+        "hours": 3600.0,
+    }.get(unit, 60.0)
+    return n * per_unit
+
+
+def _bar_gap_count(prev: datetime, new: datetime, bar_size_sec: float) -> int:
+    """Number of MISSING bars between ``prev`` and ``new`` (0 = adjacent/contiguous).
+
+    Two consecutive 1-min bars are 60s apart → 0 missing. A 3-min jump → 2
+    missing. Negative/zero deltas (out-of-order or duplicate timestamps) clamp to
+    0 so they never trigger a spurious re-seed.
+    """
+    if bar_size_sec <= 0:
+        return 0
+    delta = (new - prev).total_seconds()
+    return max(0, round(delta / bar_size_sec) - 1)
+
 
 # Transient broker disconnects worth catching mid-loop and triggering a
 # resilient reconnect rather than orchestrator exit. Mirrors the tuple in
@@ -186,6 +228,14 @@ class Orchestrator:
         self._last_bar_at: datetime | None = None
         self._last_bar_alert_at: datetime | None = None
         self._bar_timestamps: deque[datetime] = deque(maxlen=_BAR_TIMESTAMP_RING_MAXLEN)
+        # PR C — bar-gap detection after reconnect/resubscribe. _start_bar_subscription
+        # arms _pending_gap_check on any RE-subscribe (not the initial boot one); the
+        # next bar then measures the gap vs the last buffered bar. A gap > tolerance
+        # invalidates the buffer and re-seeds from history (_reseed_in_progress drops
+        # interleaving live bars meanwhile) so the SMA never spans a discontinuity.
+        self._bar_sub_started_once = False
+        self._pending_gap_check = False
+        self._reseed_in_progress = False
         self._decision_journal: deque[dict] = deque(maxlen=_DECISION_JOURNAL_MAXLEN)
         # Track 5b — timestamps of long_signals suppressed because a position was
         # already open. Aggregated into the hourly digest (NOT alerted per-bar,
@@ -445,6 +495,13 @@ class Orchestrator:
         # failed we still want a [WATCHDOG] alert 5 min later instead of
         # silent darkness.
         self._last_bar_at = datetime.now(UTC)
+        # PR C — on every RE-subscribe (socket reconnect / farm-flap), arm a
+        # one-shot gap check on the next bar. The initial boot subscribe is
+        # exempt: boot seeds a fresh contiguous buffer via _seed_strategy_warmup.
+        if self._bar_sub_started_once:
+            self._pending_gap_check = True
+            LOGGER.info("[FEED] resubscribe — armed bar-gap check on next bar")
+        self._bar_sub_started_once = True
 
     async def _seed_strategy_warmup(self) -> None:
         """warmup-enable — seed the strategy's real bar buffer from history so the
@@ -511,6 +568,14 @@ class Orchestrator:
             LOGGER.warning("[WATCHDOG] bar feed recovered — first bar after stale window")
             LOGGER.info("[ALERT] watchdog_bar_recovered")
             self._last_bar_alert_at = None
+        # PR C — never feed a gapped/invalidated buffer into the strategy.
+        if self._reseed_in_progress:
+            LOGGER.debug("[FEED] dropping bar — re-seed in progress")
+            return
+        if self._pending_gap_check:
+            self._pending_gap_check = False
+            if self._handle_post_resubscribe_gap(bar):
+                return  # gap → buffer invalidated + re-seed scheduled; no trade this bar
         try:
             signal_or_none = self._strategy.on_new_bar(bar)
         except Exception as exc:
@@ -539,6 +604,74 @@ class Orchestrator:
         if self._loop is None:
             return
         asyncio.run_coroutine_threadsafe(self._handle_trade_signal(signal_or_none), self._loop)
+
+    def _handle_post_resubscribe_gap(self, bar: dict) -> bool:
+        """PR C — measure the gap between the last buffered bar and this first bar
+        of the resumed feed. Returns True (and invalidates + schedules a re-seed)
+        when the gap exceeds ``BAR_GAP_MAX_TOLERANCE_BARS``; False when contiguous.
+
+        Sync (runs on the IB callback thread); the re-seed is scheduled onto the
+        event loop. An empty buffer needs no check — live warmup already guards it.
+        """
+        prev = self._strategy.last_bar_time
+        if prev is None:
+            return False
+        new = _normalise_bar_time(bar)
+        gap = _bar_gap_count(prev, new, _bar_size_seconds(self._bar_size))
+        tol = RISK.bar_gap_max_tolerance_bars
+        if gap <= tol:
+            LOGGER.info("[FEED] post-resubscribe bar contiguous — gap_bars=%d tol=%d", gap, tol)
+            return False
+        LOGGER.warning(
+            "[FEED] gap detected after resubscribe — gap_bars=%d tol=%d prev=%s new=%s "
+            "— invalidating buffer + re-seeding",
+            gap,
+            tol,
+            prev.isoformat(),
+            new.isoformat(),
+        )
+        self._strategy.invalidate()
+        self._reseed_in_progress = True
+        if self._loop is None:
+            # No loop to schedule the async fetch (e.g. unit context) — leave the
+            # buffer invalidated; the existing live warmup re-warms it safely.
+            self._reseed_in_progress = False
+            return True
+        asyncio.run_coroutine_threadsafe(self._reseed_strategy_after_gap(gap), self._loop)
+        return True
+
+    async def _reseed_strategy_after_gap(self, gap_bars: int) -> None:
+        """PR C — re-seed the (already invalidated) strategy buffer from history so
+        the SMA is warm and contiguous again after a feed gap. Mirrors the boot
+        warmup seed; FAIL-SAFE: a failed/short/absurd backfill leaves the buffer
+        empty and the existing live warmup re-warms it (never a junk SMA, never a
+        trade on a gapped buffer). Never raises. Clears _reseed_in_progress.
+        """
+        try:
+            bars = await self._ib.get_historical_bars(self._contract, bar_size=self._bar_size)
+            seed = hist_bars_to_dicts(bars)
+            ok, reason, sma = validate_seed(seed, needed=_WARMUP_BARS_NEEDED)
+            if not ok:
+                LOGGER.warning(
+                    "[FEED] gap re-seed rejected (%s) — buffer empty, live re-warm", reason
+                )
+                return
+            seeded = self._strategy.seed_bars(seed)
+            LOGGER.warning(
+                "[FEED] gap re-seeded — gap_bars=%d bars=%d sma100=%.2f indicators_ready=%s",
+                gap_bars,
+                seeded,
+                sma if sma is not None else float("nan"),
+                seeded >= _WARMUP_BARS_NEEDED,
+            )
+        except Exception as exc:  # noqa: BLE001 — re-seed must never crash the feed
+            LOGGER.warning(
+                "[FEED] gap re-seed failed — %s: %s (live re-warm)",
+                type(exc).__name__,
+                exc,
+            )
+        finally:
+            self._reseed_in_progress = False
 
     def _watchdog_check_bar_liveness(self) -> None:
         """Alert if no bar arrived in >5 min during an expected CME session.

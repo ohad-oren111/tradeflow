@@ -27,6 +27,13 @@ def _env_float(key: str, default: float) -> float:
     return float(raw)
 
 
+def _env_int(key: str, default: int) -> int:
+    raw = os.getenv(key)
+    if raw is None or raw == "":
+        return default
+    return int(raw)
+
+
 @dataclass(frozen=True)
 class RiskParams:
     # Kill switch thresholds (per SeanBot pattern 7)
@@ -73,6 +80,13 @@ class RiskParams:
     exit_mode: str = "trailing"
     trail_offset_pts: float = 150.0
 
+    # PR C — max tolerated gap (in missing bars) in the live feed after a
+    # reconnect/resubscribe before the strategy buffer is invalidated and
+    # re-seeded from history. The SMA must never span a gap. Default 1 tolerates a
+    # single skipped thin bar; a larger gap (≥2 missing) triggers a re-seed.
+    # Env: BAR_GAP_MAX_TOLERANCE_BARS.
+    bar_gap_max_tolerance_bars: int = 1
+
     # Session-edge buffer applied to every transition (Sunday open, CME daily
     # break boundaries, Friday weekend cutoff). Minutes, wall-clock.
     session_edge_no_trade_minutes: int = 5
@@ -115,6 +129,8 @@ RISK = RiskParams(
     # PR B — env-tunable exit knobs (default = trailing TP, 150pt offset).
     exit_mode=_load_exit_mode(),
     trail_offset_pts=_env_float("TRAIL_OFFSET", 150.0),
+    # PR C — feed-gap tolerance (missing bars) before invalidate + re-seed.
+    bar_gap_max_tolerance_bars=_env_int("BAR_GAP_MAX_TOLERANCE_BARS", 1),
 )
 # Lowercase alias for consumers that prefer `risk_params.x` over `RISK.x`.
 risk_params = RISK
