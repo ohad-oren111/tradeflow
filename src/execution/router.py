@@ -233,6 +233,32 @@ class OrderRouter:
                 entry_ref_price=signal.entry_price,
                 oca_group=oca_group,
             )
+            # PR-3 — the bracket SHAPE is the ground truth of which exit path this
+            # entry takes: trailing → STP-only (tp_child is None, bar-ratchet walks
+            # it); fixed → STP+LMT. Log it on EVERY entry so a mode anomaly (the
+            # 16:53Z fixed-under-trailing case) is visible in the logs immediately.
+            bracket_shape = "fixed" if tp_child is not None else "trailing"
+            LOGGER.info(
+                "[EXEC] %s: entry exit_mode=%s bracket=%s lifecycle=%s",
+                signal.instrument,
+                RISK.exit_mode,
+                bracket_shape,
+                lc.lifecycle_id,
+            )
+            # Guard: the built shape must match the resolved EXIT_MODE. A mismatch
+            # means the mode and the bracket disagree (env/build drift) — surface it
+            # LOUDLY but do NOT crash; the bracket is internally valid either way.
+            if bracket_shape != RISK.exit_mode:
+                LOGGER.warning(
+                    "[EXEC] %s: exit_mode_mismatch — EXIT_MODE=%s but built a %s bracket "
+                    "(tp_child=%s); entry proceeds, but the active mode is inconsistent — "
+                    "investigate env/deploy. lifecycle=%s",
+                    signal.instrument,
+                    RISK.exit_mode,
+                    bracket_shape,
+                    "set" if tp_child is not None else "None",
+                    lc.lifecycle_id,
+                )
             LOGGER.info(
                 "[EXEC] %s: place_parent — direction=%s qty=%s type=MKT exit_mode=%s oca=%s",
                 signal.instrument,
