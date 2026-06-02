@@ -438,6 +438,26 @@ class Sma100BounceStrategy:
         """The structured decision record from the most recent ``on_new_bar``."""
         return self._last_decision
 
+    @property
+    def last_bar_time(self) -> datetime | None:
+        """UTC time of the most recent buffered bar, or None if the buffer is empty.
+
+        PR C — the orchestrator reads this on the first bar after a reconnect /
+        resubscribe to measure the gap between the last bar we saw and the first
+        bar of the resumed feed.
+        """
+        if not self._bars:
+            return None
+        return _normalise_bar_time(self._bars[-1])
+
+    def invalidate(self) -> None:
+        """PR C — clear the bar buffer after a detected feed gap so it can be
+        re-seeded with a contiguous window. The SMA must never span a gap, so a
+        gapped buffer is discarded wholesale rather than patched. Cooldown and
+        session state are intentionally left untouched.
+        """
+        self._bars.clear()
+
     def seed_bars(self, bars: list[dict]) -> int:
         """Warmup-enable — pre-fill the bar buffer from historical bars so the SMA
         indicators are warm from boot (removes the ~100-min live-warmup dead zone).
