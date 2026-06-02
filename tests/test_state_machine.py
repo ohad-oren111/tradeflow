@@ -368,3 +368,22 @@ async def test_transition_update_payload_only_contains_state_and_field_updates()
     update_call = db.update_lifecycle.await_args
     assert update_call.args[0] == lc.lifecycle_id
     assert update_call.args[1] == {"state": "ENTERING", "entry_order_id": 42}
+
+
+# ------------------------------------------------- PR-2 — persist_highest (durable)
+
+
+async def test_persist_highest_merges_into_metadata_without_clobbering():
+    """persist_highest PATCHes metadata.highest_price (not a state transition) and
+    preserves any other metadata keys; the in-memory lifecycle is updated too."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.ACTIVE, metadata={"foo": "bar"})
+
+    await sm.persist_highest(lc, 20120.5)
+
+    db.update_lifecycle.assert_awaited_once()
+    lifecycle_id_arg, updates = db.update_lifecycle.await_args.args
+    assert lifecycle_id_arg == lc.lifecycle_id
+    assert updates == {"metadata": {"foo": "bar", "highest_price": 20120.5}}
+    assert lc.metadata["highest_price"] == 20120.5  # in-memory cache updated

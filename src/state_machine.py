@@ -219,6 +219,20 @@ class StateMachine:
         )
         return updated
 
+    async def persist_highest(self, lifecycle: Lifecycle, highest: float) -> None:
+        """Durably store the per-position high-water mark in ``metadata.highest_price``.
+
+        PR-2 — the EXIT_MODE=trailing ratchet tracks ``highest`` in-memory; this
+        persists it (no schema migration: ``metadata`` is an existing JSONB column)
+        so a restart mid-trend resumes from the true peak instead of reseeding to
+        entry. NOT a state transition (ACTIVE→ACTIVE) — a plain PATCH of the
+        ``metadata`` column, merged so no other key is clobbered. Mutates the
+        in-memory ``lifecycle.metadata`` so the router's cache stays current."""
+        meta = dict(lifecycle.metadata or {})
+        meta["highest_price"] = float(highest)
+        await self._db.update_lifecycle(lifecycle.lifecycle_id, {"metadata": meta})
+        lifecycle.metadata = meta
+
     # ----------------------------------------------------------------- recovery
 
     async def load_non_closed(self) -> list[Lifecycle]:

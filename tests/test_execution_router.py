@@ -67,6 +67,7 @@ def _make_mock_sm() -> MagicMock:
     sm.create_lifecycle = AsyncMock()
     sm.transition = AsyncMock()
     sm.load_non_closed = AsyncMock(return_value=[])
+    sm.persist_highest = AsyncMock()  # PR-2 — durable high-water mark
     return sm
 
 
@@ -798,3 +799,113 @@ async def test_hard_ceiling_triggers_market_close(monkeypatch):
 
     router.close_position.assert_awaited_once()
     ib.find_open_order_by_id.assert_not_awaited()  # hard exit short-circuits the stop ratchet
+
+
+# -------------------------------------- PR-2: persist the high-water mark (durable)
+# `highest` is persisted to metadata.highest_price on each advance + at the fill seed;
+# recovery seeds from the persisted peak (clamped to never sit losing-side of entry).
+
+
+async def test_ratchet_persists_highest_when_it_advances(monkeypatch):
+    _trailing(monkeypatch)
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    lc = _active_long_lc(stop_order_id=2002, entry=20000.0, stop_price=19925.0)
+    ib.find_open_order_by_id = AsyncMock(return_value=_stop_order(2002, 19925.0))
+    ib.get_positions = AsyncMock(return_value=[_position()])
+    ib.place_order = AsyncMock(return_value=_make_trade_with_status(2002, "PreSubmitted"))
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    _wire_active(router, lc, seed_highest=20000.0)
+
+    # A new high (20050 > seed 20000) → highest advances → persisted durably.
+    await router.ratchet_stop_on_bar(bar_high=20050.0, bar_low=20030.0, bar_close=20040.0)
+
+    sm.persist_highest.assert_awaited_once()
+    persisted_lc, persisted_high = sm.persist_highest.await_args.args
+    assert persisted_lc is lc and persisted_high == 20050.0
+
+
+async def test_ratchet_does_not_persist_when_highest_unchanged(monkeypatch):
+    _trailing(monkeypatch)
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    lc = _active_long_lc(stop_order_id=2002, entry=20000.0, stop_price=20050.0)
+    ib.find_open_order_by_id = AsyncMock(return_value=_stop_order(2002, 20050.0))
+    ib.place_order = AsyncMock()
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    _wire_active(router, lc, seed_highest=20060.0)
+
+    # A lower bar (high 20055 < prior 20060) → no new high → no persist.
+    await router.ratchet_stop_on_bar(bar_high=20055.0, bar_low=20020.0, bar_close=20030.0)
+
+    sm.persist_highest.assert_not_awaited()
+
+
+async def test_recovery_seeds_highest_from_persisted_metadata(monkeypatch):
+    _trailing(monkeypatch)
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    lc = _active_long_lc(stop_order_id=2002, entry=20000.0, stop_price=20050.0)
+    lc.metadata = {"highest_price": 20120.0}  # peak persisted before the restart
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+
+    router.register_recovered(lc, _make_contract())
+    assert router._highest[lc.lifecycle_id] == 20120.0  # resumes from the true peak
+
+    # And it ratchets off the persisted peak: peak 120 → lock entry+50.
+    ib.find_open_order_by_id = AsyncMock(return_value=_stop_order(2002, 20050.0))
+    ib.get_positions = AsyncMock(return_value=[_position()])
+    ib.place_order = AsyncMock(return_value=_make_trade_with_status(2002, "Submitted"))
+    # A flat bar below the peak keeps highest=20120; current stop already at lock →
+    # no further ratchet, but the seed proves recovery used the persisted value.
+    await router.ratchet_stop_on_bar(bar_high=20100.0, bar_low=20090.0, bar_close=20095.0)
+    assert router._highest[lc.lifecycle_id] == 20120.0
+
+
+async def test_recovery_absent_persisted_falls_back_to_entry(monkeypatch):
+    _trailing(monkeypatch)
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    lc = _active_long_lc(entry=20000.0)
+    lc.metadata = {}  # nothing persisted
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+
+    router.register_recovered(lc, _make_contract())
+    assert router._highest[lc.lifecycle_id] == 20000.0  # entry fallback
+
+
+async def test_recovery_persisted_below_entry_clamped_to_entry(monkeypatch):
+    _trailing(monkeypatch)
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    lc = _active_long_lc(entry=20000.0)
+    lc.metadata = {"highest_price": 19950.0}  # impossibly below entry for a LONG peak
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+
+    router.register_recovered(lc, _make_contract())
+    # Clamped to entry so it can NEVER seed a peak that would un-ratchet the stop.
+    assert router._highest[lc.lifecycle_id] == 20000.0
+
+
+async def test_on_fill_trailing_seeds_and_persists_highest(monkeypatch):
+    _trailing(monkeypatch)
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    entering_lc = _make_lifecycle(State.ENTERING, stop_order_id=2002, target_order_id=None)
+    active_lc = _make_lifecycle(State.ACTIVE)
+    active_lc.lifecycle_id = entering_lc.lifecycle_id  # same lifecycle (mirror real transition)
+    sm.transition.return_value = active_lc
+    ib.place_order = AsyncMock(return_value=_make_trade(9999))  # STP already rests → no-op
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[entering_lc.entry_order_id] = entering_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[entering_lc.lifecycle_id] = entering_lc
+    router._contracts[entering_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(entering_lc.entry_order_id, qty=2, price=20000.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    # The fill seeds the in-memory peak AND persists it durably for restart recovery.
+    assert router._highest[entering_lc.lifecycle_id] == 20000.0
+    sm.persist_highest.assert_awaited_once()
+    assert sm.persist_highest.await_args.args[1] == 20000.0
