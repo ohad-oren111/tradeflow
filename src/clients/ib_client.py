@@ -369,7 +369,12 @@ class IBClient:
         bar_size: str = "1 min",
         what_to_show: str = "TRADES",
         use_rth: bool = False,
-        duration: str = "1 D",
+        # "2 D" (not "1 D"): right after the 18:00 ET Globex reopen "1 D" returns
+        # only the current session's bars (~99 one-min bars ~98 min in), one short
+        # of the 100 the SMA100 warmup seed needs. "2 D" spans the PRIOR session so
+        # the seed always clears 100 regardless of boot time-in-session. The
+        # validate_seed >=100 fail-safe still rejects any short result.
+        duration: str = "2 D",
     ) -> list[Any]:
         """One-shot historical bars (``keepUpToDate=False``) — for warmup backfill.
 
