@@ -199,7 +199,9 @@ async def _enter_to_active(
 ) -> Any:
     """place_entry → parent fill → ACTIVE. Returns the live cached lifecycle.
 
-    Order ids assigned by _FakeIB in sequence: parent=1, tp=2, protective stp=3.
+    Order ids assigned by _FakeIB in sequence (PR B native OCA bracket placed at
+    entry): parent=1, fixed-STP child=2, TP child=3. The parent fill reuses the
+    resting STP (id 2) — no new placement (ensure_protective_stop no-op).
     """
     signal = _make_signal(entry, target, stop)
     contract = _make_contract()
@@ -217,19 +219,20 @@ async def test_target_fill_cancels_protective_stop_and_closes():
     lc = await _enter_to_active(ib, router, entry=30400.0, target=30550.0, stop=30325.0)
 
     assert State(lc.state) is State.ACTIVE
-    assert lc.target_order_id == 2
-    assert lc.stop_order_id == 3  # protective STP placed on parent fill
+    # PR B — native OCA bracket placed at entry: STP child=2, TP child=3.
+    assert lc.stop_order_id == 2  # fixed STP placed up-front as an OCA child
+    assert lc.target_order_id == 3
 
-    # TARGET (TP LMT, order id 2) fills at the limit.
+    # TARGET (TP, order id 3) fills.
     await router.on_fill(_fill_trade(lc.target_order_id, RISK.contracts_per_trade, 30550.0))
 
     closed = db.rows[lc.lifecycle_id]
     assert closed["state"] == State.CLOSED.value
     assert closed["exit_reason"] == ExitReason.TARGET.value
     assert closed["exit_price"] == 30550.0
-    # The protective STP (3) was cancelled; the filled TP (2) was not re-cancelled.
-    assert 3 in ib.cancelled
-    assert 2 not in ib.cancelled
+    # The protective STP (2) was cancelled; the filled TP (3) was not re-cancelled.
+    assert 2 in ib.cancelled
+    assert 3 not in ib.cancelled
 
 
 # --------------------------------------------------------------------- scenario 2
@@ -258,16 +261,16 @@ async def test_stop_fill_cancels_target_and_closes():
     ib, db, sm, router, _recon, _dirty = _build()
     lc = await _enter_to_active(ib, router, entry=30400.0, target=30550.0, stop=30325.0)
 
-    # STOP (protective STP, order id 3) fills at the stop price.
+    # STOP (protective STP, order id 2) fills at the stop price.
     await router.on_fill(_fill_trade(lc.stop_order_id, RISK.contracts_per_trade, 30325.0))
 
     closed = db.rows[lc.lifecycle_id]
     assert closed["state"] == State.CLOSED.value
     assert closed["exit_reason"] == ExitReason.STOP.value
     assert closed["exit_price"] == 30325.0
-    # The resting TP LMT (2) was cancelled; the filled STP (3) was not.
-    assert 2 in ib.cancelled
-    assert 3 not in ib.cancelled
+    # The resting TP (3) was cancelled; the filled STP (2) was not.
+    assert 3 in ib.cancelled
+    assert 2 not in ib.cancelled
 
 
 # --------------------------------------------------------------------- scenario 3
@@ -428,10 +431,12 @@ async def test_reconciler_force_fill_places_protective_stop_and_per_contract_ent
     ib, db, sm, router, recon, _dirty = _build()
     signal = _make_signal(entry=30445.0, target=30595.0, stop=30370.0)
     contract = _make_contract()
-    lc = await router.place_entry(signal, contract)  # ENTERING; parent=1, tp=2
+    lc = await router.place_entry(signal, contract)  # ENTERING; parent=1, STP=2, TP=3
     assert State(lc.state) is State.ENTERING
 
-    # Broker shows the position filled; the router never saw the fillEvent.
+    # Broker shows the position filled; the router never saw the fillEvent AND the
+    # entry's STP child is not resting at the broker (open_trades empty) — so the
+    # reconciler force-fill must (re-)place a protective stop (§0.5.T5 backstop).
     notional = 30445.0 * MNQ.multiplier
     ib.positions = [_position(RISK.contracts_per_trade, notional)]
     ib.open_trades = []
@@ -444,10 +449,11 @@ async def test_reconciler_force_fill_places_protective_stop_and_per_contract_ent
     assert row["state"] == State.ACTIVE.value
     # Per-contract entry price, NOT the notional avgCost.
     assert row["entry_price"] == pytest.approx(30445.0)
-    # A protective STP was placed (previously skipped on this path) with
-    # outsideRth=True, and its id stamped onto the ACTIVE row.
+    # A protective STP rests after force-fill (the entry OCA child @ id 2 plus the
+    # reconciler backstop, since open_trades showed none live). Every STP placed is
+    # an outsideRth GTC stop at the recorded stop price, and a stop id is stamped.
     stps = [order for _oid, order in ib.placed if getattr(order, "orderType", None) == "STP"]
-    assert len(stps) == 1
-    assert stps[0].outsideRth is True
-    assert stps[0].auxPrice == 30370.0
+    assert stps, "no protective STP placed"
+    assert all(s.outsideRth is True for s in stps)
+    assert all(s.auxPrice == 30370.0 for s in stps)
     assert row["stop_order_id"] is not None

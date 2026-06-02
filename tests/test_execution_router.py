@@ -120,12 +120,13 @@ async def test_place_entry_happy_path_creates_lifecycle_and_transitions_to_enter
     sm.create_lifecycle.return_value = idle_lc
     sm.transition.return_value = entering_lc
 
-    # IB.place_order returns the parent trade then the TP trade.
-    # The exact orderIds become the entry_order_id / target_order_id assignment.
+    # PR B — IB.place_order returns parent → stop child → TP child (3 calls).
+    # The orderIds become entry_order_id / stop_order_id / target_order_id.
     ib.place_order = AsyncMock(
         side_effect=[
-            _make_trade(2001),  # parent fill — exactly 1 call
-            _make_trade(2002),  # TP child — exactly 1 call
+            _make_trade(2001),  # parent
+            _make_trade(2002),  # fixed STP child
+            _make_trade(2003),  # trailing/fixed TP child
         ]
     )
 
@@ -136,14 +137,53 @@ async def test_place_entry_happy_path_creates_lifecycle_and_transitions_to_enter
     lc = await router.place_entry(signal, contract)
 
     assert lc is entering_lc
-    assert ib.place_order.await_count == 2
+    assert ib.place_order.await_count == 3
     sm.create_lifecycle.assert_awaited_once_with("MNQM6", STRAT_NAME, Direction.LONG)
     transition_call = sm.transition.await_args
     assert transition_call.args[1] is State.ENTERING
     assert transition_call.kwargs["entry_order_id"] == 2001
-    assert transition_call.kwargs["target_order_id"] == 2002
+    assert transition_call.kwargs["stop_order_id"] == 2002
+    assert transition_call.kwargs["target_order_id"] == 2003
     assert transition_call.kwargs["stop_price"] == signal.stop_price
     assert transition_call.kwargs["target_price"] == signal.target_price
+
+    # The two exit legs were placed as ONE native OCA group, both children
+    # parented to the entry — the disconnect-survival fix (Task E.1).
+    placed_orders = [call.args[1] for call in ib.place_order.await_args_list]
+    parent_o, stop_o, tp_o = placed_orders
+    assert stop_o.orderType == "STP"
+    assert stop_o.parentId == 2001
+    assert tp_o.parentId == 2001
+    assert stop_o.ocaGroup == tp_o.ocaGroup
+    assert stop_o.ocaGroup.startswith("tf-exit-")
+    assert stop_o.ocaType == 1 and tp_o.ocaType == 1
+
+
+async def test_on_fill_parent_does_not_replace_stop_when_oca_child_already_rests():
+    # PR B happy path — the protective STP was placed up-front as an OCA bracket
+    # child, so lc.stop_order_id is already set at ENTERING. The parent-fill
+    # handler must NOT place a second stop (ensure_protective_stop no-op).
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    entering_lc = _make_lifecycle(State.ENTERING, stop_order_id=2002)
+    active_lc = _make_lifecycle(State.ACTIVE)
+    sm.transition.return_value = active_lc
+
+    ib.place_order = AsyncMock(return_value=_make_trade(9999))
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[entering_lc.entry_order_id] = entering_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[entering_lc.lifecycle_id] = entering_lc
+    router._contracts[entering_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(entering_lc.entry_order_id, qty=2, price=17500.5)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    # No new STP placed — the resting OCA child is reused.
+    ib.place_order.assert_not_awaited()
+    transition_call = sm.transition.await_args
+    assert transition_call.args[1] is State.ACTIVE
+    assert transition_call.kwargs["stop_order_id"] == 2002
 
 
 async def test_place_entry_mid_sequence_failure_closes_lifecycle_as_manual():
@@ -524,7 +564,9 @@ async def test_place_entry_marks_lifecycle_dirty():
     entering_lc = _make_lifecycle(State.ENTERING)
     sm.create_lifecycle.return_value = idle_lc
     sm.transition.return_value = entering_lc
-    ib.place_order = AsyncMock(side_effect=[_make_trade(2001), _make_trade(2002)])
+    ib.place_order = AsyncMock(
+        side_effect=[_make_trade(2001), _make_trade(2002), _make_trade(2003)]
+    )
 
     dirty = DirtySet()
     router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME, dirty_set=dirty)
@@ -581,7 +623,9 @@ async def test_router_without_dirty_set_is_safe_to_use():
     entering_lc = _make_lifecycle(State.ENTERING)
     sm.create_lifecycle.return_value = idle_lc
     sm.transition.return_value = entering_lc
-    ib.place_order = AsyncMock(side_effect=[_make_trade(2001), _make_trade(2002)])
+    ib.place_order = AsyncMock(
+        side_effect=[_make_trade(2001), _make_trade(2002), _make_trade(2003)]
+    )
 
     router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)  # no dirty_set
     lc = await router.place_entry(_make_signal(), _make_contract())  # must not raise
