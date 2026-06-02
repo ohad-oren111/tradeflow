@@ -1,11 +1,17 @@
-"""Kill switch — halt-on-loss/drawdown circuit breaker.
+"""Kill switch — tiered halt-on-loss / drawdown circuit breaker (PR A).
 
-Wires the long-dormant ``risk_params`` thresholds (``max_consecutive_losses`` /
-``max_daily_dd_pct`` / ``max_weekly_dd_pct``) into a real halt. When any trigger
-fires it raises the existing global halt (blocks new entries), flattens any open
-position via the existing safe cancel+market-exit path, and alerts. It stays
-halted until a MANUAL operator reset (the existing Supabase ``halt_acks`` row /
-``/tmp/halt_clear`` flag that the reconciler polls) — never auto-resumes.
+Default = KEEP TRADING. A 6–9 consecutive-loss streak NOTIFIES once (Telegram)
+without pausing; only a hard threshold PAUSES — ``KILL_SWITCH_HALT_CONSEC_LOSSES``
+(default 10) consecutive losses, or a realized drawdown reaching
+``KILL_SWITCH_MAX_DRAWDOWN_PCT`` (default 33) % of ``KILL_SWITCH_ALLOCATION_USD``
+measured from ``KILL_SWITCH_PNL_EPOCH`` (default = deploy time, so pre-deploy
+losses don't count). The drawdown brake is INERT while allocation is unset.
+
+A PAUSE raises the existing global halt (blocks new entries) + flattens any open
+position via the existing safe cancel+market-exit path. It stays halted until a
+MANUAL operator reset (the Supabase ``halt_acks`` row / ``/tmp/halt_clear`` flag
+the reconciler polls) — never auto-resumes. All thresholds are env-tunable
+without a code change.
 
 Design invariants:
   * A kill switch can ONLY stop trading — there is no path here that opens, sizes
@@ -14,6 +20,8 @@ Design invariants:
     truth), never an in-memory counter that drifts across the frequent restarts.
   * Fail-safe — if the evaluator itself errors, it errs toward NOT trading
     (raises the halt) and never raises into the poll/eval loop.
+  * Notifications are idempotent — fire once per crossing, reset on recovery — so
+    the 30s poll never spams.
 """
 
 from __future__ import annotations
@@ -23,7 +31,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from config.risk_params import RISK, RiskParams
@@ -33,51 +41,80 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class KillVerdict:
-    tripped: bool
-    reason: str | None  # consecutive_losses | daily_dd | weekly_dd | error | None
+    # action: "pause" (raise halt + flatten) | "notify" (alert only, keep trading)
+    # | "ok". reason: consecutive_losses | drawdown | consecutive_losses_warning |
+    # error | None.
+    action: str
+    reason: str | None
     detail: str
+
+    @property
+    def tripped(self) -> bool:
+        """Back-compat alias — a 'pause' is the only action that halts trading."""
+        return self.action == "pause"
+
+
+def _consecutive_loss_streak(pnls_newest_first: list[float]) -> int:
+    """Leading run of losses in a newest-first pnl list (a win/scratch breaks it)."""
+    streak = 0
+    for p in pnls_newest_first:
+        if p < 0:
+            streak += 1
+        else:
+            break
+    return streak
 
 
 def evaluate_triggers(
     closed_pnls_newest_first: list[float],
-    realized_today: float,
-    realized_week: float,
-    equity_base: float,
+    realized_since_epoch: float,
+    allocation_usd: float | None,
     *,
-    max_consecutive_losses: int,
-    daily_dd_pct: float,
-    weekly_dd_pct: float,
+    warn_consec_losses: int,
+    halt_consec_losses: int,
+    max_drawdown_pct: float,
 ) -> KillVerdict:
-    """Pure trigger logic from broker/DB truth. ``closed_pnls_newest_first`` is the
-    ``pnl_net`` of CLOSED lifecycles, newest first. Drawdown triggers are skipped
-    when ``equity_base`` is unknown (<= 0) — the consecutive-loss trigger still
-    applies. Threshold is inclusive (the Nth consecutive loss / DD AT the bound
-    trips)."""
-    n = max_consecutive_losses
-    if (
-        n > 0
-        and len(closed_pnls_newest_first) >= n
-        and all(p < 0 for p in closed_pnls_newest_first[:n])
-    ):
-        return KillVerdict(True, "consecutive_losses", f"last {n} closed trades all losing")
-    if equity_base > 0:
-        daily_limit = -(daily_dd_pct * equity_base)
-        if realized_today <= daily_limit:
+    """Pure tiered trigger logic from broker/DB truth (§0.5.98).
+
+    ``closed_pnls_newest_first`` is the ``pnl_net`` of CLOSED lifecycles, newest
+    first. ``realized_since_epoch`` is the cumulative realized pnl since the
+    drawdown epoch (so pre-deploy losses don't count). Tiers:
+
+      * PAUSE — ``streak >= halt_consec_losses`` (default 10), OR realized loss
+        since the epoch reaches ``max_drawdown_pct`` % of ``allocation_usd``.
+      * NOTIFY (no pause) — ``warn_consec_losses`` (6) ≤ streak < halt.
+      * OK — otherwise.
+
+    The drawdown brake is INERT when ``allocation_usd`` is None / ≤ 0 (the
+    operator hasn't set allocation) — only the consecutive-loss tiers apply.
+    Thresholds are inclusive (the Nth loss / the exact % trips)."""
+    streak = _consecutive_loss_streak(closed_pnls_newest_first)
+    # PAUSE tier 1 — consecutive-loss hard halt.
+    if halt_consec_losses > 0 and streak >= halt_consec_losses:
+        return KillVerdict(
+            "pause",
+            "consecutive_losses",
+            f"{streak} consecutive losing trades (>= halt {halt_consec_losses})",
+        )
+    # PAUSE tier 2 — cumulative realized drawdown since the epoch (INERT if unset).
+    if allocation_usd is not None and allocation_usd > 0:
+        dd_limit = -(max_drawdown_pct / 100.0 * allocation_usd)
+        if realized_since_epoch <= dd_limit:
             return KillVerdict(
-                True,
-                "daily_dd",
-                f"realized_today={realized_today:.2f} <= {daily_limit:.2f} "
-                f"({daily_dd_pct:.0%} of {equity_base:.0f})",
+                "pause",
+                "drawdown",
+                f"realized_since_epoch={realized_since_epoch:.2f} <= {dd_limit:.2f} "
+                f"({max_drawdown_pct:.0f}% of {allocation_usd:.0f})",
             )
-        weekly_limit = -(weekly_dd_pct * equity_base)
-        if realized_week <= weekly_limit:
-            return KillVerdict(
-                True,
-                "weekly_dd",
-                f"realized_week={realized_week:.2f} <= {weekly_limit:.2f} "
-                f"({weekly_dd_pct:.0%} of {equity_base:.0f})",
-            )
-    return KillVerdict(False, None, "ok")
+    # NOTIFY tier — a warn..halt-1 losing streak (alert once, keep trading).
+    if warn_consec_losses > 0 and streak >= warn_consec_losses:
+        return KillVerdict(
+            "notify",
+            "consecutive_losses_warning",
+            f"{streak} consecutive losing trades "
+            f"(warn {warn_consec_losses}, halt {halt_consec_losses})",
+        )
+    return KillVerdict("ok", None, "ok")
 
 
 def _parse_ts(value: Any) -> datetime | None:
@@ -101,13 +138,16 @@ def _sum_pnl_since(rows: list[dict], since: datetime) -> float:
     return total
 
 
-def _utc_day_start(now: datetime) -> datetime:
-    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+def _resolve_pnl_epoch(raw: str, *, fallback: datetime) -> datetime:
+    """Drawdown epoch from ``KILL_SWITCH_PNL_EPOCH`` (ISO), else ``fallback``.
 
-
-def _utc_week_start(now: datetime) -> datetime:
-    midnight = _utc_day_start(now)
-    return midnight - timedelta(days=now.weekday())  # Monday 00:00 UTC
+    Default fallback is the kill switch's construction time (≈ deploy time), so a
+    fresh deploy's drawdown counter starts at 0 and pre-deploy / bug-contaminated
+    losses never count toward the % drawdown brake."""
+    parsed = _parse_ts(raw)
+    if parsed is None:
+        return fallback
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 class KillSwitch:
@@ -118,7 +158,13 @@ class KillSwitch:
       * ``is_halted()`` — skip if already halted (don't re-flatten / double-act);
       * ``raise_halt(reason)`` — the ONLY state change this class makes;
       * ``flatten()`` — the existing safe cancel+market-exit path;
-      * ``equity_base()`` — broker net-liq (or configured base) for the DD %s.
+      * ``equity_base()`` — broker net-liq (retained for back-compat; the tiered
+        drawdown brake now measures against the configured ALLOCATION, not net-liq).
+
+    PR A — tiered: a 6–9 losing streak NOTIFIES once (Telegram) without pausing;
+    only ≥10 consecutive losses or ≥33% realized drawdown of the configured
+    allocation (since the epoch) PAUSES. Notifications are idempotent — fire once
+    per crossing, reset on recovery (a win) — so there's no 30s poll spam.
     """
 
     def __init__(
@@ -135,17 +181,24 @@ class KillSwitch:
         self._is_halted = is_halted
         self._raise_halt = raise_halt
         self._flatten = flatten
-        self._equity_base = equity_base
+        self._equity_base = equity_base  # retained for back-compat (unused by tiers)
         self._p = params
+        # Drawdown epoch: env override, else construction time (≈ deploy time).
+        self._pnl_epoch = _resolve_pnl_epoch(
+            getattr(params, "kill_switch_pnl_epoch", "") or "",
+            fallback=datetime.now(UTC),
+        )
+        # Idempotency: the warn-tier alert fires once per losing streak crossing.
+        self._warn_notified = False
 
     async def poll_once(self) -> KillVerdict:
-        """Evaluate once; halt + flatten on a trip. Never raises."""
+        """Evaluate once; pause+flatten on a PAUSE, alert-once on a NOTIFY. Never raises."""
         if not self._p.kill_switch_enabled:
-            return KillVerdict(False, "disabled", "kill switch disabled")
+            return KillVerdict("ok", "disabled", "kill switch disabled")
         if self._is_halted():
             # Already halted (by us earlier, the reconciler, or an operator) — do
             # not re-evaluate or re-flatten; wait for the manual reset.
-            return KillVerdict(False, "already_halted", "halt already raised")
+            return KillVerdict("ok", "already_halted", "halt already raised")
         try:
             verdict = await self._evaluate()
         except Exception as exc:  # noqa: BLE001 — fail-safe: cannot confirm safe → STOP
@@ -156,11 +209,28 @@ class KillSwitch:
             )
             self._raise_halt("kill_switch:evaluator_error")
             LOGGER.info("[ALERT] kill_switch_tripped: reason=evaluator_error")
-            return KillVerdict(True, "error", str(exc))
+            return KillVerdict("pause", "error", str(exc))
 
-        if not verdict.tripped:
+        if verdict.action == "notify":
+            # NOTIFY tier — alert once per crossing, keep trading (no halt/flatten).
+            if not self._warn_notified:
+                self._warn_notified = True
+                LOGGER.warning(
+                    "[KILL] WARNING — reason=%s detail=%s", verdict.reason, verdict.detail
+                )
+                LOGGER.info(
+                    "[ALERT] kill_switch_warning: reason=%s detail=%s",
+                    verdict.reason,
+                    verdict.detail,
+                )
             return verdict
 
+        if verdict.action == "ok":
+            # Streak broke / recovered → re-arm the one-shot warn notification.
+            self._warn_notified = False
+            return verdict
+
+        # action == "pause" — hard halt + flatten.
         LOGGER.warning("[KILL] TRIPPED — reason=%s detail=%s", verdict.reason, verdict.detail)
         LOGGER.info(
             "[ALERT] kill_switch_tripped: reason=%s detail=%s", verdict.reason, verdict.detail
@@ -183,43 +253,42 @@ class KillSwitch:
             columns="pnl_net,exit_filled_at",
         )
         pnls = [float(r["pnl_net"]) for r in rows if r.get("pnl_net") is not None]
-        now = datetime.now(UTC)
-        realized_today = _sum_pnl_since(rows, _utc_day_start(now))
-        realized_week = _sum_pnl_since(rows, _utc_week_start(now))
-        equity_base = await self._safe_equity_base()
+        realized_since_epoch = _sum_pnl_since(rows, self._pnl_epoch)
         return evaluate_triggers(
             pnls,
-            realized_today,
-            realized_week,
-            equity_base,
-            max_consecutive_losses=self._p.max_consecutive_losses,
-            daily_dd_pct=self._p.max_daily_dd_pct,
-            weekly_dd_pct=self._p.max_weekly_dd_pct,
+            realized_since_epoch,
+            self._p.kill_switch_allocation_usd,
+            warn_consec_losses=self._p.kill_switch_warn_consec_losses,
+            halt_consec_losses=self._p.kill_switch_halt_consec_losses,
+            max_drawdown_pct=self._p.kill_switch_max_drawdown_pct,
         )
-
-    async def _safe_equity_base(self) -> float:
-        # A net-liq blip must not crash the evaluator (which would fail-safe halt);
-        # treat an unavailable base as 0 → DD triggers skipped this poll, consec-loss
-        # still active.
-        try:
-            return float(await self._equity_base())
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning(
-                "[KILL] equity_base unavailable — %r (DD triggers skipped this poll)", exc
-            )
-            return 0.0
 
     async def run_until_stopped(self, stop_event: asyncio.Event) -> None:
         interval = max(1, int(self._p.kill_poll_interval_sec))
         LOGGER.info(
-            "[KILL] poll loop started — interval=%ss enabled=%s consec=%s "
-            "daily_dd=%.0f%% weekly_dd=%.0f%%",
+            "[KILL] poll loop started — interval=%ss enabled=%s warn_consec=%s halt_consec=%s "
+            "max_drawdown=%.0f%% allocation=%s pnl_epoch=%s",
             interval,
             self._p.kill_switch_enabled,
-            self._p.max_consecutive_losses,
-            self._p.max_daily_dd_pct * 100,
-            self._p.max_weekly_dd_pct * 100,
+            self._p.kill_switch_warn_consec_losses,
+            self._p.kill_switch_halt_consec_losses,
+            self._p.kill_switch_max_drawdown_pct,
+            (
+                f"${self._p.kill_switch_allocation_usd:.0f}"
+                if self._p.kill_switch_allocation_usd is not None
+                else "UNSET"
+            ),
+            self._pnl_epoch.isoformat(),
         )
+        if self._p.kill_switch_allocation_usd is None:
+            # Loud startup warning — the % drawdown brake can't compute without an
+            # allocation, so it is INERT until the operator sets KILL_SWITCH_ALLOCATION_USD.
+            LOGGER.warning(
+                "[KILL] ALLOCATION_USD UNSET — the %.0f%% drawdown brake is INERT; "
+                "the >=%d consecutive-loss halt is the active hard brake",
+                self._p.kill_switch_max_drawdown_pct,
+                self._p.kill_switch_halt_consec_losses,
+            )
         while not stop_event.is_set():
             await self.poll_once()
             with contextlib.suppress(TimeoutError):
