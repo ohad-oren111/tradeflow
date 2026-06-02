@@ -75,6 +75,13 @@ services:
       ORCH_HEALTHCHECK_INTERVAL_SEC: ${ORCH_HEALTHCHECK_INTERVAL_SEC:-60}
       ORCH_LOG_LEVEL: ${ORCH_LOG_LEVEL:-INFO}
       PYTHONUNBUFFERED: "1"
+      # Exit mode for new entries. "trailing" = standalone post-fill native TRAIL
+      # that ratchets behind the high-water mark (the SeanBot V3 edge); "fixed" =
+      # legacy {STP -75, LMT +150} OCA bracket. Declared here (a non-secret,
+      # repo-tracked injection point) so it overrides the env_file and is NOT in
+      # the secrets file. Recovered/already-bracketed positions keep their existing
+      # bracket — the trailing handoff fires only on a NEW entry fill.
+      EXIT_MODE: ${EXIT_MODE:-trailing}
     depends_on:
       - ib-gateway
     ports:

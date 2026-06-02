@@ -97,7 +97,7 @@ def build_entry_oca_bracket(
     trail_offset: float,
     entry_ref_price: float,
     oca_group: str,
-) -> tuple[Order, Order, Order]:
+) -> tuple[Order, Order, Order | None]:
     """Return ``(parent, stop_child, tp_child)`` — a native server-side OCA bracket.
 
     PR B — supersedes the §0.5.T2 standalone-STP design for the *entry* path. The
@@ -110,18 +110,25 @@ def build_entry_oca_bracket(
     residual window between the parent fill and the OCA group activating.
 
     - ``stop_child`` is ALWAYS a fixed STP @ ``stop_price`` — it NEVER trails.
-    - ``tp_child`` is a trailing stop (``TRAIL``, ``auxPrice=trail_offset``) when
-      ``exit_mode='trailing'`` (default), else a fixed LMT @ ``target_price``
-      (``exit_mode='fixed'`` = revert to the legacy take-profit, no regression).
-    - Both children: GTC, ``outsideRth=True`` (live overnight Globex), same
-      ``oca_group`` with ``ocaType=1`` (one fill cancels the sibling broker-side).
+    - ``tp_child`` is a fixed LMT @ ``target_price`` when ``exit_mode='fixed'``
+      (the legacy take-profit, no regression). When ``exit_mode='trailing'`` there
+      is NO tp child at entry (``tp_child is None``): the trailing exit is a
+      STANDALONE post-fill ``TRAIL`` placed by the router on the parent fill, NOT
+      a bracket child — IBKR rejects a ``TRAIL`` child of a ``MKT`` parent
+      (Error 328, §0.5.190). In trailing mode the fixed STP is therefore the sole
+      exit leg of the entry bracket (and the protective floor) until the router
+      hands off to the standalone trail via :func:`build_trailing_stop`.
+    - Children are GTC, ``outsideRth=True`` (live overnight Globex), and carry the
+      ``oca_group`` with ``ocaType=1`` (one fill cancels the sibling broker-side);
+      in trailing mode the lone STP keeps the group so the post-fill TRAIL can
+      OCA-join it during the never-naked handoff.
 
-    Transmit chaining: ``parent.transmit=False``, ``stop_child.transmit=False``,
-    ``tp_child.transmit=True`` — placing the three in order (parent → stop → tp)
-    submits the whole bracket atomically once the final leg arrives, so a failure
-    before the last leg leaves nothing live (never a naked parent). The caller
-    MUST set both children's ``parentId`` to the parent's broker-assigned orderId
-    between the parent placement and each child placement.
+    Transmit chaining: ``parent.transmit=False`` and the LAST placed leg has
+    ``transmit=True`` — fixed mode chains parent → stop → tp (tp transmits);
+    trailing mode chains parent → stop (the STP transmits, as it is the last leg).
+    Either way a failure before the final leg leaves nothing live (never a naked
+    parent). The caller MUST set each child's ``parentId`` to the parent's
+    broker-assigned orderId between the parent placement and each child placement.
     """
     if qty <= 0:
         raise ValueError(f"qty must be positive, got {qty}")
@@ -145,7 +152,9 @@ def build_entry_oca_bracket(
     parent.transmit = False
     parent.tif = "DAY"
 
-    # Fixed protective stop — never trails. STP @ stop_price.
+    # Fixed protective stop — never trails. STP @ stop_price. Carries the OCA
+    # group in BOTH modes so that, in trailing mode, the standalone post-fill
+    # TRAIL can OCA-join this STP during the never-naked handoff (router).
     stop_child = Order()
     stop_child.action = exit_action
     stop_child.totalQuantity = qty
@@ -155,9 +164,22 @@ def build_entry_oca_bracket(
     stop_child.outsideRth = True
     stop_child.ocaGroup = oca_group
     stop_child.ocaType = 1
-    stop_child.transmit = False
 
-    # Take-profit leg — trailing stop (default) or fixed LMT (revert mode).
+    if exit_mode == "trailing":
+        # NO tp child at entry — the trailing exit is a STANDALONE post-fill TRAIL
+        # (a TRAIL cannot be a child of a MKT parent: Error 328, §0.5.190). The STP
+        # is the sole exit leg AND the last leg, so it transmits the bracket. The
+        # router places the standalone TRAIL on the parent fill (initial trigger
+        # derived from the actual fill price) and hands the STP off to it.
+        # ``trail_offset`` / ``entry_ref_price`` are validated/retained for API
+        # stability; the trail itself is built by :func:`build_trailing_stop`.
+        stop_child.transmit = True
+        return parent, stop_child, None
+
+    # Fixed mode — legacy LMT take-profit child (no regression). The STP is a
+    # non-transmitting middle leg; the TP child is the last leg and transmits the
+    # whole bracket atomically.
+    stop_child.transmit = False
     tp_child = Order()
     tp_child.action = exit_action
     tp_child.totalQuantity = qty
@@ -166,24 +188,51 @@ def build_entry_oca_bracket(
     tp_child.ocaGroup = oca_group
     tp_child.ocaType = 1
     tp_child.transmit = True
-    if exit_mode == "trailing":
-        tp_child.orderType = "TRAIL"
-        tp_child.auxPrice = float(trail_offset)
-        # Initial trigger sits one full offset away from the entry reference, on
-        # the protective side. IB ratchets it as the position runs in profit
-        # (LONG sell-trail: up; SHORT buy-trail: down) and never loosens it. It
-        # sits below the fixed STP until price has run ~one stop-distance in
-        # profit, so the fixed STP governs early downside and the trail locks in
-        # gains thereafter — the SeanBot V3 trailing-exit behaviour (handoff §13).
-        if direction is Direction.LONG:
-            tp_child.trailStopPrice = float(entry_ref_price) - float(trail_offset)
-        else:
-            tp_child.trailStopPrice = float(entry_ref_price) + float(trail_offset)
-    else:
-        tp_child.orderType = "LMT"
-        tp_child.lmtPrice = float(target_price)
+    tp_child.orderType = "LMT"
+    tp_child.lmtPrice = float(target_price)
 
     return parent, stop_child, tp_child
+
+
+def build_trailing_stop(
+    *,
+    direction: Direction,
+    qty: int,
+    trail_stop_price: float,
+    trail_offset: float,
+    oca_group: str,
+) -> Order:
+    """Standalone native TRAIL stop, placed AFTER the entry fill (handoff §13a).
+
+    A TRAIL is rejected by IBKR as a child of a MKT parent (Error 328, §0.5.190),
+    so the trailing exit is placed standalone with ``parentId=0`` — NOT a bracket
+    child. ``auxPrice`` is the trailing amount (points behind the high-water mark);
+    ``trailStopPrice`` is the initial trigger (entry − fixed-stop offset for a
+    LONG). IBKR ratchets the stop in the profit direction server-side and NEVER
+    loosens it (LONG sell-trail moves UP only). ``ocaGroup`` matches the entry
+    bracket's fixed STP so the two are OCA-linked during the brief handoff overlap
+    (a fill on either cancels the other → no double-sell); the router then cancels
+    the fixed STP, leaving the trail as the sole exit. GTC + ``outsideRth=True``
+    so it is live across the overnight Globex session (§0.5.T5, build_protective_stop).
+    """
+    if qty <= 0:
+        raise ValueError(f"qty must be positive, got {qty}")
+    if trail_offset <= 0:
+        raise ValueError(f"trail_offset must be positive, got {trail_offset}")
+
+    trail = Order()
+    trail.action = _exit_action(direction)
+    trail.totalQuantity = qty
+    trail.orderType = "TRAIL"
+    trail.auxPrice = float(trail_offset)
+    trail.trailStopPrice = float(trail_stop_price)
+    trail.tif = "GTC"
+    trail.outsideRth = True
+    trail.parentId = 0
+    trail.ocaGroup = oca_group
+    trail.ocaType = 1
+    trail.transmit = True
+    return trail
 
 
 def build_protective_stop(

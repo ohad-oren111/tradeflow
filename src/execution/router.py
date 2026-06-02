@@ -12,6 +12,7 @@ The protective STP is placed inside the parent fillEvent handler so §0.5.T5
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -22,7 +23,11 @@ from ib_async import Contract, Order, Trade
 from config.instruments import MNQ
 from config.risk_params import RISK
 from src.clients.ib_client import IBClient
-from src.execution.bracket import build_entry_oca_bracket, build_protective_stop
+from src.execution.bracket import (
+    build_entry_oca_bracket,
+    build_protective_stop,
+    build_trailing_stop,
+)
 from src.execution.dirty_set import DirtySet
 from src.state_machine import (
     Direction,
@@ -35,6 +40,48 @@ from src.state_machine import (
 from src.strategy import Signal
 
 LOGGER = logging.getLogger(__name__)
+
+# Order statuses that mean a freshly-placed order is live/resting at the broker
+# (safe to hand the protective floor off to) vs. dead (rejected — e.g. Error 328).
+_RESTING_STATUSES = frozenset({"PreSubmitted", "Submitted", "Filled"})
+_DEAD_STATUSES = frozenset({"Cancelled", "ApiCancelled", "Inactive"})
+
+
+def _oca_group_for(lifecycle_id: str) -> str:
+    """Deterministic OCA group for a lifecycle's exit legs.
+
+    Computed identically at entry (``place_entry``) and at the post-fill trailing
+    handoff (``_handle_parent_fill``) so the standalone TRAIL can OCA-join the
+    entry bracket's fixed STP without threading the group string through state.
+    """
+    return f"tf-exit-{lifecycle_id[:8]}"
+
+
+async def _confirm_order_resting(
+    trade: Trade,
+    *,
+    timeout_sec: float = 3.0,
+    poll_sec: float = 0.25,
+) -> bool:
+    """Poll a freshly-placed order's status until it is resting or dead.
+
+    Returns True once the broker reports a resting status (PreSubmitted/Submitted/
+    Filled), False if it reaches a dead status (Cancelled/Inactive — e.g. an
+    Error 328 rejection) or the bounded wait elapses without confirmation. The
+    status check runs BEFORE any sleep, so a mock/already-resting Trade returns
+    immediately (unit tests do not block).
+    """
+    waited = 0.0
+    while True:
+        status = getattr(getattr(trade, "orderStatus", None), "status", "") or ""
+        if status in _RESTING_STATUSES:
+            return True
+        if status in _DEAD_STATUSES:
+            return False
+        if waited >= timeout_sec:
+            return False
+        await asyncio.sleep(poll_sec)
+        waited += poll_sec
 
 
 @dataclass
@@ -151,7 +198,7 @@ class OrderRouter:
         # leg). The OCA group lets a fill on one exit leg cancel the sibling
         # broker-side, and the parentId linkage makes the protective STP a native
         # bracket leg that SURVIVES a client disconnect/redeploy (Task E.1 fix).
-        oca_group = f"tf-exit-{lc.lifecycle_id[:8]}"
+        oca_group = _oca_group_for(lc.lifecycle_id)
         try:
             parent, stop_child, tp_child = build_entry_oca_bracket(
                 direction=direction,
@@ -187,17 +234,30 @@ class OrderRouter:
             stop_trade = await self._ib.place_order(contract, stop_child)
             stop_order_id = self._order_id_of(stop_trade)
 
-            tp_child.parentId = parent_order_id
-            LOGGER.info(
-                "[EXEC] %s: place_tp — parent_id=%s mode=%s target=%.2f trail_offset=%.2f",
-                signal.instrument,
-                parent_order_id,
-                RISK.exit_mode,
-                signal.target_price,
-                RISK.trail_offset_pts,
-            )
-            tp_trade = await self._ib.place_order(contract, tp_child)
-            tp_order_id = self._order_id_of(tp_trade)
+            # Fixed mode → a LMT take-profit child completes the OCA bracket.
+            # Trailing mode → tp_child is None: the STP is the sole (transmitting)
+            # exit leg, and the standalone TRAIL is placed post-fill (Error 328,
+            # §0.5.190). target_order_id stays None until — if ever — a TP exists.
+            tp_order_id: int | None = None
+            if tp_child is not None:
+                tp_child.parentId = parent_order_id
+                LOGGER.info(
+                    "[EXEC] %s: place_tp — parent_id=%s mode=%s target=%.2f trail_offset=%.2f",
+                    signal.instrument,
+                    parent_order_id,
+                    RISK.exit_mode,
+                    signal.target_price,
+                    RISK.trail_offset_pts,
+                )
+                tp_trade = await self._ib.place_order(contract, tp_child)
+                tp_order_id = self._order_id_of(tp_trade)
+            else:
+                LOGGER.info(
+                    "[EXEC] %s: no_tp_child — exit_mode=%s; STP is sole exit leg, "
+                    "standalone TRAIL placed on fill",
+                    signal.instrument,
+                    RISK.exit_mode,
+                )
         except Exception as exc:
             LOGGER.error(
                 "[EXEC] %s: place_entry_failed — type=%s msg=%s",
@@ -228,7 +288,8 @@ class OrderRouter:
         self._by_lifecycle_id[lc.lifecycle_id] = lc
         self._contracts[lc.lifecycle_id] = contract
         self._by_order_id[parent_order_id] = lc
-        self._by_order_id[tp_order_id] = lc
+        if tp_order_id is not None:
+            self._by_order_id[tp_order_id] = lc
         self._by_order_id[stop_order_id] = lc
         self._mark_dirty(lc.lifecycle_id)
         # PR #14 — operator alert (Telegram picks this up via the [ALERT] log handler).
@@ -338,7 +399,15 @@ class OrderRouter:
             )
             return
 
+        # Recovery guard: the trailing handoff fires ONLY on a genuine new entry
+        # fill (lifecycle was ENTERING). A recovered/already-bracketed position is
+        # registered as ACTIVE and never routed here — but if a stray duplicate
+        # fill event arrived for one, was_entering is False and the handoff is
+        # skipped, leaving its existing bracket untouched (brief Constraint).
+        was_entering = State(lc.state) is State.ENTERING
+
         fill_qty, fill_price, fill_time = self._extract_fill(trade)
+        qty = fill_qty or self._contracts_per_signal()
 
         # PR B — the protective STP is now placed up-front as a native OCA bracket
         # child (see place_entry), so on a normal fill it already rests at the
@@ -351,11 +420,27 @@ class OrderRouter:
             self._ib,
             contract,
             lc,
-            qty=fill_qty or self._contracts_per_signal(),
+            qty=qty,
             existing_stop_is_live=stop_already_resting,
             component="ROUTER",
             path="parent_fill",
         )
+
+        # Trailing mode — hand the fixed STP off to a STANDALONE post-fill TRAIL
+        # (never-naked, never-double-sell). On success the protective leg becomes
+        # the trail; on any failure the fixed STP stays live (fail-safe) and
+        # final_stop_id remains the fixed STP. Recovery never reaches this branch.
+        final_stop_id = stp_order_id
+        if RISK.exit_mode == "trailing" and was_entering:
+            trail_order_id = await self._handoff_to_trailing_stop(
+                contract,
+                lc,
+                entry_fill_price=fill_price,
+                qty=qty,
+                fixed_stop_id=stp_order_id,
+            )
+            if trail_order_id is not None:
+                final_stop_id = trail_order_id
 
         lc = await self._sm.transition(
             lc,
@@ -365,12 +450,139 @@ class OrderRouter:
             entry_qty=fill_qty,
             entry_price=fill_price,
             entry_filled_at=fill_time,
-            stop_order_id=stp_order_id,
+            stop_order_id=final_stop_id,
         )
 
         self._by_lifecycle_id[lc.lifecycle_id] = lc
-        self._by_order_id[stp_order_id] = lc
+        if final_stop_id is not None:
+            self._by_order_id[final_stop_id] = lc
         self._mark_dirty(lc.lifecycle_id)
+
+    async def _handoff_to_trailing_stop(
+        self,
+        contract: Contract,
+        lc: Lifecycle,
+        *,
+        entry_fill_price: float,
+        qty: int,
+        fixed_stop_id: int | None,
+    ) -> int | None:
+        """Place a standalone TRAIL, confirm it rests, then cancel the fixed STP.
+
+        Never-naked / never-double-sell handoff (handoff §13a, option A):
+          1. the entry bracket's fixed STP (``fixed_stop_id``) is already resting
+             and protects the position the entire time;
+          2. place the TRAIL standalone (``parentId=0`` → dodges Error 328),
+             OCA-linked to the fixed STP (same group → a fill on either cancels
+             the other, so the brief overlap of two stops can never double-sell);
+          3. confirm the TRAIL is accepted + resting at the broker;
+          4. only THEN cancel the fixed STP — leaving the trail as the sole exit.
+
+        Returns the trail's order id on success, or None on ANY failure (in which
+        case the fixed STP is left live and is still the protective floor). Never
+        raises into the fill-event loop. A rejection (Error 328/321) is logged
+        loudly as a STOP-REPORT marker; broker acceptance is not unit-testable
+        (handoff §5/§8), so the first live placement is the real proof (Task F).
+        """
+        direction = Direction(lc.direction)
+        # Initial trigger = entry − fixed-stop offset (LONG); the trail then
+        # ratchets UP behind the high-water mark and never loosens (§13a).
+        offset = RISK.stop_loss_pts
+        if direction is Direction.LONG:
+            trail_stop_price = float(entry_fill_price) - float(offset)
+        else:
+            trail_stop_price = float(entry_fill_price) + float(offset)
+
+        # §0.5.192 — a position/contract may omit exchange → Error 321 on placement.
+        if not getattr(contract, "exchange", None):
+            contract.exchange = "CME"
+
+        trail = build_trailing_stop(
+            direction=direction,
+            qty=qty,
+            trail_stop_price=trail_stop_price,
+            trail_offset=RISK.trail_offset_pts,
+            oca_group=_oca_group_for(lc.lifecycle_id),
+        )
+        LOGGER.info(
+            "[EXEC] %s: place_trailing_stop — action=%s trailStop=%.2f trail_offset=%.2f "
+            "parentId=0 oca=%s (handoff from fixed STP id=%s)",
+            lc.symbol,
+            trail.action,
+            trail_stop_price,
+            RISK.trail_offset_pts,
+            trail.ocaGroup,
+            fixed_stop_id,
+        )
+        try:
+            trail_trade = await self._ib.place_order(contract, trail)
+        except Exception as exc:  # noqa: BLE001 — never raise into the fill-event loop
+            LOGGER.error(
+                "[EXEC] %s: trailing_handoff_failed — place raised type=%s msg=%s "
+                "(KEEP fixed STP id=%s; position stays protected; STOP-REPORT)",
+                lc.symbol,
+                type(exc).__name__,
+                exc,
+                fixed_stop_id,
+            )
+            return None
+
+        trail_order_id = self._order_id_of(trail_trade)
+        resting = await _confirm_order_resting(trail_trade)
+        if not resting:
+            status = getattr(getattr(trail_trade, "orderStatus", None), "status", "?")
+            LOGGER.error(
+                "[EXEC] %s: trailing_trail_not_resting — id=%s status=%s "
+                "(suspect Error 328/321; KEEP fixed STP id=%s; cancelling stray trail; "
+                "STOP-REPORT)",
+                lc.symbol,
+                trail_order_id,
+                status,
+                fixed_stop_id,
+            )
+            # Best-effort cancel of the stray/rejected trail; never raise.
+            try:
+                await self._ib.cancel_order_by_id(trail_order_id)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "[EXEC] %s: stray_trail_cancel_error — id=%s type=%s msg=%s",
+                    lc.symbol,
+                    trail_order_id,
+                    type(exc).__name__,
+                    exc,
+                )
+            return None
+
+        # TRAIL is resting and OCA-linked to the fixed STP → safe to retire the STP.
+        if fixed_stop_id is not None:
+            try:
+                cancelled = await self._ib.cancel_order_by_id(fixed_stop_id)
+            except Exception as exc:  # noqa: BLE001 — trail already protects; never raise
+                LOGGER.warning(
+                    "[EXEC] %s: fixed_stop_cancel_error — id=%s type=%s msg=%s "
+                    "(trail rests; STP may linger OCA-linked — harmless)",
+                    lc.symbol,
+                    fixed_stop_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                cancelled = False
+        else:
+            cancelled = False
+
+        self._by_order_id[trail_order_id] = lc
+        LOGGER.info(
+            "[ALERT] trailing_stop_armed: symbol=%s trail_id=%s trailStop=%.2f "
+            "trail_offset=%.2f fixed_stop_id=%s fixed_stop_cancelled=%s lifecycle_id=%s",
+            lc.symbol,
+            trail_order_id,
+            trail_stop_price,
+            RISK.trail_offset_pts,
+            fixed_stop_id,
+            cancelled,
+            lc.lifecycle_id,
+        )
+        return trail_order_id
 
     async def _handle_exit_fill(
         self,
