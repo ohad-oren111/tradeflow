@@ -41,7 +41,7 @@ from src.execution.kill_switch import KillSwitch
 from src.execution.reconciler import Reconciler
 from src.execution.router import CloseResult, OrderRouter
 from src.journal_rotation import rotate_jsonl_if_large
-from src.state_machine import InvariantViolationError, Lifecycle, State, StateMachine
+from src.state_machine import ExitReason, InvariantViolationError, Lifecycle, State, StateMachine
 
 # _in_session_edge_window is reused by the bar-liveness watchdog so that the
 # "expected bar window" definition has a single source of truth with the
@@ -1177,7 +1177,34 @@ class Orchestrator:
                 "entry_price": avg_cost,
                 "entry_filled_at": datetime.now(UTC).isoformat(),
             }
+        if target is State.CLOSED:
+            # Broker shows this lifecycle gone (never filled, or position closed
+            # while we were down). The CLOSED invariant requires every entry/exit/
+            # pnl field non-null; a never-completed lifecycle lacks them. Synthesise
+            # zeros for what's missing (preserving any real entry data) so boot
+            # recovery can close it instead of crashing the orchestrator. This is
+            # the boot-recovery sibling of OrderRouter._close_pre_active. Without it
+            # an orphan ENTERING row (e.g. an entry whose exit leg was broker-
+            # rejected) poisons every boot with an InvariantViolationError.
+            return self._synth_closed_fields(lifecycle)
         return {}
+
+    def _synth_closed_fields(self, lifecycle: Lifecycle) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        return {
+            "entry_qty": lifecycle.entry_qty if lifecycle.entry_qty is not None else 0,
+            "entry_price": (lifecycle.entry_price if lifecycle.entry_price is not None else 0.0),
+            "entry_filled_at": lifecycle.entry_filled_at or now,
+            "entry_order_id": lifecycle.entry_order_id or 0,
+            "exit_qty": 0,
+            "exit_price": 0.0,
+            "exit_filled_at": now,
+            "exit_order_id": lifecycle.exit_order_id or lifecycle.entry_order_id or 0,
+            "exit_reason": ExitReason.MANUAL.value,
+            "commission_total": 0.0,
+            "pnl_gross": 0.0,
+            "pnl_net": 0.0,
+        }
 
     async def _healthcheck_once(self) -> None:
         ib_time = await self._ib._ib.reqCurrentTimeAsync()

@@ -11,6 +11,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.orchestrator import Orchestrator
+from src.state_machine import Lifecycle, State
+
+_ENTRY_EXIT_PNL_FIELDS = (
+    "entry_qty",
+    "entry_price",
+    "entry_filled_at",
+    "entry_order_id",
+    "exit_qty",
+    "exit_price",
+    "exit_filled_at",
+    "exit_order_id",
+    "exit_reason",
+    "commission_total",
+    "pnl_gross",
+    "pnl_net",
+)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -119,6 +135,37 @@ async def test_startup_seeds_warmup_before_starting_bar_subscription():
         await orch._startup()
 
     assert calls == ["seed", "subscribe"]
+
+
+async def test_boot_recovery_closes_orphan_entering_without_invariant_error():
+    # An ENTERING lifecycle whose entry never filled (e.g. its exit leg was
+    # broker-rejected) must close cleanly at boot — not crash the orchestrator
+    # with an InvariantViolationError. Regression for the 2026-06-02 02:29Z
+    # crash loop (orphan ENTERING from the Error-328 trailing-TP entry).
+    mock_ib = _make_mock_ib()
+    mock_db = _make_mock_db()
+    orch = Orchestrator(mock_ib, mock_db, paper_account="DUQ1234567")
+
+    orphan = Lifecycle(
+        lifecycle_id="orphan-1",
+        symbol="MNQM6",
+        strategy="sma100_bounce",
+        direction="LONG",
+        state=State.ENTERING.value,
+    )
+    orphan.entry_order_id = 58  # set at ENTERING; entry_qty/price never filled (None)
+
+    fields = await orch._broker_field_updates_for(orphan, State.CLOSED)
+    # Every field the CLOSED invariant requires is present and non-null.
+    for key in _ENTRY_EXIT_PNL_FIELDS:
+        assert key in fields and fields[key] is not None, f"missing {key}"
+    assert fields["entry_qty"] == 0
+    assert fields["pnl_net"] == 0.0
+    # The applied transition must satisfy the invariant matrix (no exception).
+    from dataclasses import replace as _replace
+
+    closed = _replace(orphan, state=State.CLOSED.value, **fields)
+    orch._sm._validate_invariants(closed, State.CLOSED)  # raises on mismatch
 
 
 async def test_healthcheck_loop_runs_n_iterations():
