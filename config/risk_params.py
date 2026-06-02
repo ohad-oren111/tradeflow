@@ -72,11 +72,19 @@ class RiskParams:
     #   KILL_SWITCH_PNL_EPOCH          — ISO ts; drawdown measured from here.
     #                                    Empty → deploy time (pre-deploy losses
     #                                    don't count). See [[kill-switch-retune]].
+    #   KILL_SWITCH_MAX_CONSEC_EVAL_ERRORS — how many CONSECUTIVE transient/network
+    #                                    evaluator faults (Supabase/httpx read or
+    #                                    connect timeouts) to tolerate before the
+    #                                    fail-safe halt fires. Default 3 — a single
+    #                                    Supabase ReadTimeout no longer spuriously
+    #                                    halts a healthy, flat bot. A NON-transient
+    #                                    (logic) error still halts on the FIRST hit.
     kill_switch_warn_consec_losses: int = 6
     kill_switch_halt_consec_losses: int = 10
     kill_switch_allocation_usd: float | None = None
     kill_switch_max_drawdown_pct: float = 33.0
     kill_switch_pnl_epoch: str = ""
+    kill_switch_max_consec_eval_errors: int = 3
     # Equity base for the daily/weekly drawdown % triggers. None → use the live
     # broker NetLiquidation each poll. NOTE: on the ~$1M paper account, 8%/15% of
     # net-liq is ~$80k/$150k, so the DD triggers are very loose for a 2-contract
@@ -179,6 +187,9 @@ RISK = RiskParams(
     kill_switch_allocation_usd=_env_opt_float("KILL_SWITCH_ALLOCATION_USD"),
     kill_switch_max_drawdown_pct=_env_float("KILL_SWITCH_MAX_DRAWDOWN_PCT", 33.0),
     kill_switch_pnl_epoch=_env_str("KILL_SWITCH_PNL_EPOCH", ""),
+    # Tolerate up to N consecutive transient evaluator faults before halting
+    # (default 3; never treated as 0 — a 0 would halt on the first blip).
+    kill_switch_max_consec_eval_errors=_env_int("KILL_SWITCH_MAX_CONSEC_EVAL_ERRORS", 3),
 )
 # Lowercase alias for consumers that prefer `risk_params.x` over `RISK.x`.
 risk_params = RISK
