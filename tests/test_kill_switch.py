@@ -10,6 +10,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from config.risk_params import RISK
@@ -240,3 +241,79 @@ async def test_poll_fail_safe_halts_on_evaluator_error_without_raising():
     assert v.action == "pause" and v.reason == "error"
     assert raised == ["kill_switch:evaluator_error"]
     assert flat == []  # fail-safe blocks entries; does not act on an unknown position
+
+
+# ----------------------------- transient evaluator-fault tolerance (handoff v17)
+
+
+async def test_poll_single_transient_error_does_not_halt():
+    # One Supabase httpx.ReadTimeout — counter increments, NO halt (default max 3).
+    db = MagicMock()
+    db.select = AsyncMock(side_effect=httpx.ReadTimeout("supabase blip"))
+    ks, raised, flat = _build(db=db)
+    v = await ks.poll_once()  # must NOT raise, must NOT halt
+    assert v.action == "ok" and v.reason == "transient_error"
+    assert raised == [] and flat == []
+    assert ks._consec_eval_errors == 1
+
+
+async def test_poll_max_consecutive_transient_errors_halts_on_the_max_th():
+    db = MagicMock()
+    # 3 consecutive transient timeouts (default KILL_SWITCH_MAX_CONSEC_EVAL_ERRORS=3).
+    db.select = AsyncMock(
+        side_effect=[  # 3 elements — one per poll; halt expected on the 3rd
+            httpx.ReadTimeout("blip 1"),
+            httpx.ConnectTimeout("blip 2"),
+            httpx.ReadTimeout("blip 3"),
+        ]
+    )
+    ks, raised, flat = _build(db=db)
+    v1 = await ks.poll_once()
+    v2 = await ks.poll_once()
+    assert v1.action == "ok" and v2.action == "ok"  # 1/3 and 2/3 tolerated
+    assert raised == []
+    v3 = await ks.poll_once()  # 3/3 — fail-safe halt
+    assert v3.action == "pause" and v3.reason == "error"
+    assert raised == ["kill_switch:evaluator_error"]
+    assert flat == []  # fail-safe blocks entries; takes no position action
+
+
+async def test_poll_transient_then_clean_poll_resets_counter():
+    db = MagicMock()
+    db.select = AsyncMock(
+        side_effect=[  # 4 elements: 2 timeouts, one clean poll (empty rows), 1 timeout
+            httpx.ReadTimeout("blip 1"),
+            httpx.ReadTimeout("blip 2"),
+            [],  # clean poll → counter resets to 0
+            httpx.ReadTimeout("blip 3"),
+        ]
+    )
+    ks, raised, flat = _build(db=db)
+    await ks.poll_once()  # 1/3
+    await ks.poll_once()  # 2/3
+    assert ks._consec_eval_errors == 2
+    v_clean = await ks.poll_once()  # clean → reset
+    assert v_clean.action == "ok"
+    assert ks._consec_eval_errors == 0
+    v_after = await ks.poll_once()  # a fresh single transient does NOT halt
+    assert v_after.action == "ok" and v_after.reason == "transient_error"
+    assert raised == [] and flat == []
+    assert ks._consec_eval_errors == 1
+
+
+async def test_poll_non_transient_logic_error_halts_on_first_occurrence():
+    # A KeyError is a code bug, not a network blip — it must halt immediately,
+    # never ride the transient tolerance.
+    db = MagicMock()
+    db.select = AsyncMock(side_effect=KeyError("pnl_net"))
+    ks, raised, flat = _build(db=db)
+    v = await ks.poll_once()
+    assert v.action == "pause" and v.reason == "error"
+    assert raised == ["kill_switch:evaluator_error"]  # halted on the FIRST hit
+    assert ks._consec_eval_errors == 0  # not counted as transient
+
+
+def test_max_consec_eval_errors_defaults_to_three_not_zero():
+    # Unset env → default 3 (a 0 default would fail-safe halt on the first blip).
+    assert RISK.kill_switch_max_consec_eval_errors == 3
+    assert RISK.kill_switch_max_consec_eval_errors > 0

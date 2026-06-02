@@ -34,9 +34,30 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
+
 from config.risk_params import RISK, RiskParams
 
 LOGGER = logging.getLogger(__name__)
+
+# Transient/network faults that a brief retry-window can clear. The evaluator
+# tolerates up to ``KILL_SWITCH_MAX_CONSEC_EVAL_ERRORS`` of these IN A ROW before
+# fail-safe halting (a single Supabase ReadTimeout used to spuriously halt a
+# healthy flat bot — handoff v17). Deliberately NOT a bare ``Exception``: a real
+# logic bug (KeyError/TypeError/AttributeError/…) is excluded here and so halts
+# on the FIRST occurrence — tolerance must never let a code bug ride for N polls.
+#   * httpx.TransportError — the Supabase REST client (src/clients/supabase_client.py)
+#     is httpx-based; covers ReadTimeout/ConnectTimeout/WriteTimeout/PoolTimeout
+#     (TimeoutException) and ConnectError/ReadError/WriteError/NetworkError.
+#     httpx.HTTPStatusError is intentionally EXCLUDED — a 4xx (bad query/auth) is a
+#     bug, not a transient blip, and should halt immediately.
+#   * TimeoutError — asyncio.TimeoutError is an alias of this in 3.11 (broker awaits).
+#   * ConnectionError — socket-level reset/abort/refused (subclass of OSError).
+_TRANSIENT_EVAL_ERRORS: tuple[type[Exception], ...] = (
+    httpx.TransportError,
+    TimeoutError,
+    ConnectionError,
+)
 
 
 @dataclass
@@ -190,6 +211,9 @@ class KillSwitch:
         )
         # Idempotency: the warn-tier alert fires once per losing streak crossing.
         self._warn_notified = False
+        # Consecutive transient (network) evaluator faults — reset on any clean
+        # poll; a fail-safe halt fires only when it reaches the configured max.
+        self._consec_eval_errors = 0
 
     async def poll_once(self) -> KillVerdict:
         """Evaluate once; pause+flatten on a PAUSE, alert-once on a NOTIFY. Never raises."""
@@ -201,15 +225,43 @@ class KillSwitch:
             return KillVerdict("ok", "already_halted", "halt already raised")
         try:
             verdict = await self._evaluate()
-        except Exception as exc:  # noqa: BLE001 — fail-safe: cannot confirm safe → STOP
+        except _TRANSIENT_EVAL_ERRORS as exc:
+            # TRANSIENT/network fault — tolerate a few in a row (a single Supabase
+            # blip should not halt a healthy flat bot). Only halt at the ceiling.
+            self._consec_eval_errors += 1
+            limit = max(1, int(self._p.kill_switch_max_consec_eval_errors))
+            if self._consec_eval_errors < limit:
+                LOGGER.warning(
+                    "[KILL] eval: transient poll error %d/%d — %s: %s (tolerating, NOT halting)",
+                    self._consec_eval_errors,
+                    limit,
+                    type(exc).__name__,
+                    exc,
+                )
+                return KillVerdict("ok", "transient_error", f"{type(exc).__name__}: {exc}")
+            LOGGER.error(
+                "[KILL] eval: halting after %d consecutive transient errors — %s: %s "
+                "(FAIL-SAFE: raising halt, blocking entries)",
+                self._consec_eval_errors,
+                type(exc).__name__,
+                exc,
+            )
+            return self._raise_eval_halt(exc)
+        except Exception as exc:  # noqa: BLE001 — NON-transient (logic) error: halt FIRST hit
             LOGGER.error(
                 "[KILL] evaluator_error — %s: %s (FAIL-SAFE: raising halt, blocking entries)",
                 type(exc).__name__,
                 exc,
             )
-            self._raise_halt("kill_switch:evaluator_error")
-            LOGGER.info("[ALERT] kill_switch_tripped: reason=evaluator_error")
-            return KillVerdict("pause", "error", str(exc))
+            return self._raise_eval_halt(exc)
+
+        # Clean poll — clear any transient-error streak (log once when it had accrued).
+        if self._consec_eval_errors:
+            LOGGER.info(
+                "[KILL] eval: transient error counter reset — clean poll (was %d)",
+                self._consec_eval_errors,
+            )
+            self._consec_eval_errors = 0
 
         if verdict.action == "notify":
             # NOTIFY tier — alert once per crossing, keep trading (no halt/flatten).
@@ -245,6 +297,16 @@ class KillSwitch:
                 exc,
             )
         return verdict
+
+    def _raise_eval_halt(self, exc: Exception) -> KillVerdict:
+        """Raise the global halt for an evaluator failure + emit the trip alert.
+
+        Shared by both halt paths (the transient-error ceiling and a first-hit
+        non-transient logic error); the distinguishing log line is emitted by the
+        caller before this runs. Returns the PAUSE verdict (never raises)."""
+        self._raise_halt("kill_switch:evaluator_error")
+        LOGGER.info("[ALERT] kill_switch_tripped: reason=evaluator_error")
+        return KillVerdict("pause", "error", str(exc))
 
     async def _evaluate(self) -> KillVerdict:
         rows = await self._db.select(
