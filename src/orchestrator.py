@@ -403,11 +403,15 @@ class Orchestrator:
         await self._recover_state()
         if self._enable_strategy:
             self._wire_fill_event()
-            await self._start_bar_subscription()
-            # warmup-enable — seed the strategy's REAL buffer from history once at
-            # boot (not on farm-flap resubscribe) so it trades from the first live
-            # bar. Fail-safe + never raises (see _seed_strategy_warmup).
+            # warmup-enable — seed the strategy's REAL buffer from history BEFORE
+            # starting the live subscription. Ordering is load-bearing: seed_bars
+            # only fills an EMPTY buffer, so if the live feed is armed first a bar
+            # ticking during the ~1.5s historical fetch lands in the buffer and the
+            # seed is skipped → a cold SMA on boot (observed 2026-06-02 02:01Z:
+            # get_historical_bars returned 5762 bars but seed_bars seeded 1). Seed
+            # first → warm buffer → live bars append. Fail-safe + never raises.
             await self._seed_strategy_warmup()
+            await self._start_bar_subscription()
             self._arm_farm_flap_resubscribe()
             self._launch_background_tasks()
 
