@@ -15,12 +15,14 @@ from dataclasses import dataclass
 
 def _env_str(key: str, default: str) -> str:
     raw = os.getenv(key)
-    return raw if raw not in (None, "") else default
+    if raw is None or raw == "":
+        return default
+    return raw
 
 
 def _env_float(key: str, default: float) -> float:
     raw = os.getenv(key)
-    if raw in (None, ""):
+    if raw is None or raw == "":
         return default
     return float(raw)
 
