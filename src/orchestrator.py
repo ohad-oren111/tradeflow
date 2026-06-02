@@ -611,6 +611,19 @@ class Orchestrator:
         # warmup-enable — log the live-only SMA vs the strategy's backfilled SMA
         # this bar. Observe-only: the trade decision above is already made.
         self._warmup_shadow.observe(bar, self._strategy.last_decision)
+        # EXIT_MODE=trailing — walk the resting protective stop on this closed bar
+        # (SeanBot V3/V12 ratchet). Dispatched on the loop because it does async
+        # broker I/O; a no-op in fixed mode or with no open position, and it never
+        # raises into the feed. Independent of the entry signal below.
+        if self._loop is not None:
+            asyncio.run_coroutine_threadsafe(
+                self._router.ratchet_stop_on_bar(
+                    bar_high=bar.get("high"),
+                    bar_low=bar.get("low"),
+                    bar_close=bar.get("close"),
+                ),
+                self._loop,
+            )
         if signal_or_none is None:
             return
         if self._loop is None:

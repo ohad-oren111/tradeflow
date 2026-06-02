@@ -8,7 +8,6 @@ from src.execution.bracket import (
     build_bracket,
     build_entry_oca_bracket,
     build_protective_stop,
-    build_trailing_stop,
 )
 from src.state_machine import Direction
 
@@ -131,51 +130,10 @@ def test_oca_trailing_rejects_non_positive_offset():
         )
 
 
-# ------------------------------------------------ §13a — build_trailing_stop:
-# the STANDALONE post-fill TRAIL (parentId=0 dodges Error 328). Placed by the
-# router on the entry fill, OCA-linked to the entry bracket's fixed STP.
-
-
-def _trail(direction=Direction.LONG, qty=2, trail_stop=19925.0, offset=150.0):
-    return build_trailing_stop(
-        direction=direction,
-        qty=qty,
-        trail_stop_price=trail_stop,
-        trail_offset=offset,
-        oca_group="tf-exit-abc12345",
-    )
-
-
-def test_trailing_stop_long_is_standalone_sell_trail_parent_zero():
-    t = _trail(direction=Direction.LONG, trail_stop=19925.0, offset=150.0)
-    assert t.action == "SELL"  # exit a LONG
-    assert t.orderType == "TRAIL"
-    assert t.auxPrice == 150.0  # trailing amount behind the high-water mark
-    assert t.trailStopPrice == 19925.0  # initial trigger = entry-75
-    assert t.parentId == 0  # STANDALONE — not a bracket child (dodges Error 328)
-    assert t.tif == "GTC"
-    assert t.outsideRth is True
-    assert t.transmit is True
-    # OCA-linked to the fixed STP during the handoff overlap (one fill cancels other).
-    assert t.ocaGroup == "tf-exit-abc12345"
-    assert t.ocaType == 1
-
-
-def test_trailing_stop_short_is_buy():
-    t = _trail(direction=Direction.SHORT, trail_stop=20075.0, offset=150.0)
-    assert t.action == "BUY"  # exit a SHORT
-    assert t.orderType == "TRAIL"
-    assert t.trailStopPrice == 20075.0
-
-
-def test_trailing_stop_rejects_non_positive_qty():
-    with pytest.raises(ValueError, match="qty must be positive"):
-        _trail(qty=0)
-
-
-def test_trailing_stop_rejects_non_positive_offset():
-    with pytest.raises(ValueError, match="trail_offset must be positive"):
-        _trail(offset=0.0)
+# NOTE: PR #91's standalone native TRAIL (build_trailing_stop) was superseded by
+# the bot-walked ratchet (src/execution/trail_manager.py + OrderRouter ratchet) —
+# see tests/test_trail_manager.py and the router ratchet tests. Trailing-mode entry
+# bracket (parent + fixed STP only) is unchanged and covered above.
 
 
 def test_long_market_parent_has_transmit_false():

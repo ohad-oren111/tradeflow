@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -26,9 +26,9 @@ from src.clients.ib_client import IBClient
 from src.execution.bracket import (
     build_entry_oca_bracket,
     build_protective_stop,
-    build_trailing_stop,
 )
 from src.execution.dirty_set import DirtySet
+from src.execution.trail_manager import compute_ratcheted_stop, should_hard_exit
 from src.state_machine import (
     Direction,
     ExitReason,
@@ -131,6 +131,12 @@ class OrderRouter:
         # touched by recent events. None when run in isolation (e.g. unit tests
         # that don't care about reconciliation).
         self._dirty_set = dirty_set
+        # EXIT_MODE=trailing — per-position high-water mark (LONG: highest high
+        # seen; SHORT: lowest low) used by the bar-close ratchet. In-memory and
+        # reconstructed on recovery (seeded to entry); the resting STP itself is
+        # broker-resident and survives a restart, so losing this counter can never
+        # un-ratchet a stop — compute_ratcheted_stop only moves it toward price.
+        self._highest: dict[str, float] = {}
 
     def _mark_dirty(self, lifecycle_id: str) -> None:
         if self._dirty_set is not None:
@@ -155,6 +161,13 @@ class OrderRouter:
         ):
             if oid is not None:
                 self._by_order_id[oid] = lifecycle
+        # Seed the high-water mark so a recovered ACTIVE position still ratchets.
+        # Seeded to entry (the conservative floor): the ratchet reads the resting
+        # stop's LIVE price from the broker as current_stop and only moves it
+        # toward price, so seeding low can never lower an already-walked stop — it
+        # just resumes ratcheting as new highs/lows print post-recovery.
+        if lifecycle.state == State.ACTIVE.value and lifecycle.entry_price is not None:
+            self._highest[lifecycle.lifecycle_id] = float(lifecycle.entry_price)
 
     def register_eod_exit(self, lifecycle: Lifecycle, order_id: int) -> None:
         """Route a forthcoming fill on ``order_id`` to ``lifecycle`` as EOD-closed.
@@ -399,11 +412,10 @@ class OrderRouter:
             )
             return
 
-        # Recovery guard: the trailing handoff fires ONLY on a genuine new entry
-        # fill (lifecycle was ENTERING). A recovered/already-bracketed position is
-        # registered as ACTIVE and never routed here — but if a stray duplicate
-        # fill event arrived for one, was_entering is False and the handoff is
-        # skipped, leaving its existing bracket untouched (brief Constraint).
+        # Recovery guard: trailing-mode high-water seeding fires ONLY on a genuine
+        # new entry fill (lifecycle was ENTERING). A recovered/already-bracketed
+        # position is registered as ACTIVE (and seeded in register_recovered) and
+        # never routed here, so it keeps its existing stop untouched.
         was_entering = State(lc.state) is State.ENTERING
 
         fill_qty, fill_price, fill_time = self._extract_fill(trade)
@@ -426,21 +438,22 @@ class OrderRouter:
             path="parent_fill",
         )
 
-        # Trailing mode — hand the fixed STP off to a STANDALONE post-fill TRAIL
-        # (never-naked, never-double-sell). On success the protective leg becomes
-        # the trail; on any failure the fixed STP stays live (fail-safe) and
-        # final_stop_id remains the fixed STP. Recovery never reaches this branch.
+        # Trailing mode — the entry bracket's fixed STP @ entry-stop_loss_pts IS
+        # the stop the bar-close ratchet walks UP (SeanBot V3/V12). No separate
+        # order is placed here; just seed the high-water mark to the fill price so
+        # the first qualifying bar can ratchet. The STP stays the protective floor.
         final_stop_id = stp_order_id
         if RISK.exit_mode == "trailing" and was_entering:
-            trail_order_id = await self._handoff_to_trailing_stop(
-                contract,
-                lc,
-                entry_fill_price=fill_price,
-                qty=qty,
-                fixed_stop_id=stp_order_id,
+            self._highest[lc.lifecycle_id] = float(fill_price)
+            LOGGER.info(
+                "[EXEC] %s: trailing_armed — fixed STP id=%s @entry-%.0f is the "
+                "ratchet floor; highest seeded=%.2f lifecycle=%s",
+                lc.symbol,
+                stp_order_id,
+                RISK.stop_loss_pts,
+                fill_price,
+                lc.lifecycle_id,
             )
-            if trail_order_id is not None:
-                final_stop_id = trail_order_id
 
         lc = await self._sm.transition(
             lc,
@@ -458,131 +471,191 @@ class OrderRouter:
             self._by_order_id[final_stop_id] = lc
         self._mark_dirty(lc.lifecycle_id)
 
-    async def _handoff_to_trailing_stop(
-        self,
-        contract: Contract,
-        lc: Lifecycle,
-        *,
-        entry_fill_price: float,
-        qty: int,
-        fixed_stop_id: int | None,
-    ) -> int | None:
-        """Place a standalone TRAIL, confirm it rests, then cancel the fixed STP.
+    # --------------------------------------------- EXIT_MODE=trailing bar ratchet
 
-        Never-naked / never-double-sell handoff (handoff §13a, option A):
-          1. the entry bracket's fixed STP (``fixed_stop_id``) is already resting
-             and protects the position the entire time;
-          2. place the TRAIL standalone (``parentId=0`` → dodges Error 328),
-             OCA-linked to the fixed STP (same group → a fill on either cancels
-             the other, so the brief overlap of two stops can never double-sell);
-          3. confirm the TRAIL is accepted + resting at the broker;
-          4. only THEN cancel the fixed STP — leaving the trail as the sole exit.
+    def _active_trailing_lifecycle(self) -> Lifecycle | None:
+        """The single ACTIVE lifecycle to ratchet this bar (≤1 open position)."""
+        for lc in self._by_lifecycle_id.values():
+            if lc.state == State.ACTIVE.value:
+                return lc
+        return None
 
-        Returns the trail's order id on success, or None on ANY failure (in which
-        case the fixed STP is left live and is still the protective floor). Never
-        raises into the fill-event loop. A rejection (Error 328/321) is logged
-        loudly as a STOP-REPORT marker; broker acceptance is not unit-testable
-        (handoff §5/§8), so the first live placement is the real proof (Task F).
-        """
-        direction = Direction(lc.direction)
-        # Initial trigger = entry − fixed-stop offset (LONG); the trail then
-        # ratchets UP behind the high-water mark and never loosens (§13a).
-        offset = RISK.stop_loss_pts
-        if direction is Direction.LONG:
-            trail_stop_price = float(entry_fill_price) - float(offset)
-        else:
-            trail_stop_price = float(entry_fill_price) + float(offset)
-
-        # §0.5.192 — a position/contract may omit exchange → Error 321 on placement.
-        if not getattr(contract, "exchange", None):
-            contract.exchange = "CME"
-
-        trail = build_trailing_stop(
-            direction=direction,
-            qty=qty,
-            trail_stop_price=trail_stop_price,
-            trail_offset=RISK.trail_offset_pts,
-            oca_group=_oca_group_for(lc.lifecycle_id),
-        )
-        LOGGER.info(
-            "[EXEC] %s: place_trailing_stop — action=%s trailStop=%.2f trail_offset=%.2f "
-            "parentId=0 oca=%s (handoff from fixed STP id=%s)",
-            lc.symbol,
-            trail.action,
-            trail_stop_price,
-            RISK.trail_offset_pts,
-            trail.ocaGroup,
-            fixed_stop_id,
-        )
+    async def _broker_in_position(self, lc: Lifecycle) -> bool:
+        """§0.5.98 — confirm the broker still holds the position in lc.direction
+        before modifying its stop. Conservative: any error → False (don't touch)."""
         try:
-            trail_trade = await self._ib.place_order(contract, trail)
-        except Exception as exc:  # noqa: BLE001 — never raise into the fill-event loop
-            LOGGER.error(
-                "[EXEC] %s: trailing_handoff_failed — place raised type=%s msg=%s "
-                "(KEEP fixed STP id=%s; position stays protected; STOP-REPORT)",
+            positions = await self._ib.get_positions()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "[EXEC] %s: verify_position_error — type=%s msg=%s (skip ratchet)",
                 lc.symbol,
                 type(exc).__name__,
                 exc,
-                fixed_stop_id,
             )
-            return None
+            return False
+        want_long = Direction(lc.direction) is Direction.LONG
+        for p in positions:
+            c = getattr(p, "contract", None)
+            sym = getattr(c, "localSymbol", None) or getattr(c, "symbol", None)
+            qty = float(getattr(p, "position", 0) or 0)
+            if sym == lc.symbol and qty != 0 and ((qty > 0) == want_long):
+                return True
+        return False
 
-        trail_order_id = self._order_id_of(trail_trade)
-        resting = await _confirm_order_resting(trail_trade)
-        if not resting:
-            status = getattr(getattr(trail_trade, "orderStatus", None), "status", "?")
+    async def ratchet_stop_on_bar(
+        self,
+        *,
+        bar_high: float | None,
+        bar_low: float | None,
+        bar_close: float | None,
+    ) -> None:
+        """SeanBot V3/V12 bar-close exit ratchet (EXIT_MODE=trailing only).
+
+        Updates the open position's high-water mark from this bar, walks the single
+        resting GTC SELL STP UP only (cancel-free: modify-in-place via re-placeOrder
+        — one resting stop the whole time, no naked window), and market-exits on the
+        +hard_ceiling cap. A no-op in fixed mode or with no open position. NEVER
+        raises into the bar loop; any failure leaves the existing stop live."""
+        if RISK.exit_mode != "trailing":
+            return
+        lc = self._active_trailing_lifecycle()
+        if lc is None:
+            return
+        try:
+            await self._ratchet_one(lc, bar_high=bar_high, bar_low=bar_low, bar_close=bar_close)
+        except Exception as exc:  # noqa: BLE001 — never break the bar feed; keep the stop
             LOGGER.error(
-                "[EXEC] %s: trailing_trail_not_resting — id=%s status=%s "
-                "(suspect Error 328/321; KEEP fixed STP id=%s; cancelling stray trail; "
-                "STOP-REPORT)",
+                "[EXEC] %s: ratchet_error — type=%s msg=%s (stop unchanged)",
                 lc.symbol,
-                trail_order_id,
-                status,
-                fixed_stop_id,
+                type(exc).__name__,
+                exc,
             )
-            # Best-effort cancel of the stray/rejected trail; never raise.
-            try:
-                await self._ib.cancel_order_by_id(trail_order_id)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning(
-                    "[EXEC] %s: stray_trail_cancel_error — id=%s type=%s msg=%s",
-                    lc.symbol,
-                    trail_order_id,
-                    type(exc).__name__,
-                    exc,
-                )
-            return None
 
-        # TRAIL is resting and OCA-linked to the fixed STP → safe to retire the STP.
-        if fixed_stop_id is not None:
-            try:
-                cancelled = await self._ib.cancel_order_by_id(fixed_stop_id)
-            except Exception as exc:  # noqa: BLE001 — trail already protects; never raise
-                LOGGER.warning(
-                    "[EXEC] %s: fixed_stop_cancel_error — id=%s type=%s msg=%s "
-                    "(trail rests; STP may linger OCA-linked — harmless)",
-                    lc.symbol,
-                    fixed_stop_id,
-                    type(exc).__name__,
-                    exc,
-                )
-                cancelled = False
+    async def _ratchet_one(
+        self,
+        lc: Lifecycle,
+        *,
+        bar_high: float | None,
+        bar_low: float | None,
+        bar_close: float | None,
+    ) -> None:
+        direction = Direction(lc.direction)
+        entry = lc.entry_price
+        contract = self._contracts.get(lc.lifecycle_id)
+        if entry is None or contract is None or bar_close is None:
+            return
+
+        # 1) Update the high-water mark (LONG: highest high; SHORT: lowest low).
+        prior = self._highest.get(lc.lifecycle_id, float(entry))
+        if direction is Direction.LONG:
+            highest = max(prior, float(bar_high)) if bar_high is not None else prior
         else:
-            cancelled = False
+            highest = min(prior, float(bar_low)) if bar_low is not None else prior
+        self._highest[lc.lifecycle_id] = highest
 
-        self._by_order_id[trail_order_id] = lc
+        # 2) Hard ceiling (V3 +1000) → market-exit, regardless of the stop.
+        if should_hard_exit(
+            entry=float(entry),
+            bar_close=float(bar_close),
+            direction=direction,
+            hard_ceiling_pts=RISK.hard_ceiling_pts,
+        ):
+            LOGGER.warning(
+                "[EXEC] %s: hard_ceiling_hit — close=%.2f entry=%.2f ceiling=%.0f → market exit",
+                lc.symbol,
+                bar_close,
+                entry,
+                RISK.hard_ceiling_pts,
+            )
+            await self.close_position(lc.symbol, reason="hard_ceiling")
+            return
+
+        if lc.stop_order_id is None:
+            LOGGER.warning(
+                "[EXEC] %s: ratchet_no_stop_id — lifecycle=%s (#80 reconciler owns naked heal)",
+                lc.symbol,
+                lc.lifecycle_id,
+            )
+            return
+
+        # 3) Read the broker's LIVE stop price as current_stop (§0.5.98 truth).
+        order = await self._ib.find_open_order_by_id(lc.stop_order_id)
+        current_stop = getattr(order, "auxPrice", None) if order is not None else None
+        if current_stop is None and lc.stop_price is not None:
+            current_stop = float(lc.stop_price)
+
+        new_stop = compute_ratcheted_stop(
+            float(entry),
+            highest,
+            float(current_stop) if current_stop is not None else None,
+            direction=direction,
+            stop_loss_pts=RISK.stop_loss_pts,
+            lock_in_pts=RISK.lock_in_pts,
+            trail_offset_pts=RISK.trail_offset_pts,
+        )
+        if new_stop is None:
+            return  # no improvement → ratchet never moves the stop down
+
+        # 4) §0.5.98 — confirm we are still in the position before touching the stop.
+        if not await self._broker_in_position(lc):
+            LOGGER.info(
+                "[EXEC] %s: ratchet_skipped_not_in_position — lifecycle=%s",
+                lc.symbol,
+                lc.lifecycle_id,
+            )
+            return
+        if order is None:
+            LOGGER.error(
+                "[EXEC] %s: ratchet_no_resting_stop — id=%s not live; cannot modify "
+                "(#80 reconciler owns naked heal); STOP-REPORT",
+                lc.symbol,
+                lc.stop_order_id,
+            )
+            return
+
+        # 5) Modify in place: mutate auxPrice + re-placeOrder the SAME order id
+        # (ib_async order-modify) — one resting stop throughout, no naked window.
+        if not getattr(contract, "exchange", None):
+            contract.exchange = "CME"  # §0.5.192
+        prior_aux = getattr(order, "auxPrice", None)
+        order.auxPrice = float(new_stop)
+        try:
+            trade = await self._ib.place_order(contract, order)
+        except Exception as exc:  # noqa: BLE001 — keep the prior stop; never raise
+            LOGGER.error(
+                "[EXEC] %s: ratchet_modify_failed — id=%s type=%s msg=%s "
+                "(KEEP prior stop @%s; STOP-REPORT on Error 321/201/202)",
+                lc.symbol,
+                lc.stop_order_id,
+                type(exc).__name__,
+                exc,
+                f"{prior_aux:.2f}" if prior_aux is not None else "?",
+            )
+            return
+        if not await _confirm_order_resting(trade):
+            status = getattr(getattr(trade, "orderStatus", None), "status", "?")
+            LOGGER.error(
+                "[EXEC] %s: ratchet_modify_not_resting — id=%s status=%s "
+                "(prior stop @%s still governs; STOP-REPORT)",
+                lc.symbol,
+                lc.stop_order_id,
+                status,
+                f"{prior_aux:.2f}" if prior_aux is not None else "?",
+            )
+            return
+
+        self._by_lifecycle_id[lc.lifecycle_id] = replace(lc, stop_price=float(new_stop))
         LOGGER.info(
-            "[ALERT] trailing_stop_armed: symbol=%s trail_id=%s trailStop=%.2f "
-            "trail_offset=%.2f fixed_stop_id=%s fixed_stop_cancelled=%s lifecycle_id=%s",
+            "[ALERT] trailing_stop_ratcheted: symbol=%s stop_id=%s old=%s new=%.2f "
+            "highest=%.2f entry=%.2f lifecycle_id=%s",
             lc.symbol,
-            trail_order_id,
-            trail_stop_price,
-            RISK.trail_offset_pts,
-            fixed_stop_id,
-            cancelled,
+            lc.stop_order_id,
+            f"{prior_aux:.2f}" if prior_aux is not None else "?",
+            new_stop,
+            highest,
+            entry,
             lc.lifecycle_id,
         )
-        return trail_order_id
 
     async def _handle_exit_fill(
         self,

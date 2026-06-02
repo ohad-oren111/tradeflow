@@ -362,6 +362,37 @@ class IBClient:
             )
             return False
 
+    async def find_open_order_by_id(self, order_id: int) -> Order | None:
+        """Return the LIVE ``Order`` for ``order_id`` from ``IB.openTrades()``, or None.
+
+        The returned object is the real ib_async ``Order`` (carrying clientId /
+        permId / current ``auxPrice``), so the caller can read the broker's actual
+        resting stop price (§0.5.98 broker-truth) and modify it in place by mutating
+        the order and re-submitting via :meth:`place_order` (ib_async treats a
+        re-``placeOrder`` of the same orderId as an order-modify — one resting stop,
+        no naked window). Returns None when the id is not among live orders (filled
+        / cancelled) or on any error; never raises into the bar loop.
+        """
+        if not self.is_connected:
+            LOGGER.warning(
+                "[ib_client] find_open_order_by_id skipped id=%s — not connected", order_id
+            )
+            return None
+        try:
+            for trade in self._ib.openTrades():
+                order = getattr(trade, "order", None)
+                if order is not None and getattr(order, "orderId", None) == order_id:
+                    return order
+            return None
+        except Exception as exc:  # noqa: BLE001 — must never raise into the bar loop
+            LOGGER.warning(
+                "[ib_client] find_open_order_by_id error id=%s type=%s msg=%s",
+                order_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
     async def get_historical_bars(
         self,
         contract: Contract,
