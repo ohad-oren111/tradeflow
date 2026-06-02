@@ -34,6 +34,22 @@ def _env_int(key: str, default: int) -> int:
     return int(raw)
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() not in ("0", "false", "no")
+
+
+def _env_opt_float(key: str) -> float | None:
+    """Like _env_float but returns None when unset — for genuinely optional knobs
+    (e.g. allocation) where 'unset' has distinct meaning from any numeric default."""
+    raw = os.getenv(key)
+    if raw is None or raw == "":
+        return None
+    return float(raw)
+
+
 @dataclass(frozen=True)
 class RiskParams:
     # Kill switch thresholds (per SeanBot pattern 7)
@@ -43,6 +59,24 @@ class RiskParams:
     max_consecutive_losses: int = 6  # bug detector
     # Kill-switch master enable (safety circuit breaker — can only STOP trading).
     kill_switch_enabled: bool = True
+
+    # PR A — tiered kill switch (all env-tunable, no code change to retune).
+    # Default = KEEP TRADING. A 6–9 consecutive-loss streak NOTIFIES once (no
+    # pause); only >=10 consecutive losses or a realized drawdown >= 33% of the
+    # configured allocation (since the epoch) PAUSES (raises the halt + flattens).
+    #   KILL_SWITCH_WARN_CONSEC_LOSSES — notify-only streak threshold.
+    #   KILL_SWITCH_HALT_CONSEC_LOSSES — hard-halt streak threshold.
+    #   KILL_SWITCH_ALLOCATION_USD     — None/unset → % drawdown brake INERT (loud
+    #                                    startup warning); set to make it active.
+    #   KILL_SWITCH_MAX_DRAWDOWN_PCT   — % of allocation (whole number, e.g. 33).
+    #   KILL_SWITCH_PNL_EPOCH          — ISO ts; drawdown measured from here.
+    #                                    Empty → deploy time (pre-deploy losses
+    #                                    don't count). See [[kill-switch-retune]].
+    kill_switch_warn_consec_losses: int = 6
+    kill_switch_halt_consec_losses: int = 10
+    kill_switch_allocation_usd: float | None = None
+    kill_switch_max_drawdown_pct: float = 33.0
+    kill_switch_pnl_epoch: str = ""
     # Equity base for the daily/weekly drawdown % triggers. None → use the live
     # broker NetLiquidation each poll. NOTE: on the ~$1M paper account, 8%/15% of
     # net-liq is ~$80k/$150k, so the DD triggers are very loose for a 2-contract
@@ -131,6 +165,13 @@ RISK = RiskParams(
     trail_offset_pts=_env_float("TRAIL_OFFSET", 150.0),
     # PR C — feed-gap tolerance (missing bars) before invalidate + re-seed.
     bar_gap_max_tolerance_bars=_env_int("BAR_GAP_MAX_TOLERANCE_BARS", 1),
+    # PR A — tiered kill switch (env-tunable; default keeps trading).
+    kill_switch_enabled=_env_bool("KILL_SWITCH_ENABLED", True),
+    kill_switch_warn_consec_losses=_env_int("KILL_SWITCH_WARN_CONSEC_LOSSES", 6),
+    kill_switch_halt_consec_losses=_env_int("KILL_SWITCH_HALT_CONSEC_LOSSES", 10),
+    kill_switch_allocation_usd=_env_opt_float("KILL_SWITCH_ALLOCATION_USD"),
+    kill_switch_max_drawdown_pct=_env_float("KILL_SWITCH_MAX_DRAWDOWN_PCT", 33.0),
+    kill_switch_pnl_epoch=_env_str("KILL_SWITCH_PNL_EPOCH", ""),
 )
 # Lowercase alias for consumers that prefer `risk_params.x` over `RISK.x`.
 risk_params = RISK
