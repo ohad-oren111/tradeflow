@@ -4,8 +4,141 @@ from __future__ import annotations
 
 import pytest
 
-from src.execution.bracket import build_bracket, build_protective_stop
+from src.execution.bracket import (
+    build_bracket,
+    build_entry_oca_bracket,
+    build_protective_stop,
+)
 from src.state_machine import Direction
+
+# --------------------------------------------------------------------- PR B —
+# build_entry_oca_bracket: native server-side OCA bracket (parent + fixed STP +
+# trailing/fixed TP). Replaces the standalone-STP entry design (Task E.1 fix).
+
+
+def _oca(direction=Direction.LONG, qty=2, exit_mode="trailing", entry_ref=20000.0):
+    return build_entry_oca_bracket(
+        direction=direction,
+        qty=qty,
+        entry_type="MKT",
+        entry_lmt_price=None,
+        stop_price=entry_ref - 75.0,
+        target_price=entry_ref + 150.0,
+        exit_mode=exit_mode,
+        trail_offset=150.0,
+        entry_ref_price=entry_ref,
+        oca_group="tf-exit-abc12345",
+    )
+
+
+def test_oca_bracket_returns_three_legs():
+    result = _oca()
+    assert len(result) == 3
+
+
+def test_oca_trailing_places_fixed_stp_and_trailing_tp_in_one_oca_group():
+    parent, stop_child, tp_child = _oca(exit_mode="trailing", entry_ref=20000.0)
+    # Parent entry.
+    assert parent.action == "BUY"
+    assert parent.orderType == "MKT"
+    assert parent.transmit is False
+    # Fixed protective stop @ entry-75 — STP, never a TRAIL.
+    assert stop_child.action == "SELL"
+    assert stop_child.orderType == "STP"
+    assert stop_child.auxPrice == 20000.0 - 75.0
+    assert stop_child.transmit is False
+    # Trailing take-profit — TRAIL with the offset as the trailing amount.
+    assert tp_child.action == "SELL"
+    assert tp_child.orderType == "TRAIL"
+    assert tp_child.auxPrice == 150.0
+    assert tp_child.transmit is True
+    # Both exit legs share ONE OCA group with ocaType=1 (one fill cancels sibling).
+    assert stop_child.ocaGroup == tp_child.ocaGroup == "tf-exit-abc12345"
+    assert stop_child.ocaType == 1
+    assert tp_child.ocaType == 1
+
+
+def test_oca_fixed_stop_never_trails():
+    # In BOTH modes the protective stop is a fixed STP — never a TRAIL.
+    for mode in ("trailing", "fixed"):
+        _parent, stop_child, _tp = _oca(exit_mode=mode)
+        assert stop_child.orderType == "STP"
+        assert stop_child.auxPrice == 20000.0 - 75.0
+
+
+def test_oca_trailing_tp_initial_trigger_is_one_offset_below_entry_long():
+    _parent, _stop, tp_child = _oca(
+        direction=Direction.LONG, exit_mode="trailing", entry_ref=20000.0
+    )
+    # LONG sell-trail starts one full offset below the entry reference and ratchets up.
+    assert tp_child.trailStopPrice == 20000.0 - 150.0
+
+
+def test_oca_trailing_tp_initial_trigger_is_one_offset_above_entry_short():
+    _parent, _stop, tp_child = _oca(
+        direction=Direction.SHORT, exit_mode="trailing", entry_ref=20000.0
+    )
+    assert tp_child.action == "BUY"
+    assert tp_child.trailStopPrice == 20000.0 + 150.0
+
+
+def test_oca_fixed_mode_is_legacy_lmt_take_profit_no_regression():
+    _parent, stop_child, tp_child = _oca(exit_mode="fixed", entry_ref=20000.0)
+    # Fixed mode = legacy LMT take-profit, no TRAIL fields.
+    assert tp_child.orderType == "LMT"
+    assert tp_child.lmtPrice == 20000.0 + 150.0
+    assert tp_child.transmit is True
+    # Stop unchanged, still OCA-grouped with the LMT.
+    assert stop_child.orderType == "STP"
+    assert stop_child.ocaGroup == tp_child.ocaGroup
+
+
+def test_oca_both_exit_legs_are_gtc_outside_rth():
+    _parent, stop_child, tp_child = _oca(exit_mode="trailing")
+    assert stop_child.tif == "GTC"
+    assert tp_child.tif == "GTC"
+    assert stop_child.outsideRth is True
+    assert tp_child.outsideRth is True
+
+
+def test_oca_transmit_chains_on_last_leg_only():
+    parent, stop_child, tp_child = _oca()
+    # Only the final leg (tp_child) transmits → the whole bracket submits atomically.
+    assert parent.transmit is False
+    assert stop_child.transmit is False
+    assert tp_child.transmit is True
+
+
+def test_oca_rejects_bad_exit_mode():
+    with pytest.raises(ValueError, match="unsupported exit_mode"):
+        build_entry_oca_bracket(
+            direction=Direction.LONG,
+            qty=2,
+            entry_type="MKT",
+            entry_lmt_price=None,
+            stop_price=19925.0,
+            target_price=20150.0,
+            exit_mode="bogus",  # type: ignore[arg-type]
+            trail_offset=150.0,
+            entry_ref_price=20000.0,
+            oca_group="tf-exit-x",
+        )
+
+
+def test_oca_trailing_rejects_non_positive_offset():
+    with pytest.raises(ValueError, match="trail_offset must be positive"):
+        build_entry_oca_bracket(
+            direction=Direction.LONG,
+            qty=2,
+            entry_type="MKT",
+            entry_lmt_price=None,
+            stop_price=19925.0,
+            target_price=20150.0,
+            exit_mode="trailing",
+            trail_offset=0.0,
+            entry_ref_price=20000.0,
+            oca_group="tf-exit-x",
+        )
 
 
 def test_long_market_parent_has_transmit_false():

@@ -20,8 +20,9 @@ from typing import Any
 from ib_async import Contract, Order, Trade
 
 from config.instruments import MNQ
+from config.risk_params import RISK
 from src.clients.ib_client import IBClient
-from src.execution.bracket import build_bracket, build_protective_stop
+from src.execution.bracket import build_entry_oca_bracket, build_protective_stop
 from src.execution.dirty_set import DirtySet
 from src.state_machine import (
     Direction,
@@ -145,29 +146,55 @@ class OrderRouter:
 
         lc = await self._sm.create_lifecycle(signal.instrument, self._strategy_name, direction)
 
+        # PR B — native server-side OCA bracket: entry parent + fixed-STP child +
+        # trailing-TP child, all submitted atomically (transmit chains on the last
+        # leg). The OCA group lets a fill on one exit leg cancel the sibling
+        # broker-side, and the parentId linkage makes the protective STP a native
+        # bracket leg that SURVIVES a client disconnect/redeploy (Task E.1 fix).
+        oca_group = f"tf-exit-{lc.lifecycle_id[:8]}"
         try:
-            parent, tp_child = build_bracket(
+            parent, stop_child, tp_child = build_entry_oca_bracket(
                 direction=direction,
                 qty=qty,
                 entry_type="MKT",
                 entry_lmt_price=None,
+                stop_price=signal.stop_price,
                 target_price=signal.target_price,
+                exit_mode=RISK.exit_mode,
+                trail_offset=RISK.trail_offset_pts,
+                entry_ref_price=signal.entry_price,
+                oca_group=oca_group,
             )
             LOGGER.info(
-                "[EXEC] %s: place_parent — direction=%s qty=%s type=MKT",
+                "[EXEC] %s: place_parent — direction=%s qty=%s type=MKT exit_mode=%s oca=%s",
                 signal.instrument,
                 direction.value,
                 qty,
+                RISK.exit_mode,
+                oca_group,
             )
             parent_trade = await self._ib.place_order(contract, parent)
             parent_order_id = self._order_id_of(parent_trade)
 
-            tp_child.parentId = parent_order_id
+            stop_child.parentId = parent_order_id
             LOGGER.info(
-                "[EXEC] %s: place_tp — parent_id=%s lmt=%.2f",
+                "[EXEC] %s: place_stop_child — parent_id=%s stp=%.2f (oca=%s)",
                 signal.instrument,
                 parent_order_id,
+                signal.stop_price,
+                oca_group,
+            )
+            stop_trade = await self._ib.place_order(contract, stop_child)
+            stop_order_id = self._order_id_of(stop_trade)
+
+            tp_child.parentId = parent_order_id
+            LOGGER.info(
+                "[EXEC] %s: place_tp — parent_id=%s mode=%s target=%.2f trail_offset=%.2f",
+                signal.instrument,
+                parent_order_id,
+                RISK.exit_mode,
                 signal.target_price,
+                RISK.trail_offset_pts,
             )
             tp_trade = await self._ib.place_order(contract, tp_child)
             tp_order_id = self._order_id_of(tp_trade)
@@ -193,6 +220,7 @@ class OrderRouter:
             },
             entry_order_id=parent_order_id,
             target_order_id=tp_order_id,
+            stop_order_id=stop_order_id,
             stop_price=signal.stop_price,
             target_price=signal.target_price,
         )
@@ -201,6 +229,7 @@ class OrderRouter:
         self._contracts[lc.lifecycle_id] = contract
         self._by_order_id[parent_order_id] = lc
         self._by_order_id[tp_order_id] = lc
+        self._by_order_id[stop_order_id] = lc
         self._mark_dirty(lc.lifecycle_id)
         # PR #14 — operator alert (Telegram picks this up via the [ALERT] log handler).
         LOGGER.info(
@@ -311,16 +340,19 @@ class OrderRouter:
 
         fill_qty, fill_price, fill_time = self._extract_fill(trade)
 
-        # Place the protective STP synchronously per §0.5.T5, via the shared
-        # idempotent helper so this path and the reconciler force-fill path
-        # cannot diverge (both place an outsideRth=True stop). Fresh parent fill
-        # → no stop exists yet, so existing_stop_is_live=False.
+        # PR B — the protective STP is now placed up-front as a native OCA bracket
+        # child (see place_entry), so on a normal fill it already rests at the
+        # broker (lc.stop_order_id is set). ensure_protective_stop is idempotent:
+        # existing_stop_is_live=True → it returns the existing id (no double-place).
+        # It remains a BACKSTOP — if the bracket child somehow failed to record a
+        # stop id, this places one synchronously per §0.5.T5 (never naked).
+        stop_already_resting = lc.stop_order_id is not None
         stp_order_id = await ensure_protective_stop(
             self._ib,
             contract,
             lc,
             qty=fill_qty or self._contracts_per_signal(),
-            existing_stop_is_live=False,
+            existing_stop_is_live=stop_already_resting,
             component="ROUTER",
             path="parent_fill",
         )
@@ -346,14 +378,15 @@ class OrderRouter:
         trade: Trade,
         reason: ExitReason,
     ) -> None:
-        # W-S15.1 — cancel the resting sibling bracket leg(s) FIRST so nothing is
-        # left working once this lifecycle reaches CLOSED. The protective STP is a
-        # standalone GTC order (§0.5.T2: parentId=0, NOT OCA-linked to the TP
-        # child), so the broker will not auto-cancel the survivor on a fill — an
-        # uncancelled SELL leg would rest with no position and could flip the
-        # long-only bot SHORT if hit. The orders were placed under our own
-        # clientId, so cancelOrder-by-id is a same-client cancel (never IB error
-        # 10147, the foreign-client trap that defeats side-scripts).
+        # W-S15.1 / PR B — cancel the resting sibling bracket leg(s) so nothing is
+        # left working once this lifecycle reaches CLOSED. As of PR B the exit pair
+        # is a native OCA group (ocaType=1), so the broker AUTO-cancels the
+        # survivor on a fill — this explicit cancel is now a same-client backstop
+        # that is a logged no-op when OCA already cleared the sibling. It still
+        # matters for the legacy/recovered standalone-STP rows (#80 heal) and for
+        # MANUAL/EOD market exits. An uncancelled SELL leg resting with no position
+        # could flip the long-only bot SHORT if hit. Same-client cancel-by-id never
+        # hits IB error 10147 (the foreign-client trap that defeats side-scripts).
         await self._cancel_sibling_legs(lc, reason, self._order_id_of(trade))
 
         fill_qty, fill_price, fill_time = self._extract_fill(trade)

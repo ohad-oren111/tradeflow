@@ -85,6 +85,107 @@ def build_bracket(
     return parent, tp_child
 
 
+def build_entry_oca_bracket(
+    *,
+    direction: Direction,
+    qty: int,
+    entry_type: Literal["MKT", "LMT"],
+    entry_lmt_price: float | None,
+    stop_price: float,
+    target_price: float,
+    exit_mode: Literal["trailing", "fixed"],
+    trail_offset: float,
+    entry_ref_price: float,
+    oca_group: str,
+) -> tuple[Order, Order, Order]:
+    """Return ``(parent, stop_child, tp_child)`` — a native server-side OCA bracket.
+
+    PR B — supersedes the §0.5.T2 standalone-STP design for the *entry* path. The
+    protective STP is now a bracket child sharing ``parentId`` with the entry and
+    an OCA group (``ocaType=1``) with the take-profit leg, so IBKR holds the exit
+    pair as a native bracket that SURVIVES a client disconnect / container
+    redeploy. This is the root-cause fix for the client-simulated-stop-cancelled-
+    on-disconnect incident (Task E.1, #80/#81). The #80 reconciler self-heal and
+    the post-fill :func:`ensure_protective_stop` stay as backstops for the
+    residual window between the parent fill and the OCA group activating.
+
+    - ``stop_child`` is ALWAYS a fixed STP @ ``stop_price`` — it NEVER trails.
+    - ``tp_child`` is a trailing stop (``TRAIL``, ``auxPrice=trail_offset``) when
+      ``exit_mode='trailing'`` (default), else a fixed LMT @ ``target_price``
+      (``exit_mode='fixed'`` = revert to the legacy take-profit, no regression).
+    - Both children: GTC, ``outsideRth=True`` (live overnight Globex), same
+      ``oca_group`` with ``ocaType=1`` (one fill cancels the sibling broker-side).
+
+    Transmit chaining: ``parent.transmit=False``, ``stop_child.transmit=False``,
+    ``tp_child.transmit=True`` — placing the three in order (parent → stop → tp)
+    submits the whole bracket atomically once the final leg arrives, so a failure
+    before the last leg leaves nothing live (never a naked parent). The caller
+    MUST set both children's ``parentId`` to the parent's broker-assigned orderId
+    between the parent placement and each child placement.
+    """
+    if qty <= 0:
+        raise ValueError(f"qty must be positive, got {qty}")
+    if entry_type == "LMT" and entry_lmt_price is None:
+        raise ValueError("entry_type='LMT' requires entry_lmt_price")
+    if entry_type not in ("MKT", "LMT"):
+        raise ValueError(f"unsupported entry_type={entry_type!r}")
+    if exit_mode not in ("trailing", "fixed"):
+        raise ValueError(f"unsupported exit_mode={exit_mode!r}")
+    if exit_mode == "trailing" and trail_offset <= 0:
+        raise ValueError(f"trail_offset must be positive, got {trail_offset}")
+
+    exit_action = _exit_action(direction)
+
+    parent = Order()
+    parent.action = _entry_action(direction)
+    parent.totalQuantity = qty
+    parent.orderType = entry_type
+    if entry_type == "LMT":
+        parent.lmtPrice = float(entry_lmt_price)  # type: ignore[arg-type]
+    parent.transmit = False
+    parent.tif = "DAY"
+
+    # Fixed protective stop — never trails. STP @ stop_price.
+    stop_child = Order()
+    stop_child.action = exit_action
+    stop_child.totalQuantity = qty
+    stop_child.orderType = "STP"
+    stop_child.auxPrice = float(stop_price)
+    stop_child.tif = "GTC"
+    stop_child.outsideRth = True
+    stop_child.ocaGroup = oca_group
+    stop_child.ocaType = 1
+    stop_child.transmit = False
+
+    # Take-profit leg — trailing stop (default) or fixed LMT (revert mode).
+    tp_child = Order()
+    tp_child.action = exit_action
+    tp_child.totalQuantity = qty
+    tp_child.tif = "GTC"
+    tp_child.outsideRth = True
+    tp_child.ocaGroup = oca_group
+    tp_child.ocaType = 1
+    tp_child.transmit = True
+    if exit_mode == "trailing":
+        tp_child.orderType = "TRAIL"
+        tp_child.auxPrice = float(trail_offset)
+        # Initial trigger sits one full offset away from the entry reference, on
+        # the protective side. IB ratchets it as the position runs in profit
+        # (LONG sell-trail: up; SHORT buy-trail: down) and never loosens it. It
+        # sits below the fixed STP until price has run ~one stop-distance in
+        # profit, so the fixed STP governs early downside and the trail locks in
+        # gains thereafter — the SeanBot V3 trailing-exit behaviour (handoff §13).
+        if direction is Direction.LONG:
+            tp_child.trailStopPrice = float(entry_ref_price) - float(trail_offset)
+        else:
+            tp_child.trailStopPrice = float(entry_ref_price) + float(trail_offset)
+    else:
+        tp_child.orderType = "LMT"
+        tp_child.lmtPrice = float(target_price)
+
+    return parent, stop_child, tp_child
+
+
 def build_protective_stop(
     *,
     direction: Direction,

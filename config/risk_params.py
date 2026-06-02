@@ -9,7 +9,22 @@ Field names aligned with the SeanBot signal-detection reference in PR #10:
 No value tuning vs the prior defaults — only field renames + additions.
 """
 
+import os
 from dataclasses import dataclass
+
+
+def _env_str(key: str, default: str) -> str:
+    raw = os.getenv(key)
+    if raw is None or raw == "":
+        return default
+    return raw
+
+
+def _env_float(key: str, default: float) -> float:
+    raw = os.getenv(key)
+    if raw is None or raw == "":
+        return default
+    return float(raw)
 
 
 @dataclass(frozen=True)
@@ -49,6 +64,15 @@ class RiskParams:
     take_profit_pts: float = 150.0
     cooldown_bars: int = 10
 
+    # PR B — exit mode for the take-profit leg of the native OCA entry bracket.
+    # "trailing" (default): TP is a TRAIL stop trailing `trail_offset_pts` behind
+    # the peak, locking in profit (SeanBot V3 handoff §13). "fixed": legacy LMT
+    # take-profit @ entry+take_profit_pts (no regression / kill-switch revert).
+    # The fixed protective STP @ entry-stop_loss_pts is ALWAYS present and NEVER
+    # trails, in either mode. Env: EXIT_MODE, TRAIL_OFFSET.
+    exit_mode: str = "trailing"
+    trail_offset_pts: float = 150.0
+
     # Session-edge buffer applied to every transition (Sunday open, CME daily
     # break boundaries, Friday weekend cutoff). Minutes, wall-clock.
     session_edge_no_trade_minutes: int = 5
@@ -80,6 +104,17 @@ class RiskParams:
     gateway_restart_end_et: str = "00:15"
 
 
-RISK = RiskParams()
+def _load_exit_mode() -> str:
+    mode = _env_str("EXIT_MODE", "trailing").strip().lower()
+    if mode not in ("trailing", "fixed"):
+        raise RuntimeError(f"Invalid EXIT_MODE={mode!r}; must be 'trailing' or 'fixed'.")
+    return mode
+
+
+RISK = RiskParams(
+    # PR B — env-tunable exit knobs (default = trailing TP, 150pt offset).
+    exit_mode=_load_exit_mode(),
+    trail_offset_pts=_env_float("TRAIL_OFFSET", 150.0),
+)
 # Lowercase alias for consumers that prefer `risk_params.x` over `RISK.x`.
 risk_params = RISK
