@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from config.instruments import MNQ
+from config.risk_params import RISK
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.execution.dirty_set import DirtySet
@@ -1021,6 +1023,77 @@ async def test_heal_no_placement_when_flat():
     await rec.reconcile_one(_make_lifecycle(State.ACTIVE))
 
     ib.place_order.assert_not_awaited()  # FLAT → never place; the close path owns this
+
+
+# -------- PR 99: leg-heal is exit-mode-aware (§0.5.196 / WO5) --------
+
+
+def _set_exit_mode(monkeypatch, mode: str) -> None:
+    """Override the reconciler's resolved RISK with a chosen exit_mode (frozen → replace)."""
+    monkeypatch.setattr("src.execution.reconciler.RISK", replace(RISK, exit_mode=mode))
+
+
+async def test_heal_trailing_skips_target_rearm_but_heals_missing_stop(monkeypatch, caplog):
+    """Trailing mode + ACTIVE position with the STP gone and NO resting TARGET (trailing
+    entry shape: target_order_id=None): the reconciler re-places the STOP but NEVER
+    re-arms a TARGET (the §0.5.196 hybrid). Asserts on placed order TYPES."""
+    _set_exit_mode(monkeypatch, "trailing")
+    ib = _make_mock_ib(
+        positions=[_make_position(qty=2)],
+        open_trades=[],  # stop 1003 gone; trailing lifecycle never had a target order
+    )
+    ib.place_order = AsyncMock(return_value=_placed(9001))  # STP only — a 2nd call is a bug
+    db = _make_mock_db()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, db=db)
+
+    with caplog.at_level(logging.INFO):
+        action = await rec.reconcile_one(_make_lifecycle(State.ACTIVE, target_order_id=None))
+
+    assert action is ReconcileAction.HEALED
+    ib.place_order.assert_awaited_once()  # exactly one leg placed
+    placed = [c.args[1] for c in ib.place_order.await_args_list]
+    assert [o.orderType for o in placed] == ["STP"]  # STOP healed, NO LMT TARGET re-armed
+    assert any("target_heal_skipped" in r.message for r in caplog.records)
+    assert db.update_lifecycle.await_args.args[1] == {"stop_order_id": 9001}  # no target id
+
+
+async def test_heal_trailing_healthy_position_is_noop_no_target_rearm(monkeypatch):
+    """Trailing mode + ACTIVE position with the STP resident and (correctly) no TARGET:
+    the position is healthy — the reconciler must NOT treat the absent target as a gap
+    and must place nothing (no every-scan re-arm / log-spam)."""
+    _set_exit_mode(monkeypatch, "trailing")
+    ib = _make_mock_ib(
+        positions=[_make_position(qty=2)],
+        open_trades=[_make_open_trade(1003)],  # STP resident; no target order exists
+    )
+    ib.place_order = AsyncMock()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib)
+
+    action = await rec.reconcile_one(_make_lifecycle(State.ACTIVE, target_order_id=None))
+
+    assert action is ReconcileAction.NOOP
+    ib.place_order.assert_not_awaited()  # healthy trailing position → nothing to heal
+
+
+async def test_heal_fixed_rearms_missing_target(monkeypatch):
+    """Regression lock: fixed mode + ACTIVE position with the STP resident and the TARGET
+    missing → the reconciler re-arms the LMT TARGET exactly as before."""
+    _set_exit_mode(monkeypatch, "fixed")
+    ib = _make_mock_ib(
+        positions=[_make_position(qty=2)],
+        open_trades=[_open_trade_oca(1003, "grp-S")],  # stop resident; target 1002 gone
+    )
+    ib.place_order = AsyncMock(return_value=_placed(9201))  # LMT only
+    db = _make_mock_db()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, db=db)
+
+    action = await rec.reconcile_one(_make_lifecycle(State.ACTIVE))
+
+    assert action is ReconcileAction.HEALED
+    ib.place_order.assert_awaited_once()
+    placed = ib.place_order.await_args.args[1]
+    assert placed.orderType == "LMT" and placed.lmtPrice == 17600.0  # re-armed take-profit
+    assert db.update_lifecycle.await_args.args[1] == {"target_order_id": 9201}
 
 
 async def test_heal_failure_is_swallowed_and_alerts(caplog):

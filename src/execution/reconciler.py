@@ -26,11 +26,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from config.instruments import MNQ
+from config.risk_params import RISK
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.execution.bracket import build_bracket, build_protective_stop
 from src.execution.dirty_set import DirtySet
-from src.execution.router import ensure_protective_stop
+from src.execution.router import ensure_protective_stop, should_heal_target
 from src.state_machine import (
     Direction,
     ExitReason,
@@ -362,25 +363,37 @@ class Reconciler:
                     updates["stop_order_id"],
                 )
             if not target_order_open and lifecycle.target_price is not None:
-                _parent, tp = build_bracket(
-                    direction=direction,
-                    qty=qty,
-                    entry_type="MKT",
-                    entry_lmt_price=None,
-                    target_price=float(lifecycle.target_price),
-                )
-                tp.parentId = 0  # standalone — not stitched to a (non-existent) parent
-                tp.ocaGroup = oca_group
-                tp.ocaType = _HEAL_OCA_TYPE
-                trade = await self._ib.place_order(contract, tp)
-                updates["target_order_id"] = _order_id_of(trade)
-                LOGGER.warning(
-                    "[RECOVER] %s: target missing — re-placed LMT @%.2f oca=%s id=%s",
-                    lifecycle.lifecycle_id,
-                    float(lifecycle.target_price),
-                    oca_group,
-                    updates["target_order_id"],
-                )
+                # Exit-mode-aware (§0.5.196 / WO5): in trailing mode there is NO
+                # resting TARGET to heal — the bar-close ratchet walks the STP, and
+                # re-arming a +offset LMT would cap upside (the hybrid-bracket bug).
+                # The missing STOP above is still healed in both modes (§0.5.T5).
+                if not should_heal_target(RISK.exit_mode):
+                    LOGGER.info(
+                        "[RECONCILER] %s: target_heal_skipped — exit_mode=%s "
+                        "(no resting TARGET in trailing; bar-ratchet walks the STP)",
+                        lifecycle.symbol,
+                        RISK.exit_mode,
+                    )
+                else:
+                    _parent, tp = build_bracket(
+                        direction=direction,
+                        qty=qty,
+                        entry_type="MKT",
+                        entry_lmt_price=None,
+                        target_price=float(lifecycle.target_price),
+                    )
+                    tp.parentId = 0  # standalone — not stitched to a (non-existent) parent
+                    tp.ocaGroup = oca_group
+                    tp.ocaType = _HEAL_OCA_TYPE
+                    trade = await self._ib.place_order(contract, tp)
+                    updates["target_order_id"] = _order_id_of(trade)
+                    LOGGER.warning(
+                        "[RECOVER] %s: target missing — re-placed LMT @%.2f oca=%s id=%s",
+                        lifecycle.lifecycle_id,
+                        float(lifecycle.target_price),
+                        oca_group,
+                        updates["target_order_id"],
+                    )
         except Exception as exc:  # noqa: BLE001 — never raise into the reconcile loop
             LOGGER.error(
                 "[RECOVER] %s: heal_failed — %s: %s (position may be unprotected)",
@@ -416,7 +429,12 @@ class Reconciler:
             # Self-heal: a live position whose protective leg is gone (e.g. a GTC
             # stop that didn't survive a redeploy) is unprotected — re-place any
             # missing bracket leg. Idempotent: both legs resident → nothing to do.
-            if not (stop_order_open and target_order_open):
+            # Exit-mode-aware (§0.5.196): in trailing mode there is intentionally no
+            # resting TARGET (the bar-ratchet walks the STP), so a "missing" target is
+            # expected — treat it as healthy here so a healthy trailing position isn't
+            # re-healed (and target_heal_skipped-logged) every scan.
+            target_healthy = target_order_open or not should_heal_target(RISK.exit_mode)
+            if not (stop_order_open and target_healthy):
                 healed = await self._heal_missing_legs(
                     lifecycle,
                     positions=positions,
