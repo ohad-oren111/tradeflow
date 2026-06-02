@@ -102,13 +102,17 @@ class RiskParams:
     ma_slow: int = 100
     ma_touch_buffer_pts: float = 5.0
     ma_min_gap_pts: float = 0.5  # SeanBot V3 config/settings.py:44 (PR #33)
-    # Candle-confirmation tolerance for the LONG bullish gate (W-S14.2 Track 2,
-    # operator-approved D-1). bullish_ok := close >= open - ma_bullish_tolerance_pts.
-    # 0.0 reproduces the prior strict close>=open; the A-S14.1 calibration backtest
-    # showed the strict gate rejected 7/12 captured SeanBot entries on flat/near-doji
-    # 1-min touch bars. 2.0pt recovered 8/12 (from 2/12) at +1 realistic trade/day.
-    # Entry-filter threshold only — regime/stop/SL/TP/kill-switch are unchanged.
-    ma_bullish_tolerance_pts: float = 2.0
+    # Candle-confirmation tolerance for the LONG bullish gate. bullish_ok :=
+    # close >= open - ma_bullish_tolerance_pts; 0.0 == SeanBot's strict close>=open.
+    # PR-1 (entry-gate parity): default reset 2.0 -> 0.0 to match SeanBot's CURRENT
+    # live Python (`close > open`, ma_bounce.py check_signal). Env-tunable via
+    # BULLISH_TOLERANCE. CONFLICT FLAG: TF's older W-S14.2 calibration (against
+    # captured SeanBot Telegram entries) found strict close>open matched only 2/12
+    # of those fires vs 8/12 at 2.0pt — i.e. SeanBot was THEN more permissive. The
+    # operator's parity target now says strict; if SeanBot's live code has not
+    # tightened since W-S14.2 this may REDUCE live parity — set BULLISH_TOLERANCE=2.0
+    # to revert. (Entry-filter only; exit/SL/TP/kill-switch unchanged.)
+    ma_bullish_tolerance_pts: float = 0.0
     stop_loss_pts: float = 75.0
     take_profit_pts: float = 150.0
     cooldown_bars: int = 10
@@ -155,7 +159,10 @@ class RiskParams:
     # SeanBot C1 regime gate — 30-min EMA200 level filter for LONG entries.
     # When True, detect_signal blocks LONG signals if current price <= 30m EMA200.
     # Fail-open on warmup (<202 30-min bars), missing timestamps, or exception.
-    regime_gate_enabled: bool = True
+    # PR-1 (entry-gate parity): default reset True -> False — the operator removed
+    # the regime gate from SeanBot's live check_signal, so TF EXCLUDES it for
+    # parity. Code retained (env-tunable via REGIME_GATE_ENABLED) for reversibility.
+    regime_gate_enabled: bool = False
 
     # EOD force-close — fires on ``force_close_weekday`` at ``force_close_et``.
     # Default is Friday at 16:25 ET (5 min before the weekend cutoff at 16:30 ET).
@@ -202,6 +209,11 @@ RISK = RiskParams(
     # Tolerate up to N consecutive transient evaluator faults before halting
     # (default 3; never treated as 0 — a 0 would halt on the first blip).
     kill_switch_max_consec_eval_errors=_env_int("KILL_SWITCH_MAX_CONSEC_EVAL_ERRORS", 3),
+    # PR-1 — entry-gate parity with SeanBot live check_signal (env-tunable):
+    #   BULLISH_TOLERANCE (0.0 = strict close>=open),
+    #   REGIME_GATE_ENABLED (False = excluded, per operator).
+    ma_bullish_tolerance_pts=_env_float("BULLISH_TOLERANCE", 0.0),
+    regime_gate_enabled=_env_bool("REGIME_GATE_ENABLED", False),
 )
 # Lowercase alias for consumers that prefer `risk_params.x` over `RISK.x`.
 risk_params = RISK
