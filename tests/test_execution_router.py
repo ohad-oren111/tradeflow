@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from config.instruments import MNQ
+from config.risk_params import RISK
 from src.clients.ib_client import IBClient
 from src.execution.dirty_set import DirtySet
 from src.execution.router import OrderRouter
@@ -99,6 +101,15 @@ def _make_trade_with_fill(order_id: int, qty: int, price: float) -> MagicMock:
     fill.execution.avgPrice = price
     fill.execution.time = datetime(2026, 5, 21, 15, 0, tzinfo=UTC)
     trade.fills = [fill]
+    return trade
+
+
+def _make_trade_with_status(order_id: int, status: str) -> MagicMock:
+    """Trade whose orderStatus.status is set, for _confirm_order_resting() —
+    'PreSubmitted'/'Submitted' read as resting, 'Inactive'/'Cancelled' as dead."""
+    trade = _make_trade(order_id)
+    trade.orderStatus = MagicMock()
+    trade.orderStatus.status = status
     return trade
 
 
@@ -630,3 +641,177 @@ async def test_router_without_dirty_set_is_safe_to_use():
     router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)  # no dirty_set
     lc = await router.place_entry(_make_signal(), _make_contract())  # must not raise
     assert lc is entering_lc
+
+
+# ----------------------------------------- §13a trailing handoff (EXIT_MODE=trailing)
+# On a NEW entry fill in trailing mode the router places a STANDALONE post-fill
+# TRAIL (parentId=0 → dodges Error 328), OCA-linked to the entry bracket's fixed
+# STP, confirms it rests, THEN cancels the fixed STP — never naked, never two
+# independent sell-stops. Recovery never triggers it. Fixed mode is untouched.
+
+
+def _trailing_router(monkeypatch):
+    """Patch the router's RISK to EXIT_MODE=trailing and return a fresh router/ib/sm."""
+    monkeypatch.setattr("src.execution.router.RISK", replace(RISK, exit_mode="trailing"))
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    return ib, sm
+
+
+def _entering_trailing_lc() -> Lifecycle:
+    # Trailing entry: fixed STP already resting (id 2002); NO TP child → target None.
+    return _make_lifecycle(State.ENTERING, stop_order_id=2002, target_order_id=None)
+
+
+async def test_on_fill_trailing_places_standalone_trail_and_cancels_fixed_stp(monkeypatch):
+    ib, sm = _trailing_router(monkeypatch)
+    entering_lc = _entering_trailing_lc()
+    sm.transition.return_value = _make_lifecycle(State.ACTIVE)
+
+    # Exactly ONE placement during on_fill = the standalone TRAIL (the fixed STP
+    # already rests, so ensure_protective_stop is a no-op).
+    ib.place_order = AsyncMock(return_value=_make_trade_with_status(7001, "PreSubmitted"))
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[entering_lc.entry_order_id] = entering_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[entering_lc.lifecycle_id] = entering_lc
+    contract = _make_contract()
+    contract.exchange = ""  # force the §0.5.192 CME assignment
+    router._contracts[entering_lc.lifecycle_id] = contract
+
+    trade = _make_trade_with_fill(entering_lc.entry_order_id, qty=2, price=20000.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    ib.place_order.assert_awaited_once()
+    placed = ib.place_order.await_args.args[1]
+    assert placed.orderType == "TRAIL"
+    assert placed.parentId == 0  # standalone — dodges Error 328
+    assert placed.auxPrice == RISK.trail_offset_pts
+    assert placed.trailStopPrice == 20000.0 - RISK.stop_loss_pts  # initial trigger = entry-75
+    assert placed.tif == "GTC" and placed.outsideRth is True
+    assert placed.ocaGroup.startswith("tf-exit-")  # OCA-linked to the fixed STP
+    assert contract.exchange == "CME"  # §0.5.192
+    # Fixed STP cancelled AFTER the trail is confirmed resting — never naked.
+    ib.cancel_order_by_id.assert_awaited_once_with(2002)
+    # The ACTIVE transition records the TRAIL as the protective stop.
+    transition_call = sm.transition.await_args
+    assert transition_call.args[1] is State.ACTIVE
+    assert transition_call.kwargs["stop_order_id"] == 7001
+
+
+async def test_on_fill_trailing_trail_initial_trigger_is_below_entry_long(monkeypatch):
+    # Ratchet floor: the LONG trail starts BELOW entry (entry-75) and IBKR only
+    # ratchets it UP server-side — it never moves down. The code's contribution is
+    # the protective initial trigger; the up-only ratchet is the TRAIL order type.
+    ib, sm = _trailing_router(monkeypatch)
+    entering_lc = _entering_trailing_lc()
+    sm.transition.return_value = _make_lifecycle(State.ACTIVE)
+    ib.place_order = AsyncMock(return_value=_make_trade_with_status(7001, "Submitted"))
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[entering_lc.entry_order_id] = entering_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[entering_lc.lifecycle_id] = entering_lc
+    router._contracts[entering_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(entering_lc.entry_order_id, qty=2, price=20000.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    placed = ib.place_order.await_args.args[1]
+    assert placed.action == "SELL"  # exit a LONG
+    assert placed.trailStopPrice < 20000.0  # below entry — protective floor
+    assert placed.trailStopPrice == 20000.0 - RISK.stop_loss_pts
+    assert placed.auxPrice > 0  # a positive trailing amount → IB ratchets up only
+
+
+async def test_on_fill_trailing_placement_failure_keeps_fixed_stp_live(monkeypatch):
+    # The TRAIL placement RAISES (e.g. a broker reject) → fail-safe: keep the fixed
+    # STP (never naked), do NOT cancel it, never raise into the fill loop.
+    ib, sm = _trailing_router(monkeypatch)
+    entering_lc = _entering_trailing_lc()
+    sm.transition.return_value = _make_lifecycle(State.ACTIVE)
+    ib.place_order = AsyncMock(side_effect=RuntimeError("broker reject 328"))  # 1 call, raises
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[entering_lc.entry_order_id] = entering_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[entering_lc.lifecycle_id] = entering_lc
+    router._contracts[entering_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(entering_lc.entry_order_id, qty=2, price=20000.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)  # must NOT raise
+
+    ib.cancel_order_by_id.assert_not_awaited()  # fixed STP left live
+    transition_call = sm.transition.await_args
+    assert transition_call.kwargs["stop_order_id"] == 2002  # still the fixed STP
+
+
+async def test_on_fill_trailing_trail_not_resting_keeps_fixed_stp(monkeypatch):
+    # The TRAIL is placed but the broker reports it dead (Inactive — suspected
+    # Error 328) → keep the fixed STP, cancel the stray trail, do not hand off.
+    ib, sm = _trailing_router(monkeypatch)
+    entering_lc = _entering_trailing_lc()
+    sm.transition.return_value = _make_lifecycle(State.ACTIVE)
+    ib.place_order = AsyncMock(return_value=_make_trade_with_status(7001, "Inactive"))
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[entering_lc.entry_order_id] = entering_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[entering_lc.lifecycle_id] = entering_lc
+    router._contracts[entering_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(entering_lc.entry_order_id, qty=2, price=20000.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    # The stray/rejected trail is cancelled; the fixed STP is NOT (stays the floor).
+    ib.cancel_order_by_id.assert_awaited_once_with(7001)
+    transition_call = sm.transition.await_args
+    assert transition_call.kwargs["stop_order_id"] == 2002  # still the fixed STP
+
+
+async def test_on_fill_trailing_recovered_active_position_does_not_handoff(monkeypatch):
+    # Recovery guard: a stray parent-fill event for an ALREADY-ACTIVE (recovered)
+    # lifecycle must NOT trigger the trailing handoff (was_entering is False) — its
+    # existing bracket is left untouched. No trail placed, no cancel.
+    ib, sm = _trailing_router(monkeypatch)
+    active_lc = _make_lifecycle(State.ACTIVE, stop_order_id=2002)  # already bracketed
+    sm.transition.return_value = _make_lifecycle(State.ACTIVE)
+    ib.place_order = AsyncMock()
+    ib.cancel_order_by_id = AsyncMock()
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[active_lc.entry_order_id] = active_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[active_lc.lifecycle_id] = active_lc
+    router._contracts[active_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(active_lc.entry_order_id, qty=2, price=20000.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    ib.place_order.assert_not_awaited()  # no standalone TRAIL on a recovered position
+    ib.cancel_order_by_id.assert_not_awaited()
+
+
+async def test_on_fill_fixed_mode_does_not_place_a_trail(monkeypatch):
+    # Regression guard: in EXIT_MODE=fixed (default), a parent fill places NO trail
+    # and does NOT cancel the resting OCA STP — the {STP, LMT} bracket is untouched.
+    monkeypatch.setattr("src.execution.router.RISK", replace(RISK, exit_mode="fixed"))
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    entering_lc = _make_lifecycle(State.ENTERING, stop_order_id=2002)
+    sm.transition.return_value = _make_lifecycle(State.ACTIVE)
+    ib.place_order = AsyncMock(return_value=_make_trade(9999))
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[entering_lc.entry_order_id] = entering_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[entering_lc.lifecycle_id] = entering_lc
+    router._contracts[entering_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(entering_lc.entry_order_id, qty=2, price=20000.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    ib.place_order.assert_not_awaited()  # no trail (and STP already rests)
+    ib.cancel_order_by_id.assert_not_awaited()
+    transition_call = sm.transition.await_args
+    assert transition_call.kwargs["stop_order_id"] == 2002
