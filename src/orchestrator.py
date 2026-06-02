@@ -373,6 +373,21 @@ class Orchestrator:
             pid,
             self._healthcheck_interval,
         )
+        # PR-3 — log the RESOLVED exit mode + ladder knobs prominently at boot so
+        # the active mode is unmissable in the logs (the 16:53Z fixed-bracket-under-
+        # trailing anomaly was invisible until a broker probe). One INFO line, the
+        # single source of truth for which exit path entries will take this run.
+        LOGGER.info(
+            "[ORCH] startup: EXIT_MODE=%s — stop_loss=%.1f lock_in=%.1f trail_offset=%.1f "
+            "hard_ceiling=%.1f take_profit=%.1f (bracket=%s on new entries)",
+            RISK.exit_mode,
+            RISK.stop_loss_pts,
+            RISK.lock_in_pts,
+            RISK.trail_offset_pts,
+            RISK.hard_ceiling_pts,
+            RISK.take_profit_pts,
+            "STP-only + bar-ratchet" if RISK.exit_mode == "trailing" else "fixed STP+LMT",
+        )
         LOGGER.info(
             "[ORCH] startup: ib_connecting — host=%s port=%s client_id=%s",
             getattr(self._ib, "_host", "?"),

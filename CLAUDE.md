@@ -63,6 +63,32 @@ Your shell harness blocks the following commands. Plan around them.
 - `--dangerously-skip-permissions`
 - Writes to `.claude/`, `/home/tradeflow/.tradeflow-secrets/`, or anything under those
 
+## Bash command style — avoid self-inflicted permission prompts (READ THIS)
+
+Most prompts in this project are NOT allowlist gaps — the allowlist is already comprehensive
+(`git:*`, repo `Write`/`Edit`, `docker compose:*`, the venv + watchdog-venv pythons, etc.).
+They come from command STYLE that trips harness *security gates*, which OVERRIDE the allowlist.
+Adding more allow-entries does nothing for these. Follow these rules and the prompts disappear:
+
+1. **No brace-group + quotes + redirect.** `{ echo "x"; git log; } > /tmp/f 2>&1` trips the
+   "expansion obfuscation" gate every time, allowlist or not. Instead: issue each command as its
+   own simple Bash call (parallelize them in ONE message), or use the Read/Grep/Glob tools.
+2. **Never use `cd`.** `cd /home/tradeflow/tradeflow; <cmd>` trips the "path-resolution-bypass"
+   gate. The cwd is already the repo — use absolute paths or `git -C`, plus the dedicated tools.
+3. **No `;` / `&&` mega-commands** to "save calls." Separate Bash calls in one message run in
+   parallel. A chained command only needs one bad token (cd, brace, `VAR=`) to force a prompt.
+4. **No leading `VAR=value` env prefixes.** `GIT_COMMIT=… docker compose build` makes the matcher
+   read `GIT_COMMIT=…` as the first token, so `Bash(docker compose:*)` never matches. Put the var
+   in the compose `.env`, or eat the single once-per-deploy prompt.
+5. **Use absolute paths that match the allowlist.** `.watchdog-venv/bin/python …` prompts;
+   `/home/tradeflow/tradeflow/.watchdog-venv/bin/python …` is already allowed. Same for any binary.
+6. **Prefer dedicated tools over shell-outs.** Read/Grep/Glob/Write never trip these gates;
+   `grep`/`sed`/`cat`/`find`/`echo`-to-file can. Use the Write tool for `/tmp` scratch files.
+
+Net rule: separate simple Bash calls, absolute paths, no `cd`, no brace-quote redirects, no
+`VAR=` prefixes, dedicated tools over shell-outs. Settings load once at session start, so
+allowlist edits never help the current session anyway — this discipline is the only same-session lever.
+
 ## Common confabulations to avoid (verified gotchas)
 
 1. **Compose service ≠ container_name.** Service `ib-gateway` ≠ container `tradeflow-ib-gateway`. Use service name for `docker compose` ops, container_name for `docker exec` / `docker logs` / `docker inspect`.

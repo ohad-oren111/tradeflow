@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -885,6 +886,66 @@ async def test_recovery_persisted_below_entry_clamped_to_entry(monkeypatch):
     router.register_recovered(lc, _make_contract())
     # Clamped to entry so it can NEVER seed a peak that would un-ratchet the stop.
     assert router._highest[lc.lifecycle_id] == 20000.0
+
+
+# -------------------------------------- PR-3: per-entry exit-mode log + mismatch guard
+
+
+async def test_place_entry_logs_exit_mode_and_bracket_shape(caplog):
+    """PR-3: every entry logs `entry exit_mode=<mode> bracket=<shape>` so the active
+    exit path is visible in the logs (no broker probe needed). Fixed mode → fixed."""
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    sm.create_lifecycle.return_value = _make_lifecycle(State.IDLE)
+    sm.transition.return_value = _make_lifecycle(State.ENTERING)
+    ib.place_order = AsyncMock(
+        side_effect=[_make_trade(2001), _make_trade(2002), _make_trade(2003)]  # 3 legs (fixed)
+    )
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+
+    with caplog.at_level(logging.INFO, logger="src.execution.router"):
+        await router.place_entry(_make_signal(), _make_contract())
+
+    entry_logs = [r.getMessage() for r in caplog.records if "entry exit_mode=" in r.getMessage()]
+    assert entry_logs, "expected a per-entry [EXEC] entry exit_mode=... log"
+    assert "exit_mode=fixed" in entry_logs[0] and "bracket=fixed" in entry_logs[0]
+    # Consistent case → no mismatch warning.
+    assert not [r for r in caplog.records if "exit_mode_mismatch" in r.getMessage()]
+
+
+async def test_place_entry_exit_mode_mismatch_warns_but_does_not_crash(monkeypatch, caplog):
+    """PR-3 guard: if the built bracket SHAPE disagrees with the resolved EXIT_MODE
+    (env/build drift), log a loud exit_mode_mismatch WARNING but still place the
+    entry — surface the anomaly, never crash."""
+    _trailing(monkeypatch)  # RISK.exit_mode = trailing
+
+    from ib_async import Order
+
+    from src.execution import router as router_mod
+
+    def _fake_build(**kwargs):
+        # Return a FIXED-shaped bracket (tp_child set) under trailing → mismatch.
+        return Order(), Order(), Order()
+
+    monkeypatch.setattr(router_mod, "build_entry_oca_bracket", _fake_build)
+
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    sm.create_lifecycle.return_value = _make_lifecycle(State.IDLE)
+    entering_lc = _make_lifecycle(State.ENTERING)
+    sm.transition.return_value = entering_lc
+    ib.place_order = AsyncMock(
+        side_effect=[_make_trade(2001), _make_trade(2002), _make_trade(2003)]
+    )
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+
+    with caplog.at_level(logging.WARNING, logger="src.execution.router"):
+        lc = await router.place_entry(_make_signal(), _make_contract())  # must NOT raise
+
+    assert lc is entering_lc  # entry still proceeds
+    mismatch = [r.getMessage() for r in caplog.records if "exit_mode_mismatch" in r.getMessage()]
+    assert mismatch, "expected an exit_mode_mismatch WARNING"
+    assert "EXIT_MODE=trailing" in mismatch[0] and "fixed bracket" in mismatch[0]
 
 
 async def test_on_fill_trailing_seeds_and_persists_highest(monkeypatch):

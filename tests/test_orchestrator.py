@@ -8,6 +8,7 @@ import pathlib
 import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from config.risk_params import RISK
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.orchestrator import Orchestrator
@@ -106,6 +107,31 @@ async def test_startup_logs_account_binding(caplog):
     msg = bind_logs[0].getMessage()
     assert "prefix=DUQ" in msg
     assert "987654.32" in msg
+
+
+async def test_startup_logs_resolved_exit_mode_and_ladder(caplog):
+    """PR-3: boot logs the resolved EXIT_MODE + ladder knobs prominently so the
+    active exit path is unmissable in the logs."""
+    caplog.set_level(logging.INFO)
+    mock_ib = _make_mock_ib()
+    mock_db = _make_mock_db()
+    orch = Orchestrator(mock_ib, mock_db, paper_account="DUQ1234567", healthcheck_interval=10.0)
+
+    async def stopper():
+        for _ in range(20):
+            await asyncio.sleep(0)
+        if orch._stop_event is not None:
+            orch._stop_event.set()
+
+    with patch.object(orch, "_install_signal_handlers"):
+        await asyncio.wait_for(asyncio.gather(orch.run(), stopper()), timeout=2.0)
+
+    logs = [r for r in caplog.records if "[ORCH] startup: EXIT_MODE=" in r.getMessage()]
+    assert logs, "expected [ORCH] startup: EXIT_MODE= log"
+    msg = logs[0].getMessage()
+    assert f"EXIT_MODE={RISK.exit_mode}" in msg
+    assert "lock_in=" in msg and "trail_offset=" in msg and "hard_ceiling=" in msg
+    assert "bracket=" in msg
 
 
 async def test_startup_seeds_warmup_before_starting_bar_subscription():
