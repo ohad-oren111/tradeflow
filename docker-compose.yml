@@ -82,6 +82,11 @@ services:
       # the secrets file. Recovered/already-bracketed positions keep their existing
       # bracket — the trailing handoff fires only on a NEW entry fill.
       EXIT_MODE: ${EXIT_MODE:-trailing}
+      # Parity override — TF's W-S14.2 live calibration matched SeanBot's actual
+      # entries at 2.0pt (8/12) vs strict close>open (2/12). risk_params default
+      # stays 0.0 (source-faithful); 2.0 is the live-parity value. Tune via
+      # /divergence agreement.
+      BULLISH_TOLERANCE: ${BULLISH_TOLERANCE:-2.0}
     depends_on:
       - ib-gateway
     ports:
