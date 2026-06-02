@@ -162,12 +162,20 @@ class OrderRouter:
             if oid is not None:
                 self._by_order_id[oid] = lifecycle
         # Seed the high-water mark so a recovered ACTIVE position still ratchets.
-        # Seeded to entry (the conservative floor): the ratchet reads the resting
-        # stop's LIVE price from the broker as current_stop and only moves it
-        # toward price, so seeding low can never lower an already-walked stop — it
-        # just resumes ratcheting as new highs/lows print post-recovery.
+        # PR-2 — prefer the PERSISTED peak (metadata.highest_price) so a restart
+        # mid-trend resumes from the true high; fall back to entry. Clamped so it
+        # is NEVER on the losing side of entry (LONG: >= entry; SHORT: <= entry) —
+        # the ratchet only moves the stop toward price, so this can never un-ratchet.
         if lifecycle.state == State.ACTIVE.value and lifecycle.entry_price is not None:
-            self._highest[lifecycle.lifecycle_id] = float(lifecycle.entry_price)
+            entry = float(lifecycle.entry_price)
+            persisted = (lifecycle.metadata or {}).get("highest_price")
+            if persisted is None:
+                seed = entry
+            elif Direction(lifecycle.direction) is Direction.LONG:
+                seed = max(float(persisted), entry)
+            else:
+                seed = min(float(persisted), entry)
+            self._highest[lifecycle.lifecycle_id] = seed
 
     def register_eod_exit(self, lifecycle: Lifecycle, order_id: int) -> None:
         """Route a forthcoming fill on ``order_id`` to ``lifecycle`` as EOD-closed.
@@ -471,7 +479,26 @@ class OrderRouter:
             self._by_order_id[final_stop_id] = lc
         self._mark_dirty(lc.lifecycle_id)
 
+        # PR-2 — persist the initial high-water mark so a restart right after entry
+        # resumes from it rather than reseeding to entry on the next recovery.
+        if RISK.exit_mode == "trailing" and was_entering:
+            await self._persist_highest(lc, float(fill_price))
+
     # --------------------------------------------- EXIT_MODE=trailing bar ratchet
+
+    async def _persist_highest(self, lc: Lifecycle, highest: float) -> None:
+        """Durably store the high-water mark (PR-2). Never raises into the caller:
+        the in-memory ``_highest`` governs the live ratchet, so persistence is a
+        best-effort durability improvement for restart recovery only."""
+        try:
+            await self._sm.persist_highest(lc, highest)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "[EXEC] %s: persist_highest_failed — type=%s msg=%s (in-memory peak kept)",
+                lc.symbol,
+                type(exc).__name__,
+                exc,
+            )
 
     def _active_trailing_lifecycle(self) -> Lifecycle | None:
         """The single ACTIVE lifecycle to ratchet this bar (≤1 open position)."""
@@ -552,6 +579,10 @@ class OrderRouter:
         else:
             highest = min(prior, float(bar_low)) if bar_low is not None else prior
         self._highest[lc.lifecycle_id] = highest
+        # PR-2 — persist the peak whenever it ADVANCES (a new high/low), so a
+        # restart resumes the ratchet from the true peak, not from entry.
+        if highest != prior:
+            await self._persist_highest(lc, highest)
 
         # 2) Hard ceiling (V3 +1000) → market-exit, regardless of the stop.
         if should_hard_exit(
