@@ -118,9 +118,10 @@ async def test_get_historical_bars_returns_snapshot_not_keepuptodate(mock_ib_fac
     assert fake_ib.reqHistoricalDataAsync.await_args.kwargs["keepUpToDate"] is False
 
 
-async def test_get_historical_bars_default_window_is_two_days(mock_ib_factory):
-    # "2 D" (not "1 D"): spans the prior session so the warmup seed always clears
-    # the 100-bar SMA100 minimum even ~1 min after the 18:00 ET Globex reopen.
+async def test_get_historical_bars_default_window_is_five_days(mock_ib_factory):
+    # "5 D" (not "1 D"): spans prior session(s) across the weekend so the warmup
+    # seed clears the 100-bar SMA100 minimum even ~1 min after the 18:00 ET reopen,
+    # including a Sunday-evening restart. Capped at 5 D to avoid an IB pacing reject.
     fake_ib = mock_ib_factory()
     fake_ib.isConnected.return_value = True
     fake_ib.reqHistoricalDataAsync = AsyncMock(return_value=[])
@@ -128,7 +129,7 @@ async def test_get_historical_bars_default_window_is_two_days(mock_ib_factory):
     client = IBClient(host="h", port=4002, client_id=1, ib_factory=lambda: fake_ib)
     await client.get_historical_bars(MagicMock(localSymbol="MNQM6"))
 
-    assert fake_ib.reqHistoricalDataAsync.await_args.kwargs["durationStr"] == "2 D"
+    assert fake_ib.reqHistoricalDataAsync.await_args.kwargs["durationStr"] == "5 D"
 
 
 async def test_get_historical_bars_duration_override_is_honored(mock_ib_factory):
