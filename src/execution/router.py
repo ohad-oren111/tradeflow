@@ -47,6 +47,22 @@ _RESTING_STATUSES = frozenset({"PreSubmitted", "Submitted", "Filled"})
 _DEAD_STATUSES = frozenset({"Cancelled", "ApiCancelled", "Inactive"})
 
 
+def should_heal_target(exit_mode: str) -> bool:
+    """Whether a MISSING take-profit (LMT TARGET) leg should be re-armed, by exit_mode.
+
+    Pure helper (no IB calls, no state) so the reconciler's leg-heal decision is
+    unit-testable with an explicit arg — mirrors the entry leg-shape decision that
+    already lives in :func:`src.execution.bracket.build_entry_oca_bracket`.
+
+    - ``"fixed"`` → True: the resting LMT IS the take-profit; if a redeploy dropped
+      it the reconciler must re-place it (§0.5.T5 leg self-heal).
+    - ``"trailing"`` → False: there is intentionally NO resting TARGET (the bar-close
+      ratchet walks the STP). Re-arming a +offset LMT here would cap upside — exactly
+      the §0.5.196 hybrid bracket this guards against. A missing STOP is still healed.
+    """
+    return exit_mode != "trailing"
+
+
 def _oca_group_for(lifecycle_id: str) -> str:
     """Deterministic OCA group for a lifecycle's exit legs.
 
@@ -300,10 +316,11 @@ class OrderRouter:
                 tp_order_id = self._order_id_of(tp_trade)
             else:
                 LOGGER.info(
-                    "[EXEC] %s: no_tp_child — exit_mode=%s; STP is sole exit leg, "
-                    "standalone TRAIL placed on fill",
+                    "[ROUTER] %s: entry_placed — bracket=STP-only exit_mode=%s entry=%.2f "
+                    "(STP is sole exit leg; the bar-close ratchet walks it — §0.5.196)",
                     signal.instrument,
                     RISK.exit_mode,
+                    signal.entry_price,
                 )
         except Exception as exc:
             LOGGER.error(

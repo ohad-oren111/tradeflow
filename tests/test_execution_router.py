@@ -948,6 +948,53 @@ async def test_place_entry_exit_mode_mismatch_warns_but_does_not_crash(monkeypat
     assert "EXIT_MODE=trailing" in mismatch[0] and "fixed bracket" in mismatch[0]
 
 
+# --------------------------- PR 99: entry bracket shape honors exit_mode (§0.5.196)
+
+
+async def test_place_entry_trailing_places_stp_only_no_lmt(monkeypatch):
+    """Trailing entry → parent + STP child ONLY, no resting LMT TARGET. Asserts on the
+    placed order TYPES (not call index): exactly one STP, zero LMT, and the lifecycle
+    transition records target_order_id=None."""
+    _trailing(monkeypatch)
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    sm.create_lifecycle.return_value = _make_lifecycle(State.IDLE)
+    sm.transition.return_value = _make_lifecycle(State.ENTERING, target_order_id=None)
+    # Exactly TWO legs in trailing (parent + STP). A 3rd place_order would raise
+    # StopIteration — proving no LMT TARGET is placed.
+    ib.place_order = AsyncMock(side_effect=[_make_trade(2001), _make_trade(2002)])
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    await router.place_entry(_make_signal(), _make_contract())
+
+    assert ib.place_order.await_count == 2  # parent + STP only
+    placed = [call.args[1] for call in ib.place_order.await_args_list]
+    types = [o.orderType for o in placed]
+    assert types.count("STP") == 1  # one protective stop
+    assert "LMT" not in types  # NO take-profit TARGET in trailing mode
+    assert sm.transition.await_args.kwargs["target_order_id"] is None
+
+
+async def test_place_entry_fixed_places_stp_and_lmt():
+    """Regression lock: fixed-mode entry still places the full {STP, LMT} OCA bracket
+    (parent + STP + LMT). Default RISK.exit_mode is 'fixed' — no monkeypatch needed."""
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    sm.create_lifecycle.return_value = _make_lifecycle(State.IDLE)
+    sm.transition.return_value = _make_lifecycle(State.ENTERING)
+    ib.place_order = AsyncMock(
+        side_effect=[_make_trade(2001), _make_trade(2002), _make_trade(2003)]
+    )
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    await router.place_entry(_make_signal(), _make_contract())
+
+    assert ib.place_order.await_count == 3  # parent + STP + LMT
+    types = [call.args[1].orderType for call in ib.place_order.await_args_list]
+    assert types.count("STP") == 1 and types.count("LMT") == 1  # full bracket
+    assert sm.transition.await_args.kwargs["target_order_id"] == 2003
+
+
 async def test_on_fill_trailing_seeds_and_persists_highest(monkeypatch):
     _trailing(monkeypatch)
     ib = _make_mock_ib()
