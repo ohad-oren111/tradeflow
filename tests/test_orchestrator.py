@@ -92,6 +92,35 @@ async def test_startup_logs_account_binding(caplog):
     assert "987654.32" in msg
 
 
+async def test_startup_seeds_warmup_before_starting_bar_subscription():
+    # Ordering is load-bearing: seed_bars only fills an EMPTY buffer, so the
+    # historical seed MUST run before the live subscription — otherwise a bar
+    # ticking during the ~1.5s fetch leaves the buffer non-empty and the seed is
+    # skipped (cold SMA on boot, observed 2026-06-02 02:01Z).
+    mock_ib = _make_mock_ib()
+    mock_db = _make_mock_db()
+    orch = Orchestrator(mock_ib, mock_db, paper_account="DUQ1234567")
+    calls: list[str] = []
+
+    async def rec_seed():
+        calls.append("seed")
+
+    async def rec_sub():
+        calls.append("subscribe")
+
+    with (
+        patch.object(orch, "_recover_state", AsyncMock()),
+        patch.object(orch, "_wire_fill_event", MagicMock()),
+        patch.object(orch, "_seed_strategy_warmup", AsyncMock(side_effect=rec_seed)),
+        patch.object(orch, "_start_bar_subscription", AsyncMock(side_effect=rec_sub)),
+        patch.object(orch, "_arm_farm_flap_resubscribe", MagicMock()),
+        patch.object(orch, "_launch_background_tasks", MagicMock()),
+    ):
+        await orch._startup()
+
+    assert calls == ["seed", "subscribe"]
+
+
 async def test_healthcheck_loop_runs_n_iterations():
     mock_ib = _make_mock_ib()
     mock_db = _make_mock_db()
