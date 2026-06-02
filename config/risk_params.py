@@ -126,6 +126,15 @@ class RiskParams:
     # trails, in either mode. Env: EXIT_MODE, TRAIL_OFFSET.
     exit_mode: str = "fixed"
     trail_offset_pts: float = 150.0
+    # SeanBot V3/V12 bot-ratcheted exit ladder (EXIT_MODE=trailing). On each 1-min
+    # bar close the bot walks a single resting GTC SELL STP UP only (never down):
+    #   base            : entry - stop_loss_pts (75)
+    #   peak >= lock_in : max(prev, entry + lock_in_pts)  — V12 +50 lock-in
+    #   peak >= trail   : max(prev, highest - trail_offset_pts) — trail tail
+    #   close >= entry + hard_ceiling_pts → market-exit (V3 hard cap).
+    # Env: LOCK_IN_PTS, HARD_CEILING_PTS (stop_loss_pts/trail_offset_pts reused).
+    lock_in_pts: float = 50.0
+    hard_ceiling_pts: float = 1000.0
 
     # PR C — max tolerated gap (in missing bars) in the live feed after a
     # reconnect/resubscribe before the strategy buffer is invalidated and
@@ -178,6 +187,9 @@ RISK = RiskParams(
     # PR B — env-tunable exit knobs (default = trailing TP, 150pt offset).
     exit_mode=_load_exit_mode(),
     trail_offset_pts=_env_float("TRAIL_OFFSET", 150.0),
+    # SeanBot V3/V12 ratchet ladder knobs (EXIT_MODE=trailing).
+    lock_in_pts=_env_float("LOCK_IN_PTS", 50.0),
+    hard_ceiling_pts=_env_float("HARD_CEILING_PTS", 1000.0),
     # PR C — feed-gap tolerance (missing bars) before invalidate + re-seed.
     bar_gap_max_tolerance_bars=_env_int("BAR_GAP_MAX_TOLERANCE_BARS", 1),
     # PR A — tiered kill switch (env-tunable; default keeps trading).
