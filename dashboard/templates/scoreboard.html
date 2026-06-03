@@ -25,6 +25,49 @@
         <span class="{% if board.delta_total < 0 %}text-danger{% elif board.delta_total > 0 %}text-success{% endif %}">{{ "%.2f"|format(board.delta_total) }}</span>
       </span>
     </div>
+    {% if board.chart %}
+    {% set c = board.chart %}
+    <div class="mb-4">
+      <div class="d-flex gap-3 mb-2 small">
+        <span><span style="display:inline-block;width:14px;height:3px;background:#198754;vertical-align:middle;"></span> TF (cumulative)</span>
+        <span><span style="display:inline-block;width:14px;height:3px;background:#fd7e14;vertical-align:middle;"></span> SeanBot (cumulative)</span>
+        {% if board.has_estimate %}<span class="text-muted">○ open marker = estimate day</span>{% endif %}
+      </div>
+      <svg viewBox="0 0 {{ c.width }} {{ c.height }}" width="100%" style="max-width:{{ c.width }}px;font-size:11px;"
+           role="img" aria-label="TF vs SeanBot cumulative P&amp;L">
+        <!-- y gridlines + dollar labels -->
+        {% for y, label in c.y_labels %}
+          <line x1="68" y1="{{ "%.1f"|format(y) }}" x2="{{ c.width - 16 }}" y2="{{ "%.1f"|format(y) }}"
+                stroke="#e9ecef" stroke-width="1"/>
+          <text x="60" y="{{ "%.1f"|format(y + 3) }}" text-anchor="end" fill="#6c757d">{{ label }}</text>
+        {% endfor %}
+        <!-- zero line (emphasized) -->
+        <line x1="68" y1="{{ "%.1f"|format(c.zero_y) }}" x2="{{ c.width - 16 }}" y2="{{ "%.1f"|format(c.zero_y) }}"
+              stroke="#adb5bd" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <!-- x date labels -->
+        {% for x, label in c.x_labels %}
+          <text x="{{ "%.1f"|format(x) }}" y="{{ c.height - 14 }}" text-anchor="middle" fill="#6c757d">{{ label }}</text>
+        {% endfor %}
+        <!-- SeanBot curve -->
+        <polyline points="{{ c.sb_polyline }}" fill="none" stroke="#fd7e14" stroke-width="2"/>
+        <!-- TF curve -->
+        <polyline points="{{ c.tf_polyline }}" fill="none" stroke="#198754" stroke-width="2"/>
+        <!-- SeanBot markers (open circle = estimate day) -->
+        {% for x, y, val, est in c.sb_points %}
+          <circle cx="{{ "%.1f"|format(x) }}" cy="{{ "%.1f"|format(y) }}" r="3"
+                  fill="{{ '#fff' if est else '#fd7e14' }}" stroke="#fd7e14" stroke-width="1.5">
+            <title>{{ "SeanBot cum $%.2f%s"|format(val, ' (est.)' if est else '') }}</title>
+          </circle>
+        {% endfor %}
+        <!-- TF markers -->
+        {% for x, y, val in c.tf_points %}
+          <circle cx="{{ "%.1f"|format(x) }}" cy="{{ "%.1f"|format(y) }}" r="3" fill="#198754">
+            <title>{{ "TF cum $%.2f"|format(val) }}</title>
+          </circle>
+        {% endfor %}
+      </svg>
+    </div>
+    {% endif %}
     <div class="table-responsive">
     <table class="table table-sm table-striped mb-0 align-middle">
       <thead>
@@ -44,7 +87,9 @@
         <tr>
           <td>{{ r.day }}</td>
           <td class="text-end {% if r.tf_pnl < 0 %}text-danger{% elif r.tf_pnl > 0 %}text-success{% endif %}">{{ "%.2f"|format(r.tf_pnl) }}</td>
-          <td class="text-end {% if r.sb_pnl < 0 %}text-danger{% elif r.sb_pnl > 0 %}text-success{% endif %}">{{ "%.2f"|format(r.sb_pnl) }}</td>
+          <td class="text-end {% if r.sb_pnl < 0 %}text-danger{% elif r.sb_pnl > 0 %}text-success{% endif %}">
+            {{ "%.2f"|format(r.sb_pnl) }}{% if r.sb_is_estimate %} <span class="badge bg-secondary" title="No operator anchor for this day — lossy per-exit estimate">est.</span>{% endif %}
+          </td>
           <td class="text-end {% if r.delta < 0 %}text-danger{% elif r.delta > 0 %}text-success{% endif %}">{{ "%.2f"|format(r.delta) }}</td>
           <td>
             {% if r.winner == 'TF' %}<span class="badge bg-success">TF</span>

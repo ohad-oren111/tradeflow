@@ -331,53 +331,45 @@ def test_scoreboard_seanbot_dollars_from_points(_env):
     assert "Different books" in body  # caveat
 
 
-def test_scoreboard_compares_two_days_with_winner_and_cumulative(_env):
-    orch = _make_orch()
-    tf_rows = [
-        {"state": "CLOSED", "pnl_net": 100.0, "exit_filled_at": "2026-05-30T15:00:00+00:00"},
-        {"state": "CLOSED", "pnl_net": -30.0, "exit_filled_at": "2026-05-31T15:00:00+00:00"},
-    ]
-    sb_rows = [
-        {
-            "type": "exit",
-            "pnl_points": 20,
-            "contracts": 2,
-            "ts": "2026-05-30T16:00:00+00:00",
-        },  # $80
-        {
-            "type": "exit",
-            "pnl_points": -10,
-            "contracts": 2,
-            "ts": "2026-05-31T16:00:00+00:00",
-        },  # -$40
-    ]
-    orch._db.select = AsyncMock(side_effect=[tf_rows, sb_rows])  # 2 calls: lifecycles, seanbot
-    client = TestClient(create_app(orch))
-    r = client.get("/scoreboard", auth=(_TEST_USER, _TEST_PASS))
-    assert r.status_code == 200
-    body = r.text
-    # day 05-30: TF 100 vs SB 80 → TF +20; day 05-31: TF -30 vs SB -40 → TF +10 (lost less)
-    assert "100.00" in body and "80.00" in body
-    assert "-30.00" in body and "-40.00" in body
-    # cumulative TF 70 vs SB 40 → TF leads by 30
-    assert "TF leads by $30.00" in body
+def test_scoreboard_compares_two_days_with_winner_and_cumulative():
+    # Per-day winner + cumulative-delta logic. Asserted on rows directly (not the
+    # rendered headline) because the always-present operator anchors dominate the
+    # global totals — the per-day comparison must still be exact on un-anchored days.
+    from dashboard.scoreboard import _build_scoreboard
+
+    board = _build_scoreboard(
+        tf_by_day={"2026-05-30": 100.0, "2026-05-31": -30.0},
+        sb_estimate_by_day={"2026-05-30": 80.0, "2026-05-31": -40.0},
+    )
+    by_day = {r.day: r for r in board.rows}
+    d30 = by_day["2026-05-30"]
+    assert d30.tf_pnl == 100.0 and d30.sb_pnl == 80.0
+    assert d30.delta == 20.0 and d30.winner == "TF"  # TF +20
+    d31 = by_day["2026-05-31"]
+    assert d31.tf_pnl == -30.0 and d31.sb_pnl == -40.0
+    assert d31.delta == 10.0 and d31.winner == "TF"  # lost less → TF +10
+    # cumulative delta advances by 05-31's daily delta from the prior day
+    assert d31.delta_cum - d30.delta_cum == pytest.approx(10.0, abs=0.005)
 
 
 def test_scoreboard_one_sided_day_renders_other_side_zero(_env):
     orch = _make_orch()
+    # Use 2026-05-30 — a day with NO authoritative anchor, so an empty SeanBot
+    # capture set must render as a $0 estimate (not crash, not anchor-overridden).
     orch._db.select = AsyncMock(
         side_effect=[
-            [{"state": "CLOSED", "pnl_net": 50.0, "exit_filled_at": "2026-06-01T15:00:00+00:00"}],
-            [],  # SeanBot silent that day → $0, must not crash
+            [{"state": "CLOSED", "pnl_net": 50.0, "exit_filled_at": "2026-05-30T15:00:00+00:00"}],
+            [],  # SeanBot silent that day → $0 estimate, must not crash
         ]
     )
     client = TestClient(create_app(orch))
     r = client.get("/scoreboard", auth=(_TEST_USER, _TEST_PASS))
     assert r.status_code == 200
     body = r.text
-    assert "2026-06-01" in body
+    assert "2026-05-30" in body
     assert "50.00" in body
     assert "0.00" in body  # SeanBot side rendered as zero
+    assert "est." in body  # un-anchored day flagged as estimate
 
 
 def test_scoreboard_read_error_surfaces_not_500(_env):
@@ -554,6 +546,110 @@ def test_aggregate_excludes_non_exit_rows():
     by_day = _aggregate_seanbot_daily(rows)
     # only the single exit: −75 × $2 × 2 = −$300; the +50 stop_moved is excluded.
     assert by_day == {"2026-06-01": pytest.approx(-300.0, abs=0.05)}
+
+
+# ----------------- DASH-FIX: authoritative SeanBot daily P&L + comparison chart
+# SeanBot posts no daily-summary alert and capture began mid-2026-05-28, so the
+# per-exit reconstruction cannot reproduce the operator's trusted anchors. The
+# scoreboard prefers operator-trusted figures (dashboard.seanbot_authoritative)
+# per day and flags estimate-fallback days.
+
+
+def test_authoritative_overrides_lossy_estimate_for_anchored_day():
+    from dashboard.scoreboard import _build_scoreboard
+
+    # 2026-06-01 is an operator anchor (−866.72). Even a wildly different per-exit
+    # estimate for that day must be ignored in favour of the anchor.
+    board = _build_scoreboard(
+        tf_by_day={"2026-06-01": -100.0},
+        sb_estimate_by_day={"2026-06-01": -1884.0},  # the lossy over-capture
+    )
+    row = next(r for r in board.rows if r.day == "2026-06-01")
+    assert row.sb_pnl == pytest.approx(-866.72, abs=0.005)
+    assert row.sb_is_estimate is False
+
+
+def test_unanchored_day_falls_back_to_estimate_and_is_flagged():
+    from dashboard.scoreboard import _build_scoreboard
+
+    # 2026-05-29 has no anchor → use the per-exit estimate, flagged as estimate.
+    board = _build_scoreboard(
+        tf_by_day={},
+        sb_estimate_by_day={"2026-05-29": 1004.0},
+    )
+    row = next(r for r in board.rows if r.day == "2026-05-29")
+    assert row.sb_pnl == pytest.approx(1004.0, abs=0.005)
+    assert row.sb_is_estimate is True
+    assert board.has_estimate is True
+
+
+def test_anchor_day_with_no_tf_and_no_captures_still_appears():
+    from dashboard.scoreboard import _build_scoreboard
+
+    # 2026-05-26 (+2108.18) has zero TF rows and zero captures — it must still
+    # appear, sourced purely from the authoritative anchor.
+    board = _build_scoreboard(tf_by_day={}, sb_estimate_by_day={})
+    days = {r.day: r for r in board.rows}
+    assert "2026-05-26" in days
+    assert days["2026-05-26"].sb_pnl == pytest.approx(2108.18, abs=0.005)
+    assert days["2026-05-26"].sb_is_estimate is False
+
+
+def test_chart_geometry_endpoints_track_cumulative():
+    from dashboard.scoreboard import _build_scoreboard
+
+    board = _build_scoreboard(
+        tf_by_day={"2026-05-30": 100.0, "2026-05-31": -40.0},
+        sb_estimate_by_day={"2026-05-30": 20.0, "2026-05-31": -10.0},
+    )
+    c = board.chart
+    assert c is not None
+    # One marker per row (anchors are always present, so don't hard-code a count).
+    assert len(c.tf_points) == len(board.rows)
+    assert len(c.sb_points) == len(board.rows)
+    # Chart is oldest→newest, so the last marker equals the newest row (rows[0]).
+    newest = board.rows[0]
+    assert c.tf_points[-1][2] == pytest.approx(newest.tf_cum, abs=0.005)
+    assert c.sb_points[-1][2] == pytest.approx(newest.sb_cum, abs=0.005)
+    # polylines are space-separated "x,y" pairs, one per row.
+    assert len(c.tf_polyline.split()) == len(board.rows)
+    assert len(c.sb_polyline.split()) == len(board.rows)
+
+
+def test_scoreboard_route_renders_chart_and_estimate_marker(_env):
+    orch = _make_orch()
+    # TF on an anchored day; SeanBot captures empty (anchor wins) plus an
+    # un-anchored day from the estimate path.
+    tf_rows = [
+        {"state": "CLOSED", "pnl_net": -100.0, "exit_filled_at": "2026-06-01T15:00:00+00:00"},
+    ]
+    sb_rows = [
+        {"type": "exit", "pnl_points": 48, "contracts": 2, "ts": "2026-05-31T22:52:05+00:00"},
+    ]
+    orch._db.select = AsyncMock(side_effect=[tf_rows, sb_rows])
+    client = TestClient(create_app(orch))
+    r = client.get("/scoreboard", auth=(_TEST_USER, _TEST_PASS))
+    assert r.status_code == 200
+    body = r.text
+    assert "<svg" in body and "polyline" in body  # comparison chart rendered
+    assert "-866.72" in body  # 2026-06-01 anchor used, not an estimate
+    assert "192.00" in body  # 2026-05-31 estimate (48pt × $2 × 2ct)
+    assert "est." in body  # the un-anchored day flagged
+
+
+def test_authoritative_module_matches_trusted_anchors():
+    from dashboard.seanbot_authoritative import authoritative_pnl
+
+    trusted = {
+        "2026-05-26": 2108.18,
+        "2026-05-27": 1380.94,
+        "2026-05-28": -616.20,
+        "2026-06-01": -866.72,
+        "2026-06-02": -202.96,
+    }
+    for day, val in trusted.items():
+        assert authoritative_pnl(day) == pytest.approx(val, abs=0.005)
+    assert authoritative_pnl("2026-05-29") is None  # un-anchored → None
 
 
 # --------------------------------------- PR 2: decision divergence panel
