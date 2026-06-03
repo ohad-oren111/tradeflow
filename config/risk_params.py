@@ -97,6 +97,15 @@ class RiskParams:
     max_contracts_per_trade: int = 2
     contracts_per_trade: int = 2  # default standard sizing
 
+    # STABILIZE-4 — foreign-position auto-flatten guard. A broker position that does
+    # not reconcile to tracked INTENT (its non-CLOSED lifecycles) is flattened at
+    # market once it is PERSISTENTLY foreign — confirmed across this many consecutive
+    # full-scan ticks (the debounce that prevents liquidating a just-opened position
+    # during the open→track race). Direction-agnostic: keys off intent, never
+    # "long-only". `enabled=False` disables auto-liquidation (still halts + alerts).
+    foreign_flatten_enabled: bool = True
+    foreign_flatten_confirm_ticks: int = 2
+
     # Strategy parameters (per kickoff §3 — MA50/MA100 bounce, no ADX after PR #33)
     ma_fast: int = 50
     ma_slow: int = 100

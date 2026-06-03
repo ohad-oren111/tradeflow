@@ -32,6 +32,8 @@ from src.execution.reconciler import (
     _fill_price_for_order,
     _filled_order_id_for,
     compute_pnl_gross,
+    foreign_quantity,
+    intended_net_position,
 )
 from src.state_machine import (
     Direction,
@@ -1139,3 +1141,176 @@ async def test_heal_failure_is_swallowed_and_alerts(caplog):
     assert action is ReconcileAction.NOOP  # nothing persisted → not HEALED
     assert any("heal_failed" in r.message for r in caplog.records)
     assert any("recover_heal_failed" in r.message for r in caplog.records)
+
+
+# ========================================================================
+# STABILIZE-4 — foreign-position auto-flatten guard (intent-based, direction-agnostic)
+# ========================================================================
+
+
+# ---- pure helpers: foreign_quantity (CLOSE-only) + intended_net_position ----
+
+
+def test_foreign_quantity_close_only_table():
+    # (broker_net, intended_net) -> signed foreign qty to flatten (never opens).
+    assert foreign_quantity(4, 2) == 2  # oversized long → sell the +2 excess
+    assert foreign_quantity(-2, 0) == -2  # untracked short (STABILIZE-3 artifact) → buy 2
+    assert foreign_quantity(2, 2) == 0  # matches intent → nothing
+    assert foreign_quantity(0, 2) == 0  # entry unfilled (broker short of intent) → NEVER opens
+    assert foreign_quantity(1, 2) == 0  # partially filled → never tops up
+    assert foreign_quantity(-2, 2) == -2  # contrary short vs long intent → close it (won't re-long)
+    assert foreign_quantity(2, -2) == 2  # contrary long vs short intent → close it
+    assert foreign_quantity(-4, -2) == -2  # FUTURE shorts: excess short → buy back the extra 2
+    assert foreign_quantity(0, 0) == 0
+
+
+def test_intended_net_position_is_direction_agnostic():
+    long_lc = _make_lifecycle(State.ACTIVE, entry_qty=2)  # LONG by default
+    short_lc = _make_lifecycle(State.ACTIVE, direction=Direction.SHORT.value, entry_qty=2)
+    idle_lc = _make_lifecycle(State.IDLE)  # no fill intended yet → 0
+    entering_lc = _make_lifecycle(State.ENTERING, entry_qty=None)  # qty unknown → default
+    assert intended_net_position([long_lc], "MNQM6", 2) == 2
+    assert intended_net_position([short_lc], "MNQM6", 2) == -2
+    assert intended_net_position([idle_lc], "MNQM6", 2) == 0
+    assert intended_net_position([entering_lc], "MNQM6", 2) == 2  # falls back to default_qty
+    assert intended_net_position([long_lc, short_lc], "MNQM6", 2) == 0  # net flat
+
+
+# ---- MUST flatten ----
+
+
+async def test_guard_flattens_untracked_short_after_debounce(caplog):
+    # The STABILIZE-3 artifact: broker -2, NO lifecycle. Halts on tick 1, flattens
+    # (BUY 2) on tick 2 once the debounce (confirm_ticks=2) is satisfied.
+    sm = _make_mock_sm(non_closed=[])
+    ib = _make_mock_ib(portfolio=[_make_portfolio_item(symbol="MNQM6", qty=-2)])
+    orch = _make_mock_orchestrator()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, sm=sm, orchestrator=orch)
+
+    with caplog.at_level(logging.INFO):
+        c1 = await rec._reconcile_foreign_positions([], ib.get_portfolio.return_value)
+    ib.place_order.assert_not_awaited()  # tick 1 → debounce not met → NO flatten
+    assert c1.get(ReconcileAction.FOREIGN_POSITION) == 1
+    orch.raise_halt.assert_called_with("MNQM6")
+
+    with caplog.at_level(logging.INFO):
+        c2 = await rec._reconcile_foreign_positions([], ib.get_portfolio.return_value)
+    ib.place_order.assert_awaited_once()  # tick 2 → confirmed → flatten
+    order = ib.place_order.await_args.args[1]
+    assert order.action == "BUY" and order.totalQuantity == 2 and order.orderType == "MKT"
+    assert c2.get(ReconcileAction.FLATTENED) == 1
+    assert any("foreign_flatten_initiated" in r.getMessage() for r in caplog.records)
+    assert any("foreign_flatten_placed" in r.getMessage() for r in caplog.records)
+
+
+async def test_guard_flattens_oversold_size_mismatch_excess_only():
+    # Broker +4 but the ACTIVE lifecycle intends +2 → flatten the +2 EXCESS (SELL 2),
+    # leaving the intended +2 intact. Call the guard directly (confirm_ticks twice).
+    active = _make_lifecycle(State.ACTIVE, entry_qty=2)  # LONG +2
+    ib = _make_mock_ib(portfolio=[_make_portfolio_item(symbol="MNQM6", qty=4)])
+    orch = _make_mock_orchestrator()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, orchestrator=orch)
+
+    await rec._reconcile_foreign_positions([active], ib.get_portfolio.return_value)
+    ib.place_order.assert_not_awaited()  # debounce tick 1
+    await rec._reconcile_foreign_positions([active], ib.get_portfolio.return_value)
+
+    ib.place_order.assert_awaited_once()
+    order = ib.place_order.await_args.args[1]
+    assert order.action == "SELL" and order.totalQuantity == 2  # only the excess, not all 4
+
+
+# ---- MUST NOT flatten ----
+
+
+async def test_guard_leaves_matching_long_untouched():
+    active = _make_lifecycle(State.ACTIVE, entry_qty=2)  # LONG +2
+    ib = _make_mock_ib(portfolio=[_make_portfolio_item(symbol="MNQM6", qty=2)])
+    orch = _make_mock_orchestrator()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, orchestrator=orch)
+
+    for _ in range(3):  # several ticks — must never trip
+        c = await rec._reconcile_foreign_positions([active], ib.get_portfolio.return_value)
+
+    ib.place_order.assert_not_awaited()
+    orch.raise_halt.assert_not_called()
+    assert ReconcileAction.FLATTENED not in c and ReconcileAction.FOREIGN_POSITION not in c
+
+
+async def test_guard_does_not_flatten_during_open_race_in_flight():
+    # A just-opened position whose lifecycle is still ENTERING (entry filling): the
+    # net is changing by design → NEVER flatten, NEVER halt, even across many ticks.
+    entering = _make_lifecycle(State.ENTERING, entry_qty=None)  # mid-open, qty unknown
+    ib = _make_mock_ib(portfolio=[_make_portfolio_item(symbol="MNQM6", qty=2)])
+    orch = _make_mock_orchestrator()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, orchestrator=orch)
+
+    for _ in range(3):
+        await rec._reconcile_foreign_positions([entering], ib.get_portfolio.return_value)
+
+    ib.place_order.assert_not_awaited()
+    orch.raise_halt.assert_not_called()
+
+
+async def test_guard_debounce_holds_on_first_tick_only_halts():
+    # Explicit debounce: a stable foreign position halts immediately but is NOT
+    # flattened on the FIRST tick (the race-protection window).
+    ib = _make_mock_ib(portfolio=[_make_portfolio_item(symbol="MNQM6", qty=-2)])
+    orch = _make_mock_orchestrator()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, orchestrator=orch)
+
+    counts = await rec._reconcile_foreign_positions([], ib.get_portfolio.return_value)
+
+    orch.raise_halt.assert_called_once_with("MNQM6")  # halted on tick 1
+    ib.place_order.assert_not_awaited()  # but NOT flattened (debounce)
+    assert counts.get(ReconcileAction.FOREIGN_POSITION) == 1
+    assert ReconcileAction.FLATTENED not in counts
+
+
+async def test_guard_future_short_lifecycle_is_left_alone():
+    # FUTURE-PROOF: an INTENTIONAL short (ACTIVE direction=SHORT, -2) matched by a -2
+    # broker short reconciles to intent → NOT foreign → untouched. Enabling shorts
+    # later trips nothing here.
+    short_lc = _make_lifecycle(State.ACTIVE, direction=Direction.SHORT.value, entry_qty=2)
+    ib = _make_mock_ib(portfolio=[_make_portfolio_item(symbol="MNQM6", qty=-2)])
+    orch = _make_mock_orchestrator()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, orchestrator=orch)
+
+    for _ in range(3):
+        c = await rec._reconcile_foreign_positions([short_lc], ib.get_portfolio.return_value)
+
+    ib.place_order.assert_not_awaited()  # the intended short is left ALONE
+    orch.raise_halt.assert_not_called()
+    assert ReconcileAction.FLATTENED not in c
+
+
+async def test_guard_disabled_halts_and_alerts_but_does_not_flatten(monkeypatch):
+    # foreign_flatten_enabled=False → still halt + alert, but NEVER auto-liquidate.
+    monkeypatch.setattr(
+        "src.execution.reconciler.RISK", replace(RISK, foreign_flatten_enabled=False)
+    )
+    ib = _make_mock_ib(portfolio=[_make_portfolio_item(symbol="MNQM6", qty=-2)])
+    orch = _make_mock_orchestrator()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, orchestrator=orch)
+
+    for _ in range(4):  # well past the debounce
+        await rec._reconcile_foreign_positions([], ib.get_portfolio.return_value)
+
+    orch.raise_halt.assert_called_with("MNQM6")  # still halts
+    ib.place_order.assert_not_awaited()  # but never flattens
+
+
+async def test_guard_flatten_failure_is_swallowed_and_alerts(caplog):
+    # A broker reject on the flatten order must NOT raise into the scan loop.
+    ib = _make_mock_ib(portfolio=[_make_portfolio_item(symbol="MNQM6", qty=-2)])
+    ib.place_order = AsyncMock(side_effect=RuntimeError("broker reject"))
+    orch = _make_mock_orchestrator()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, orchestrator=orch)
+
+    await rec._reconcile_foreign_positions([], ib.get_portfolio.return_value)
+    with caplog.at_level(logging.INFO):
+        counts = await rec._reconcile_foreign_positions([], ib.get_portfolio.return_value)
+
+    ib.place_order.assert_awaited()  # attempt made
+    assert ReconcileAction.FLATTENED not in counts  # not counted as success
+    assert any("foreign_flatten_failed" in r.getMessage() for r in caplog.records)

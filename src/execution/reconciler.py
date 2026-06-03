@@ -31,6 +31,7 @@ from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.execution.bracket import build_bracket, build_protective_stop
 from src.execution.dirty_set import DirtySet
+from src.execution.router import _build_market_exit as build_market_exit
 from src.execution.router import (
     ensure_protective_stop,
     should_heal_target,
@@ -71,6 +72,7 @@ class ReconcileAction(StrEnum):
     ACTIVE_TO_CLOSED = "active_to_closed"  # via EXITING
     EXITING_TO_CLOSED = "exiting_to_closed"
     FOREIGN_POSITION = "foreign_position"
+    FLATTENED = "flattened"  # STABILIZE-4: auto-flattened a confirmed-foreign position
     HEALED = "healed"  # ACTIVE+position: re-placed a missing bracket leg (stop/target)
     WARNING = "warning"  # logged anomaly, no transition
     RACE = "race"  # state machine guard fired (InvariantViolationError)
@@ -103,6 +105,10 @@ class Reconciler:
         self._dirty_drain_interval_sec = dirty_drain_interval_sec
         self._full_scan_interval_sec = full_scan_interval_sec
         self._halt_ack_file_path = halt_ack_file_path
+        # STABILIZE-4 — per-symbol foreign-position debounce: symbol → (foreign_qty,
+        # consecutive_tick_count). A confirmed-foreign position is only auto-flattened
+        # once the SAME foreign qty persists for `foreign_flatten_confirm_ticks` ticks.
+        self._foreign_streak: dict[str, tuple[int, int]] = {}
 
     # --------------------------------------------------------------- per-lifecycle
 
@@ -705,32 +711,11 @@ class Reconciler:
             action = await self.reconcile_one(lc)
             counts[action] += 1
 
-        # Foreign-position detection runs over the canonical portfolio() snapshot
-        # (§0.5.T3). A broker position whose symbol matches no non-CLOSED
-        # lifecycle is a foreign trade — halt entries to prevent compounding.
+        # Foreign-position detection + auto-flatten guard (STABILIZE-4) over the
+        # canonical portfolio() snapshot (§0.5.T3). Intent-based + direction-agnostic.
         portfolio = await self._ib.get_portfolio()
-        tracked_symbols = {lc.symbol for lc in non_closed}
-        for item in portfolio:
-            contract = getattr(item, "contract", None)
-            if contract is None:
-                continue
-            local = getattr(contract, "localSymbol", None)
-            base = getattr(contract, "symbol", None)
-            qty = getattr(item, "position", 0)
-            if not qty:
-                continue
-            symbol = local or base
-            if symbol is None:
-                continue
-            if symbol in tracked_symbols or base in tracked_symbols:
-                continue
-            LOGGER.warning(
-                "[RECON] foreign_position: symbol=%s qty=%s — halting new entries",
-                symbol,
-                qty,
-            )
-            self._orchestrator.raise_halt(symbol)
-            counts[ReconcileAction.FOREIGN_POSITION] += 1
+        foreign_counts = await self._reconcile_foreign_positions(non_closed, portfolio)
+        counts.update(foreign_counts)
 
         LOGGER.info(
             "[RECON] tick: full_scan_complete — non_closed=%s actions=%s",
@@ -745,6 +730,155 @@ class Reconciler:
             counts.get(ReconcileAction.HEALED, 0),
         )
         return dict(counts)
+
+    async def _reconcile_foreign_positions(
+        self, non_closed: list[Lifecycle], portfolio: list[Any]
+    ) -> Counter[ReconcileAction]:
+        """STABILIZE-4 — reconcile every broker position against tracked INTENT and
+        auto-flatten the unaccounted-for delta once it is PERSISTENTLY foreign.
+
+        Direction-agnostic by design: "foreign" = broker exposure not backed by a
+        non-CLOSED lifecycle (no lifecycle, wrong side, or oversized). An INTENTIONAL
+        short carries its own SHORT lifecycle → reconciles to intent → never foreign,
+        so enabling shorts later needs ZERO change here. CLOSE-only: the guard never
+        opens/increases a position (an unfilled entry, where broker < intent, is the
+        entry path's job — :func:`foreign_quantity` returns 0 there).
+
+        Safety: a confirmed-foreign position is flattened only after the SAME foreign
+        qty persists for ``foreign_flatten_confirm_ticks`` consecutive full scans
+        (debounce) AND is NOT explained by an in-flight ENTERING/EXITING lifecycle
+        for that symbol. When uncertain (in-flight transition) → no halt, no flatten;
+        wait. Halt fires immediately on a stable foreign position; the auto-flatten
+        is gated behind the debounce + the ``foreign_flatten_enabled`` knob.
+        """
+        counts: Counter[ReconcileAction] = Counter()
+        default_qty = int(RISK.contracts_per_trade)
+
+        # Net broker position per symbol (sum across items) + a contract for placement.
+        broker_net: dict[str, int] = {}
+        broker_contract: dict[str, Any] = {}
+        for item in portfolio:
+            contract = getattr(item, "contract", None)
+            if contract is None:
+                continue
+            qty = getattr(item, "position", 0)
+            if not qty:
+                continue
+            symbol = getattr(contract, "localSymbol", None) or getattr(contract, "symbol", None)
+            if symbol is None:
+                continue
+            try:
+                signed = int(qty)
+            except (TypeError, ValueError):
+                continue
+            broker_net[symbol] = broker_net.get(symbol, 0) + signed
+            broker_contract.setdefault(symbol, contract)
+
+        for symbol, b_net in broker_net.items():
+            i_net = intended_net_position(non_closed, symbol, default_qty)
+            fq = foreign_quantity(b_net, i_net)
+            if fq == 0:
+                # Fully reconciled to intent → clear any pending debounce.
+                self._foreign_streak.pop(symbol, None)
+                continue
+
+            # In-flight transition (entry filling / exit closing) → the net is changing
+            # as designed. Do NOT halt or flatten; wait for it to settle (§ race guard).
+            if _symbol_in_flight(non_closed, symbol):
+                LOGGER.info(
+                    "[RECON] foreign_skip_in_flight: symbol=%s broker_net=%s intended_net=%s "
+                    "foreign_qty=%s (ENTERING/EXITING lifecycle present — not flattening)",
+                    symbol,
+                    b_net,
+                    i_net,
+                    fq,
+                )
+                self._foreign_streak.pop(symbol, None)
+                continue
+
+            # Stable foreign exposure → halt immediately (compounding guard, as before).
+            counts[ReconcileAction.FOREIGN_POSITION] += 1
+            self._orchestrator.raise_halt(symbol)
+
+            prev = self._foreign_streak.get(symbol)
+            streak = prev[1] + 1 if prev is not None and prev[0] == fq else 1
+            self._foreign_streak[symbol] = (fq, streak)
+            LOGGER.warning(
+                "[RECON] foreign_position: symbol=%s broker_net=%s intended_net=%s "
+                "foreign_qty=%s streak=%s/%s — halting new entries",
+                symbol,
+                b_net,
+                i_net,
+                fq,
+                streak,
+                RISK.foreign_flatten_confirm_ticks,
+            )
+            LOGGER.info(
+                "[ALERT] foreign_position_detected: symbol=%s broker=%s intended=%s "
+                "foreign=%s streak=%s/%s",
+                symbol,
+                b_net,
+                i_net,
+                fq,
+                streak,
+                RISK.foreign_flatten_confirm_ticks,
+            )
+
+            if not RISK.foreign_flatten_enabled:
+                continue  # auto-liquidation disabled → halt + alert only
+            if streak < RISK.foreign_flatten_confirm_ticks:
+                continue  # not yet confirmed across the debounce window → wait
+
+            # CONFIRMED-foreign across the debounce → flatten the unaccounted delta.
+            flattened = await self._flatten_foreign(symbol, fq, broker_contract.get(symbol))
+            if flattened:
+                counts[ReconcileAction.FLATTENED] += 1
+            # Re-evaluate from broker truth next scan (the market exit fills ~instantly).
+            self._foreign_streak.pop(symbol, None)
+
+        return counts
+
+    async def _flatten_foreign(self, symbol: str, foreign_qty: int, contract: Any) -> bool:
+        """Flatten a CONFIRMED-foreign delta at market via the shared market-exit
+        builder (the same primitive EOD / manual-close use — never a hand-rolled raw
+        order). ``foreign_qty`` > 0 → broker too long → SELL; < 0 → too short → BUY.
+        Alerts BEFORE and AFTER. Never raises into the scan loop."""
+        if contract is None:
+            LOGGER.error("[RECON] foreign_flatten_skipped: symbol=%s — no broker contract", symbol)
+            LOGGER.info("[ALERT] foreign_flatten_failed: symbol=%s reason=no_contract", symbol)
+            return False
+        if not getattr(contract, "exchange", ""):
+            contract.exchange = "CME"  # §0.5.192 — position-derived contracts omit exchange
+        qty = abs(int(foreign_qty))
+        close_dir = Direction.LONG if foreign_qty > 0 else Direction.SHORT
+        order = build_market_exit(close_dir, qty)
+        LOGGER.warning(
+            "[ALERT] foreign_flatten_initiated: symbol=%s foreign_qty=%s action=%s qty=%s",
+            symbol,
+            foreign_qty,
+            order.action,
+            qty,
+        )
+        try:
+            trade = await self._ib.place_order(contract, order)
+        except Exception as exc:  # noqa: BLE001 — never raise into the reconcile loop
+            LOGGER.error(
+                "[RECON] foreign_flatten_failed: symbol=%s type=%s msg=%s",
+                symbol,
+                type(exc).__name__,
+                exc,
+            )
+            LOGGER.info("[ALERT] foreign_flatten_failed: symbol=%s msg=%s", symbol, exc)
+            return False
+        order_id = _order_id_of(trade)
+        LOGGER.warning(
+            "[ALERT] foreign_flatten_placed: symbol=%s action=%s qty=%s order=%s",
+            symbol,
+            order.action,
+            qty,
+            order_id,
+        )
+        return True
 
     # ---------------------------------------------------------------- halt-ack
     # PR #12 — poll Supabase first (primary), file flag second (fallback when
@@ -871,6 +1005,66 @@ def compute_pnl_gross(
     """
     delta = exit_price - entry_price if direction is Direction.LONG else entry_price - exit_price
     return delta * qty * MNQ.multiplier
+
+
+def _signed_intended_qty(lifecycle: Lifecycle, default_qty: int) -> int:
+    """Signed position a non-CLOSED lifecycle INTENDS to hold (+long / -short).
+
+    IDLE → 0 (no fill intended yet). ENTERING / ACTIVE / EXITING → ±intended size.
+    Uses ``entry_qty`` when known, else ``default_qty`` (entry_qty is only stamped on
+    the fill, so an ENTERING leg falls back to the configured per-trade size).
+    Direction-agnostic — reads ``lifecycle.direction``, never assumes long.
+    """
+    if lifecycle.state not in (
+        State.ENTERING.value,
+        State.ACTIVE.value,
+        State.EXITING.value,
+    ):
+        return 0
+    qty = int(lifecycle.entry_qty) if lifecycle.entry_qty else int(default_qty)
+    sign = 1 if Direction(lifecycle.direction) is Direction.LONG else -1
+    return sign * qty
+
+
+def intended_net_position(lifecycles: list[Lifecycle], symbol: str, default_qty: int) -> int:
+    """Net position implied by tracked intent for ``symbol`` (sum of signed lifecycle
+    intents). Direction-agnostic; an intentional short contributes a negative qty."""
+    return sum(_signed_intended_qty(lc, default_qty) for lc in lifecycles if lc.symbol == symbol)
+
+
+def foreign_quantity(broker_net: int, intended_net: int) -> int:
+    """Signed quantity NOT backed by intent — the delta to flatten toward intent.
+
+    Direction-agnostic and CLOSE-ONLY: never returns a value that would OPEN or
+    increase exposure, so a position SHORT OF intent (an unfilled / partially filled
+    entry) yields 0 — re-establishing intent is the entry path's job, not the guard's.
+
+    Examples (long & short symmetric)::
+
+        broker +4, intended +2 → +2   (sell 2: oversold/oversized excess)
+        broker -2, intended  0 → -2   (buy 2: untracked short, the STABILIZE-3 artifact)
+        broker +2, intended +2 →  0   (matches intent)
+        broker  0, intended +2 →  0   (entry not filled yet — never opens)
+        broker -2, intended +2 → -2   (buy 2: close the contrary short; guard won't re-long)
+        broker -4, intended -2 → -2   (buy 2: reduce excess short — FUTURE shorts)
+    """
+    if broker_net == 0:
+        return 0
+    same_direction = intended_net != 0 and (broker_net > 0) == (intended_net > 0)
+    if not same_direction:
+        return broker_net  # no intent in broker's direction → the whole position is foreign
+    if abs(broker_net) <= abs(intended_net):
+        return 0  # within intent (possibly still filling) → nothing to flatten
+    return broker_net - intended_net  # same sign → only the excess beyond intent
+
+
+def _symbol_in_flight(lifecycles: list[Lifecycle], symbol: str) -> bool:
+    """True if any lifecycle for ``symbol`` is mid-transition (ENTERING/EXITING) — its
+    broker net is changing by design, so the guard must wait rather than flatten."""
+    return any(
+        lc.symbol == symbol and lc.state in (State.ENTERING.value, State.EXITING.value)
+        for lc in lifecycles
+    )
 
 
 def _broker_qty_for(positions: list[Any], symbol: str) -> int | None:
