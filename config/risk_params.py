@@ -149,6 +149,24 @@ class RiskParams:
     lock_in_pts: float = 50.0
     hard_ceiling_pts: float = 1000.0
 
+    # REPLICATE — SeanBot-triggered, validity-checked second entry path. A SeanBot
+    # LONG MNQ notification triggers a TF entry IFF (at TF's action time) the
+    # current price is still near the MA AND not a stale chase vs SB's signal
+    # price. Bounds derived from signal_reconciliations + 1-min bars (2026-06-03):
+    # the SB entry band (SB_price - sma100) spanned -12.9..+30.7 (median +1.3); the
+    # +1min price drift vs SB's signal had p90 ~+28. This path catches the near-MA
+    # touches TF's own once-per-closed-bar gate structurally misses (it took only
+    # ~9% of SB's entries; 71% missed on the touch gate). FLAT/no-stack + the halt
+    # are enforced downstream by the existing _handle_trade_signal/create_lifecycle
+    # path — this path NEVER stacks and NEVER double-enters an own-gate setup.
+    # Env: SB_TRIGGER_ENABLED, SB_NEAR_MA_BELOW_PTS, SB_NEAR_MA_ABOVE_PTS,
+    # SB_NO_CHASE_MAX_PTS, SB_TRIGGER_MAX_BAR_AGE_SEC.
+    sb_trigger_enabled: bool = True
+    sb_near_ma_below_pts: float = 15.0  # accept price >= sma100 - 15 (matches touch lower band)
+    sb_near_ma_above_pts: float = 35.0  # accept price <= sma100 + 35 (covers SB band max +30.7)
+    sb_no_chase_max_pts: float = 25.0  # reject price > SB_signal + 25 (stale chase)
+    sb_trigger_max_bar_age_sec: float = 180.0  # require a settled bar this fresh (current truth)
+
     # PR C — max tolerated gap (in missing bars) in the live feed after a
     # reconnect/resubscribe before the strategy buffer is invalidated and
     # re-seeded from history. The SMA must never span a gap. Default 1 tolerates a
@@ -223,6 +241,12 @@ RISK = RiskParams(
     #   REGIME_GATE_ENABLED (False = excluded, per operator).
     ma_bullish_tolerance_pts=_env_float("BULLISH_TOLERANCE", 0.0),
     regime_gate_enabled=_env_bool("REGIME_GATE_ENABLED", False),
+    # REPLICATE — SeanBot-triggered validity-checked entry (env-tunable).
+    sb_trigger_enabled=_env_bool("SB_TRIGGER_ENABLED", True),
+    sb_near_ma_below_pts=_env_float("SB_NEAR_MA_BELOW_PTS", 15.0),
+    sb_near_ma_above_pts=_env_float("SB_NEAR_MA_ABOVE_PTS", 35.0),
+    sb_no_chase_max_pts=_env_float("SB_NO_CHASE_MAX_PTS", 25.0),
+    sb_trigger_max_bar_age_sec=_env_float("SB_TRIGGER_MAX_BAR_AGE_SEC", 180.0),
 )
 # Lowercase alias for consumers that prefer `risk_params.x` over `RISK.x`.
 risk_params = RISK

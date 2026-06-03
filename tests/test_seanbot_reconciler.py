@@ -11,9 +11,13 @@ from unittest.mock import AsyncMock
 from src.comparison.seanbot_reconciler import (
     SeanbotReconciler,
     classify,
+    evaluate_sb_trigger,
     nearest_decision,
     record_to_row,
 )
+
+# Default REPLICATE bounds (mirror RISK.sb_* defaults) for the pure-function tests.
+_BOUNDS = {"near_below_pts": 15.0, "near_above_pts": 35.0, "no_chase_max_pts": 25.0}
 
 
 def _decision(ts: str, decision: str, *, failed: str | None = None, close=30310.0, sma100=30309.0):
@@ -279,3 +283,150 @@ async def test_repeat_signal_upserts_same_key_idempotent_shape(tmp_path):
         assert call.args[0] == "signal_reconciliations"
         assert call.kwargs["on_conflict"] == "channel,message_id"
         assert call.args[1]["message_id"] == 88
+
+
+# ----- REPLICATE: evaluate_sb_trigger (pure validity) -----------------------
+
+
+def test_sb_trigger_valid_near_ma_in_window():
+    ok, reason = evaluate_sb_trigger(
+        direction="long",
+        symbol="MNQ",
+        sb_price=30500.0,
+        current_price=30502.0,
+        sma100=30500.0,
+        **_BOUNDS,
+    )
+    assert ok is True
+    assert reason.startswith("ok:")
+
+
+def test_sb_trigger_rejects_stale_chase():
+    # Price ran +30 above SB's signal (> no_chase_max 25) -> stale chase.
+    ok, reason = evaluate_sb_trigger(
+        direction="long",
+        symbol="MNQ",
+        sb_price=30500.0,
+        current_price=30530.0,
+        sma100=30505.0,
+        **_BOUNDS,
+    )
+    assert ok is False
+    assert reason.startswith("stale-chase")
+
+
+def test_sb_trigger_rejects_far_above_ma():
+    # +40 above the MA (> near_above 35), even though not a chase vs SB price.
+    ok, reason = evaluate_sb_trigger(
+        direction="long",
+        symbol="MNQ",
+        sb_price=30539.0,
+        current_price=30540.0,
+        sma100=30500.0,
+        **_BOUNDS,
+    )
+    assert ok is False
+    assert reason.startswith("far-from-ma")
+
+
+def test_sb_trigger_rejects_far_below_ma():
+    ok, reason = evaluate_sb_trigger(
+        direction="long",
+        symbol="MNQ",
+        sb_price=30480.0,
+        current_price=30480.0,
+        sma100=30500.0,
+        **_BOUNDS,
+    )
+    assert ok is False
+    assert reason.startswith("far-from-ma")
+
+
+def test_sb_trigger_rejects_warmup_no_sma():
+    ok, reason = evaluate_sb_trigger(
+        direction="long",
+        symbol="MNQ",
+        sb_price=30500.0,
+        current_price=30500.0,
+        sma100=None,
+        **_BOUNDS,
+    )
+    assert ok is False
+    assert reason == "warmup-no-sma"
+
+
+def test_sb_trigger_rejects_non_long_and_non_mnq():
+    ok, _ = evaluate_sb_trigger(
+        direction="short",
+        symbol="MNQ",
+        sb_price=30500.0,
+        current_price=30500.0,
+        sma100=30500.0,
+        **_BOUNDS,
+    )
+    assert ok is False
+    ok2, _ = evaluate_sb_trigger(
+        direction="long",
+        symbol="ES",
+        sb_price=30500.0,
+        current_price=30500.0,
+        sma100=30500.0,
+        **_BOUNDS,
+    )
+    assert ok2 is False
+
+
+def test_sb_trigger_boundaries_inclusive():
+    # Exactly at +near_above and exactly at +no_chase: both inclusive -> valid.
+    ok, _ = evaluate_sb_trigger(
+        direction="long",
+        symbol="MNQ",
+        sb_price=30500.0,
+        current_price=30525.0,
+        sma100=30500.0,
+        **_BOUNDS,  # px-sb=+25 (==no_chase)
+    )
+    assert ok is True
+
+
+# ----- REPLICATE: poll_once fires entry_handler once per fresh entry ---------
+
+
+async def test_poll_once_invokes_entry_handler_once_per_fresh_entry(tmp_path):
+    getter = _getter([_decision("2026-05-28T22:05:00+00:00", "long_signal")])
+    calls = []
+
+    async def handler(row):
+        calls.append(row.get("message_id"))
+
+    rec = SeanbotReconciler(
+        decisions_getter=getter,
+        journal_path=str(tmp_path / "r.jsonl"),
+        entry_handler=handler,
+    )
+    db = AsyncMock()
+    await rec.poll_once(db)  # seed cursor
+    db.select = AsyncMock(return_value=[_entry(message_id=501)])
+    assert await rec.poll_once(db) == 1
+    # Redelivered -> deduped -> handler NOT called again.
+    db.select = AsyncMock(return_value=[_entry(message_id=501)])
+    assert await rec.poll_once(db) == 0
+    assert calls == [501]
+
+
+async def test_poll_once_entry_handler_error_does_not_break_loop(tmp_path):
+    getter = _getter([_decision("2026-05-28T22:05:00+00:00", "long_signal")])
+
+    async def boom(row):
+        raise RuntimeError("entry path blew up")
+
+    rec = SeanbotReconciler(
+        decisions_getter=getter,
+        journal_path=str(tmp_path / "r.jsonl"),
+        entry_handler=boom,
+    )
+    db = AsyncMock()
+    await rec.poll_once(db)  # seed cursor
+    db.select = AsyncMock(return_value=[_entry(message_id=502)])
+    # Eval loop completes (count=1) despite the handler raising.
+    assert await rec.poll_once(db) == 1

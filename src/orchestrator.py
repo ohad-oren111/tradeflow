@@ -35,7 +35,11 @@ from config.risk_params import RISK
 from src.clients.ib_client import BrokerExtendedOutageError, IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.comparison.decision_journal import DecisionJournal
-from src.comparison.seanbot_reconciler import _RECON_JSONL_PATH, SeanbotReconciler
+from src.comparison.seanbot_reconciler import (
+    _RECON_JSONL_PATH,
+    SeanbotReconciler,
+    evaluate_sb_trigger,
+)
 from src.execution.dirty_set import DirtySet
 from src.execution.force_close import EodForceClose
 from src.execution.kill_switch import KillSwitch
@@ -257,7 +261,11 @@ class Orchestrator:
         # from this orchestrator's journal (get_recent_decisions); polls the
         # shared Supabase seanbot_signals table for new entries in its task.
         self._seanbot_reconciler = SeanbotReconciler(
-            decisions_getter=lambda: self.get_recent_decisions(_DECISION_JOURNAL_MAXLEN)
+            decisions_getter=lambda: self.get_recent_decisions(_DECISION_JOURNAL_MAXLEN),
+            # REPLICATE — second entry path: a SeanBot LONG MNQ entry triggers a
+            # validity-checked TF entry (catches the near-MA touches the own gate
+            # misses). FLAT/no-stack + halt are enforced by _handle_trade_signal.
+            entry_handler=self._maybe_enter_on_seanbot,
         )
         # PR-D3c — durable TF→SeanBot decision journal. Observe-only mirror of
         # the analytically-useful subset of last_decision to Supabase
@@ -391,6 +399,16 @@ class Orchestrator:
             RISK.hard_ceiling_pts,
             RISK.take_profit_pts,
             "STP-only + bar-ratchet" if RISK.exit_mode == "trailing" else "fixed STP+LMT",
+        )
+        # REPLICATE — surface the SeanBot-triggered entry path config at boot.
+        LOGGER.info(
+            "[ORCH] startup: SB_TRIGGER=%s — near_ma=[sma-%.0f,sma+%.0f] no_chase=+%.0f "
+            "max_bar_age=%.0fs (validity-checked, FLAT/no-stack via own entry path)",
+            "on" if RISK.sb_trigger_enabled else "off",
+            RISK.sb_near_ma_below_pts,
+            RISK.sb_near_ma_above_pts,
+            RISK.sb_no_chase_max_pts,
+            RISK.sb_trigger_max_bar_age_sec,
         )
         LOGGER.info(
             "[ORCH] startup: ib_connecting — host=%s port=%s client_id=%s",
@@ -1014,6 +1032,95 @@ class Orchestrator:
                 type(exc).__name__,
                 exc,
             )
+
+    async def _maybe_enter_on_seanbot(self, signal_row: dict) -> None:
+        """REPLICATE — a SeanBot LONG MNQ entry triggers a TF entry IFF still valid
+        at TF's action time. Second entry path alongside TF's own gate; catches the
+        near-MA touches the once-per-closed-bar gate structurally misses.
+
+        Validity here (pure :func:`evaluate_sb_trigger`): LONG MNQ, indicators warm,
+        current price inside the near-MA window AND not a stale chase vs SeanBot's
+        signal price (bounds = RISK.sb_*). "Current price" is TradeFlow's freshest
+        SETTLED 1-min bar close (no look-ahead) — rejected if that bar is stale.
+
+        FLAT/no-stack + the halt are NOT re-checked here: the entry is dispatched
+        through :meth:`_handle_trade_signal`, so ``is_halted`` drops it while halted
+        and ``create_lifecycle`` rejects it (InvariantViolationError → suppressed)
+        if a non-CLOSED lifecycle already exists — i.e. it NEVER stacks and NEVER
+        double-enters a setup TradeFlow's own gate already took. Standard mechanics
+        follow incl. the STABILIZE-5 standalone stop + trailing ratchet.
+        """
+        if not RISK.sb_trigger_enabled:
+            return
+        ld = self._strategy.last_decision
+        if not ld:
+            LOGGER.info("[SB-TRIGGER] skip — no settled bar yet (warmup)")
+            return
+        # Current truth must be FRESH — validate only against a recent settled bar.
+        bar_age: float | None = None
+        raw_ts = ld.get("ts")
+        if raw_ts:
+            try:
+                bar_ts = datetime.fromisoformat(str(raw_ts))
+                if bar_ts.tzinfo is None:
+                    bar_ts = bar_ts.replace(tzinfo=UTC)
+                bar_age = (datetime.now(UTC) - bar_ts).total_seconds()
+            except ValueError:
+                bar_age = None
+        if bar_age is None or bar_age > RISK.sb_trigger_max_bar_age_sec:
+            LOGGER.warning(
+                "[SB-TRIGGER] skip — settled bar not fresh (age=%s > %.0fs); feed stale",
+                f"{bar_age:.0f}s" if bar_age is not None else "n/a",
+                RISK.sb_trigger_max_bar_age_sec,
+            )
+            return
+        current_price = ld.get("close")
+        sma100 = ld.get("sma100")
+        sb_price = signal_row.get("price")
+        ok, reason = evaluate_sb_trigger(
+            direction=signal_row.get("direction"),
+            symbol=signal_row.get("symbol"),
+            sb_price=sb_price,
+            current_price=current_price,
+            sma100=sma100,
+            near_below_pts=RISK.sb_near_ma_below_pts,
+            near_above_pts=RISK.sb_near_ma_above_pts,
+            no_chase_max_pts=RISK.sb_no_chase_max_pts,
+        )
+        if not ok:
+            LOGGER.info(
+                "[SB-TRIGGER] reject — sb_price=%s current=%s sma100=%s reason=%s",
+                sb_price,
+                current_price,
+                sma100,
+                reason,
+            )
+            return
+        LOGGER.info(
+            "[SB-TRIGGER] valid — entering: sb_price=%s current=%s sma100=%s (%s)",
+            sb_price,
+            current_price,
+            sma100,
+            reason,
+        )
+        # Build the entry off CURRENT market truth (MKT entry; entry_ref_price is
+        # the stop/target anchor). ma_* fields are best-effort metadata only — the
+        # router uses entry/stop/target prices, not the MA values.
+        price = float(current_price)
+        sma = float(sma100)
+        signal = Signal(
+            instrument=self._instrument,
+            direction="LONG",
+            entry_price=price,
+            stop_price=price - RISK.stop_loss_pts,
+            target_price=price + RISK.take_profit_pts,
+            ma_fast_value=sma,
+            ma_slow_value=sma,
+            ma_gap=0.0,
+            adx_value=0.0,
+            timestamp=datetime.now(UTC),
+        )
+        await self._handle_trade_signal(signal)
 
     # ------------------------------------------------------------- halt API
     # PR #12 — public halt coordinator surface consumed by Reconciler.
