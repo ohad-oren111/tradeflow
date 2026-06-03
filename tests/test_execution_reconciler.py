@@ -428,6 +428,51 @@ async def test_recon_close_with_no_open_legs_cancels_nothing():
     ib.cancel_order_by_id.assert_not_awaited()
 
 
+async def test_recon_trailing_standalone_stp_cancelled_when_position_flat(caplog):
+    # STABILIZE-5 NEVER-ORPHAN: a trailing position has a SINGLE standalone STP
+    # (target_order_id=None) and no OCA. If the position goes flat by any non-STP
+    # path (manual/EOD/opposite fill) the STP is left resting (1003) with no position
+    # behind it. The reconciler's flat-position close must cancel it — driven by
+    # broker truth (stop_order_open), not by exit attribution.
+    ib = _make_mock_ib(positions=[], open_trades=[_make_open_trade(1003)])
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+    sm = _make_mock_sm()
+    sm.transition = AsyncMock(
+        side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]
+    )
+    rec, _ib, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm)
+    # Trailing-shaped ACTIVE row: standalone STP (1003), NO resting TARGET.
+    lc = _make_lifecycle(State.ACTIVE, target_order_id=None)
+
+    action = await rec.reconcile_one(lc)
+
+    assert action is ReconcileAction.ACTIVE_TO_CLOSED
+    assert _cancelled_order_ids(ib) == [1003]  # the orphaned standalone STP, cancelled
+
+
+async def test_recon_trailing_stop_filled_does_not_rearm_or_oversell(monkeypatch):
+    # STABILIZE-5 NEVER-NAKED: when the standalone STP itself fills (STP gone broker-
+    # side, position flat, target_order_id=None), the reconciler closes as STOP and
+    # must NOT place any order — no re-arm of a new stop and no oversell into a short.
+    monkeypatch.setattr("src.execution.reconciler.RISK", replace(RISK, exit_mode="trailing"))
+    ib = _make_mock_ib(positions=[], open_trades=[])  # STP gone (filled), book flat
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+    sm = _make_mock_sm()
+    sm.transition = AsyncMock(
+        side_effect=[_make_lifecycle(State.EXITING), _make_lifecycle(State.CLOSED)]
+    )
+    rec, _ib, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm)
+    lc = _make_lifecycle(State.ACTIVE, target_order_id=None)
+
+    action = await rec.reconcile_one(lc)
+
+    assert action is ReconcileAction.ACTIVE_TO_CLOSED
+    closed_call = sm.transition.await_args_list[1]
+    assert closed_call.kwargs["exit_reason"] == "STOP"  # the STP fill closed it
+    ib.place_order.assert_not_awaited()  # NEVER-NAKED: no heal/re-arm, no oversell
+    ib.cancel_order_by_id.assert_not_awaited()  # nothing to cancel — the STP is gone
+
+
 async def test_recon_orphan_cancel_is_safe_noop_on_error():
     # A cancel reject (e.g. order already filled) must not crash the reconciler.
     ib = _make_mock_ib(positions=[], open_trades=[_make_open_trade(1002)])

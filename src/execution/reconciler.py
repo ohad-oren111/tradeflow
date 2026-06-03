@@ -636,6 +636,19 @@ class Reconciler:
         are cancelled (the filled leg is already gone). Cancels via our own IB
         client — the same clientId that placed the orders, so it's a same-client
         cancel (never IB error 10147). Idempotent: errors are logged, never raised.
+
+        STABILIZE-5 NEVER-ORPHAN — this is the reconciler half of the cancel that the
+        OCA group used to do broker-side. A trailing-mode protective STP is now a
+        STANDALONE order (parentId=0, ungrouped — so the bar-ratchet can modify it),
+        which means a fill on the *position-closing* path no longer auto-cancels it.
+        When a tracked position goes flat by any path other than the STP itself (a
+        TARGET/manual/opposite/EOD fill, or a fill the router missed), the STP is left
+        resting with no position behind it — a SELL STP that could re-open a short if
+        hit. This is reached for the standalone STP via the flat-position close path
+        (``_reconcile_active`` / ``_reconcile_exiting`` → ``_close_from_exiting``): the
+        leg is cancelled here because ``stop_order_open`` is broker-truth (driven by
+        ``openTrades``), not by exit attribution. The router's ``_cancel_sibling_legs``
+        is the event-driven half (cancels on the exit fill the router DOES see).
         """
         for is_open, oid, leg, px in (
             (stop_order_open, lifecycle.stop_order_id, "STP", lifecycle.stop_price),

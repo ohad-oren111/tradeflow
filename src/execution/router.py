@@ -335,16 +335,31 @@ class OrderRouter:
             parent_trade = await self._ib.place_order(contract, parent)
             parent_order_id = self._order_id_of(parent_trade)
 
-            stop_child.parentId = parent_order_id
-            LOGGER.info(
-                "[EXEC] %s: place_stop_child — parent_id=%s stp=%.2f (oca=%s)",
-                signal.instrument,
-                parent_order_id,
-                signal.stop_price,
-                oca_group,
-            )
-            stop_trade = await self._ib.place_order(contract, stop_child)
-            stop_order_id = self._order_id_of(stop_trade)
+            # STABILIZE-5 — trailing mode returns stop_child=None: the protective STP
+            # is NOT a native bracket child (a parentId-linked child is auto-OCA'd by
+            # the gateway → Error 10326 on the ratchet's modify). It is placed
+            # STANDALONE (parentId=0, ungrouped) on the parent fill in
+            # _handle_parent_fill → ensure_protective_stop. Fixed mode still places the
+            # STP+LMT OCA bracket children up-front here.
+            stop_order_id: int | None = None
+            if stop_child is not None:
+                stop_child.parentId = parent_order_id
+                LOGGER.info(
+                    "[EXEC] %s: place_stop_child — parent_id=%s stp=%.2f (oca=%s)",
+                    signal.instrument,
+                    parent_order_id,
+                    signal.stop_price,
+                    oca_group,
+                )
+                stop_trade = await self._ib.place_order(contract, stop_child)
+                stop_order_id = self._order_id_of(stop_trade)
+            else:
+                LOGGER.info(
+                    "[EXEC] %s: trailing entry — protective STP deferred to standalone "
+                    "post-fill placement (parentId=0, ungrouped; STABILIZE-5) lifecycle=%s",
+                    signal.instrument,
+                    lc.lifecycle_id,
+                )
 
             # Fixed mode → a LMT take-profit child completes the OCA bracket.
             # Trailing mode → tp_child is None: the STP is the sole (transmitting)
@@ -403,7 +418,8 @@ class OrderRouter:
         self._by_order_id[parent_order_id] = lc
         if tp_order_id is not None:
             self._by_order_id[tp_order_id] = lc
-        self._by_order_id[stop_order_id] = lc
+        if stop_order_id is not None:  # None in trailing — the STP is placed post-fill
+            self._by_order_id[stop_order_id] = lc
         self._mark_dirty(lc.lifecycle_id)
         # PR #14 — operator alert (Telegram picks this up via the [ALERT] log handler).
         LOGGER.info(
@@ -522,12 +538,16 @@ class OrderRouter:
         fill_qty, fill_price, fill_time = self._extract_fill(trade)
         qty = fill_qty or self._contracts_per_signal()
 
-        # PR B — the protective STP is now placed up-front as a native OCA bracket
-        # child (see place_entry), so on a normal fill it already rests at the
-        # broker (lc.stop_order_id is set). ensure_protective_stop is idempotent:
-        # existing_stop_is_live=True → it returns the existing id (no double-place).
-        # It remains a BACKSTOP — if the bracket child somehow failed to record a
-        # stop id, this places one synchronously per §0.5.T5 (never naked).
+        # Protective STP placement, by mode:
+        #  - trailing (STABILIZE-5): place_entry placed NO bracket-child stop
+        #    (lc.stop_order_id is None), so ensure_protective_stop places the STANDALONE
+        #    STP here (parentId=0, ungrouped) — the gateway can't auto-OCA it, so the
+        #    bar-close ratchet can modify it (Error 10326 designed out). This is the
+        #    primary placement, synchronous in the fill callback so the naked window is
+        #    bounded by one IB round-trip (§0.5.T5; reconciler leg-heal is the backstop).
+        #  - fixed (PR B): the STP rests up-front as an OCA bracket child
+        #    (lc.stop_order_id set), so ensure_protective_stop is an idempotent no-op
+        #    (existing_stop_is_live=True → returns the existing id, no double-place).
         stop_already_resting = lc.stop_order_id is not None
         stp_order_id = await ensure_protective_stop(
             self._ib,
@@ -916,6 +936,13 @@ class OrderRouter:
         already-filled/already-cancelled order is a logged no-op — this method
         never raises, so a duplicate fill or a broker reject can't crash the
         fill-event loop.
+
+        STABILIZE-5 NEVER-ORPHAN — for a trailing position the STP is now a STANDALONE
+        order (parentId=0, ungrouped), so there is no OCA to auto-cancel it broker-side.
+        This method is the event-driven never-orphan leg: a TARGET/MANUAL/EOD/hard-ceiling
+        exit cancels the resting STP here (a STOP fill IS the STP, so nothing to cancel,
+        and we must NOT re-arm — never-naked). The reconciler's ``_cancel_open_legs`` is
+        the backstop for any exit fill this event-driven path misses.
         """
         if reason is ExitReason.TARGET:
             legs: list[tuple[int | None, str, float | None]] = [
