@@ -63,6 +63,23 @@ def should_heal_target(exit_mode: str) -> bool:
     return exit_mode != "trailing"
 
 
+def stop_leg_uses_oca(exit_mode: str) -> bool:
+    """Whether the protective STP leg should carry an OCA group, by exit_mode.
+
+    Pure helper (no IB calls, no state) shared by the entry-bracket builder and the
+    reconciler's leg-heal so both place the STP with the SAME grouping.
+
+    - ``"fixed"`` → True: the STP and the LMT take-profit form an OCA pair so a fill
+      on one cancels the sibling broker-side.
+    - ``"trailing"`` → False: the STP is the SOLE exit leg and the bar-close ratchet
+      modifies it in place. IBKR rejects a modify of an OCA-grouped order with Error
+      10326 and CANCELS it (STABILIZE-3), so a trailing STP must be ungrouped or the
+      ratchet silently drops the protective stop. A single-member OCA group buys
+      nothing here.
+    """
+    return exit_mode != "trailing"
+
+
 def _oca_group_for(lifecycle_id: str) -> str:
     """Deterministic OCA group for a lifecycle's exit legs.
 
@@ -94,6 +111,38 @@ async def _confirm_order_resting(
             return True
         if status in _DEAD_STATUSES:
             return False
+        if waited >= timeout_sec:
+            return False
+        await asyncio.sleep(poll_sec)
+        waited += poll_sec
+
+
+async def _confirm_stop_at_aux(
+    ib: IBClient,
+    order_id: int,
+    expected_aux: float,
+    *,
+    timeout_sec: float = 2.0,
+    poll_sec: float = 0.25,
+    tol: float = 0.01,
+) -> bool:
+    """Confirm from BROKER TRUTH that the resting order ``order_id`` actually holds
+    ``expected_aux`` (§0.5.98).
+
+    STABILIZE-3 — a ratchet modifies an order that was ALREADY resting, so the
+    Trade's status is "resting" the instant ``place_order`` returns, before any
+    async rejection lands (the Error 10326 OCA-revision cancel arrived ~3 ms later
+    and fooled the status-only :func:`_confirm_order_resting`). This re-reads the
+    live order from ``IB.openTrades()`` and only returns True once its ``auxPrice``
+    equals the requested level — so a modify that was silently cancelled (order
+    gone) or never applied (stale aux) is caught instead of announced. Returns False
+    on timeout / missing order / mismatch. Never raises."""
+    waited = 0.0
+    while True:
+        order = await ib.find_open_order_by_id(order_id)
+        aux = getattr(order, "auxPrice", None) if order is not None else None
+        if aux is not None and abs(float(aux) - float(expected_aux)) <= tol:
+            return True
         if waited >= timeout_sec:
             return False
         await asyncio.sleep(poll_sec)
@@ -544,6 +593,24 @@ class OrderRouter:
                 exc,
             )
 
+    async def _persist_stop_price(self, lc: Lifecycle, stop_price: float) -> None:
+        """Durably store the ratcheted stop level (STABILIZE-3). Never raises into the
+        caller: the broker-resident STP is the live protection, so persistence is a
+        durability improvement for the reconciler's leg-heal source-of-truth only —
+        but a failure here means a redeploy-dropped stop would heal at base, so it is
+        logged loudly."""
+        try:
+            await self._sm.persist_stop_price(lc, stop_price)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "[EXEC] %s: persist_stop_price_failed — type=%s msg=%s "
+                "(broker STP @%.2f still governs; heal source may be stale)",
+                lc.symbol,
+                type(exc).__name__,
+                exc,
+                stop_price,
+            )
+
     def _active_trailing_lifecycle(self) -> Lifecycle | None:
         """The single ACTIVE lifecycle to ratchet this bar (≤1 open position)."""
         for lc in self._by_lifecycle_id.values():
@@ -719,7 +786,28 @@ class OrderRouter:
             )
             return
 
-        self._by_lifecycle_id[lc.lifecycle_id] = replace(lc, stop_price=float(new_stop))
+        # 6) §0.5.98 broker truth — a modify acts on an ALREADY-resting order, so its
+        # status reads "resting" before any async rejection lands. Confirm the broker
+        # order ACTUALLY holds new_stop before announcing/persisting; otherwise the
+        # alert + DB would claim a level the broker never accepted (the STABILIZE-3
+        # bug: an Error 10326 OCA-revision cancel raised the in-memory/Telegram level
+        # while the broker dropped the stop). Do NOT announce or persist on failure.
+        if not await _confirm_stop_at_aux(self._ib, lc.stop_order_id, float(new_stop)):
+            LOGGER.error(
+                "[EXEC] %s: ratchet_modify_unconfirmed — id=%s broker did not confirm "
+                "aux=%.2f (prior stop @%s governs; #80 reconciler owns naked heal); STOP-REPORT",
+                lc.symbol,
+                lc.stop_order_id,
+                new_stop,
+                f"{prior_aux:.2f}" if prior_aux is not None else "?",
+            )
+            return
+
+        # 7) Persist the ratcheted level so the reconciler's leg-heal re-arms at the
+        # RATCHETED stop, not the stale entry−75 base (never lowers the protection).
+        updated = replace(lc, stop_price=float(new_stop))
+        self._by_lifecycle_id[lc.lifecycle_id] = updated
+        await self._persist_stop_price(updated, float(new_stop))
         LOGGER.info(
             "[ALERT] trailing_stop_ratcheted: symbol=%s stop_id=%s old=%s new=%.2f "
             "highest=%.2f entry=%.2f lifecycle_id=%s",

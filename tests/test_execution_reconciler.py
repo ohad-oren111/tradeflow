@@ -1075,6 +1075,34 @@ async def test_heal_trailing_healthy_position_is_noop_no_target_rearm(monkeypatc
     ib.place_order.assert_not_awaited()  # healthy trailing position → nothing to heal
 
 
+async def test_heal_trailing_stop_is_ungrouped_and_at_ratcheted_level(monkeypatch):
+    """STABILIZE-3 — after a ratchet (which persists the new stop_price), a redeploy/
+    reconnect that drops the GTC stop must heal at the RATCHETED level, not the
+    entry−75 base, AND the re-placed STP must be UNGROUPED so the bar-ratchet can
+    keep modifying it (an OCA-grouped stop is rejected with Error 10326 and
+    cancelled — the exact failure that left the protection at base)."""
+    _set_exit_mode(monkeypatch, "trailing")
+    ib = _make_mock_ib(
+        positions=[_make_position(qty=2)],
+        open_trades=[],  # stop gone; trailing lifecycle never had a target order
+    )
+    ib.place_order = AsyncMock(return_value=_placed(9001))
+    db = _make_mock_db()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, db=db)
+
+    # The router has ratcheted + PERSISTED the stop up to 17555 (from the 17400 base).
+    lc = _make_lifecycle(State.ACTIVE, target_order_id=None, stop_price=17555.0)
+    action = await rec.reconcile_one(lc)
+
+    assert action is ReconcileAction.HEALED
+    ib.place_order.assert_awaited_once()
+    placed = ib.place_order.await_args.args[1]
+    assert placed.orderType == "STP" and placed.action == "SELL"
+    assert placed.auxPrice == 17555.0  # the RATCHETED level — never re-armed at base
+    assert not placed.ocaGroup  # UNGROUPED → the ratchet can modify it (no Error 10326)
+    assert placed.ocaType == 0
+
+
 async def test_heal_fixed_rearms_missing_target(monkeypatch):
     """Regression lock: fixed mode + ACTIVE position with the STP resident and the TARGET
     missing → the reconciler re-arms the LMT TARGET exactly as before."""

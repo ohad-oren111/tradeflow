@@ -154,7 +154,6 @@ def build_entry_oca_bracket(
 
     # Fixed protective stop @ stop_price. In fixed mode it never moves; in trailing
     # mode it is the floor the bar-close ratchet walks UP (router/trail_manager).
-    # Carries the OCA group in both modes (harmless single-member group in trailing).
     stop_child = Order()
     stop_child.action = exit_action
     stop_child.totalQuantity = qty
@@ -162,8 +161,6 @@ def build_entry_oca_bracket(
     stop_child.auxPrice = float(stop_price)
     stop_child.tif = "GTC"
     stop_child.outsideRth = True
-    stop_child.ocaGroup = oca_group
-    stop_child.ocaType = 1
 
     if exit_mode == "trailing":
         # NO tp child at entry — the STP is the sole exit leg AND the last leg, so it
@@ -171,8 +168,23 @@ def build_entry_oca_bracket(
         # child of a MKT parent: Error 328, §0.5.190); instead the bar-close ratchet
         # (router/trail_manager) walks this STP UP each bar. ``trail_offset`` /
         # ``entry_ref_price`` are validated/retained for API stability.
+        #
+        # STABILIZE-3 — the trailing STP carries NO OCA group. IBKR rejects a modify
+        # of any OCA-grouped order with Error 10326 ("OCA group revision is not
+        # allowed") and CANCELS it — so a single-member OCA group is not "harmless":
+        # it makes the ratchet's modify-in-place illegal, the broker silently drops
+        # the protective stop, and the reconciler then re-arms at the BASE level. With
+        # no group the STP is freely modifiable and the ratchet walks it as intended.
+        # There is no sibling leg in trailing mode, so the OCA group bought nothing;
+        # exit-fill cleanup is handled by OrderRouter._cancel_sibling_legs / the
+        # never-naked backstops.
         stop_child.transmit = True
         return parent, stop_child, None
+
+    # Fixed mode — the STP shares an OCA group with the LMT take-profit so a fill on
+    # one cancels the other broker-side. (Fixed-mode STPs are never ratcheted.)
+    stop_child.ocaGroup = oca_group
+    stop_child.ocaType = 1
 
     # Fixed mode — legacy LMT take-profit child (no regression). The STP is a
     # non-transmitting middle leg; the TP child is the last leg and transmits the

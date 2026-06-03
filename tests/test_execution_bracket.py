@@ -49,9 +49,12 @@ def test_oca_trailing_has_no_tp_child_stp_is_sole_transmitting_leg():
     assert stop_child.orderType == "STP"
     assert stop_child.auxPrice == 20000.0 - 75.0
     assert stop_child.transmit is True  # sole exit leg → transmits the bracket
-    # The STP keeps the OCA group so the post-fill TRAIL can OCA-join it.
-    assert stop_child.ocaGroup == "tf-exit-abc12345"
-    assert stop_child.ocaType == 1
+    # STABILIZE-3 — the trailing STP carries NO OCA group. An OCA-grouped order
+    # cannot be modified (IBKR Error 10326 cancels it), which would defeat the
+    # bar-close ratchet that walks this STP UP. A single-member OCA group buys
+    # nothing in trailing mode (there is no sibling leg).
+    assert not stop_child.ocaGroup
+    assert stop_child.ocaType == 0
     # NO tp child in trailing mode (the trail is the exit, placed post-fill).
     assert tp_child is None
 

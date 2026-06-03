@@ -69,6 +69,7 @@ def _make_mock_sm() -> MagicMock:
     sm.transition = AsyncMock()
     sm.load_non_closed = AsyncMock(return_value=[])
     sm.persist_highest = AsyncMock()  # PR-2 — durable high-water mark
+    sm.persist_stop_price = AsyncMock()  # STABILIZE-3 — durable ratcheted stop
     return sm
 
 
@@ -707,6 +708,67 @@ async def test_ratchet_locks_in_at_plus_50(monkeypatch):
     assert modified.auxPrice == 20050.0  # entry + lock_in_pts (50)
     # in-memory stop_price cached after the confirmed modify.
     assert router._by_lifecycle_id[lc.lifecycle_id].stop_price == 20050.0
+
+
+async def test_ratchet_issues_broker_modify_and_persists_ratcheted_level(monkeypatch):
+    # STABILIZE-3 (the money gate): a ratchet decision must ACTUALLY issue a broker
+    # modify carrying the new aux AND persist the ratcheted level — not merely update
+    # in-memory state / emit an alert. (The losing trade announced +50 while the
+    # broker stop stayed at base because the modify was silently rejected.)
+    _trailing(monkeypatch)
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    lc = _active_long_lc(stop_order_id=2002, entry=20000.0, stop_price=19925.0)
+    live = _stop_order(2002, 19925.0)
+    ib.find_open_order_by_id = AsyncMock(return_value=live)
+    ib.get_positions = AsyncMock(return_value=[_position()])
+    ib.place_order = AsyncMock(return_value=_make_trade_with_status(2002, "PreSubmitted"))
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    _wire_active(router, lc, seed_highest=20000.0)
+
+    await router.ratchet_stop_on_bar(bar_high=20050.0, bar_low=20030.0, bar_close=20040.0)
+
+    # A broker modify was ISSUED, same order id, with the new aux (broker-side change).
+    ib.place_order.assert_awaited_once()
+    modified = ib.place_order.await_args.args[1]
+    assert modified.orderId == 2002
+    assert modified.auxPrice == 20050.0  # entry + lock_in_pts (50)
+    # The ratcheted level is PERSISTED so the reconciler's leg-heal reads it (not base).
+    sm.persist_stop_price.assert_awaited_once()
+    _persisted_lc, persisted_stop = sm.persist_stop_price.await_args.args
+    assert persisted_stop == 20050.0
+
+
+async def test_ratchet_modify_unconfirmed_does_not_announce_or_persist(monkeypatch):
+    # STABILIZE-3 regression for the real bleed: a modify that the broker SILENTLY
+    # cancels (Error 10326 "OCA group revision is not allowed") leaves the resting
+    # order gone. The bot must NOT update its cached/persisted stop — it must never
+    # claim a protective level the broker does not hold. Broker truth (a re-read of
+    # the live order) is the gate, not the Trade's stale "resting" status.
+    _trailing(monkeypatch)
+    monkeypatch.setattr("src.execution.router.asyncio.sleep", AsyncMock())  # no real delay
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    lc = _active_long_lc(stop_order_id=2002, entry=20000.0, stop_price=19925.0)
+    live = _stop_order(2002, 19925.0)
+    calls = {"n": 0}
+
+    async def _find(_order_id):  # 1st read → live order; confirm re-read → GONE (cancelled)
+        calls["n"] += 1
+        return live if calls["n"] == 1 else None
+
+    ib.find_open_order_by_id = AsyncMock(side_effect=_find)
+    ib.get_positions = AsyncMock(return_value=[_position()])
+    ib.place_order = AsyncMock(return_value=_make_trade_with_status(2002, "PreSubmitted"))
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    _wire_active(router, lc, seed_highest=20000.0)
+
+    await router.ratchet_stop_on_bar(bar_high=20050.0, bar_low=20030.0, bar_close=20040.0)
+
+    ib.place_order.assert_awaited_once()  # the modify was attempted
+    sm.persist_stop_price.assert_not_awaited()  # but NOT persisted (broker never confirmed)
+    # Cache keeps the prior stop — no phantom +50 the broker isn't holding.
+    assert router._by_lifecycle_id[lc.lifecycle_id].stop_price == 19925.0
 
 
 async def test_ratchet_does_not_lower_the_stop(monkeypatch):
