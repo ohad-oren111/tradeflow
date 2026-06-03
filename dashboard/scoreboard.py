@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from config.instruments import MNQ
@@ -24,7 +25,10 @@ LOGGER = logging.getLogger(__name__)
 
 SCOREBOARD_CAVEAT = (
     "Different books — each bot's own realized P&L, not same-trade. "
-    "Small sample; TF newly live (2026-06-01). " + DB_VIEW_CAVEAT
+    "Small sample; TF newly live (2026-06-01). "
+    "SeanBot P&L is reconstructed from captured exit alerts (same-price "
+    "re-announcements deduped) — an estimate that may diverge from SeanBot's own "
+    "daily summary; treat the leader as indicative, not authoritative. " + DB_VIEW_CAVEAT
 )
 
 
@@ -67,7 +71,7 @@ class ScoreboardAggregator:
             sb_rows = await self._orch._db.select(
                 "seanbot_signals",
                 filters={"type": "eq.exit", "order": "ts.desc"},
-                columns="pnl_points,contracts,ts,type",
+                columns="pnl_points,contracts,ts,type,price,message_id",
             )
         except Exception as exc:  # noqa: BLE001 — surface as a view error, never 500
             LOGGER.warning("[DASH] scoreboard: seanbot read_failed — %r", exc)
@@ -78,12 +82,74 @@ class ScoreboardAggregator:
         return _build_scoreboard(tf_by_day, sb_by_day)
 
 
-def _aggregate_seanbot_daily(rows: list[dict[str, Any]]) -> dict[str, float]:
-    """SeanBot realized $ per UTC day: sum(pnl_points × multiplier × contracts)."""
-    by_day: dict[str, float] = {}
-    for row in rows:
-        if str(row.get("type") or "") != "exit":
+# SeanBot's book is a fixed 2-contract position: it can close at most ONCE at a
+# given price. Multiple ``exit`` rows at the SAME price within this window are the
+# same close re-announced by SeanBot's reconciler (each post recomputes P&L, so
+# the points differ — e.g. the 2026-06-01 13:22:18/13:22:53/13:22:53 @30365.25
+# trio, or the 06-02 19:57:45/19:58:05 @30694.25 exact +49/+49 pair). Summing all
+# of them over-captured realized P&L ~3.3× and produced the bogus "TF leads"
+# headline (§0.5.197 / §7.3). We collapse each same-price burst to one event.
+_DEDUP_WINDOW_SECONDS = 120.0
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    """Parse a ``seanbot_signals.ts`` ISO string (``...+00:00``) → aware datetime."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _dedup_seanbot_exits(
+    rows: list[dict[str, Any]],
+    window_seconds: float = _DEDUP_WINDOW_SECONDS,
+) -> list[dict[str, Any]]:
+    """Collapse same-close re-announcements: ``exit`` rows sharing a price whose
+    timestamps fall within ``window_seconds`` of the prior kept row at that price
+    are the SAME close. Keep the LAST (latest-ts) row — SeanBot's settled recompute.
+
+    Rows with no parseable price/ts are passed through unchanged (they can't be
+    proven duplicates and the caller's value-guard drops malformed ones anyway).
+    Pure + deterministic; logs which row won each collapse (handoff §11).
+    """
+    exits = [r for r in rows if str(r.get("type") or "") == "exit"]
+    exits.sort(key=lambda r: str(r.get("ts") or ""))  # oldest first
+
+    kept: list[dict[str, Any]] = []
+    last_idx_by_price: dict[float, int] = {}
+    for row in exits:
+        price = _f(row.get("price"))
+        ts = _parse_ts(row.get("ts"))
+        if price is None or ts is None:
+            kept.append(row)
             continue
+        prev_idx = last_idx_by_price.get(price)
+        if prev_idx is not None:
+            prev_ts = _parse_ts(kept[prev_idx].get("ts"))
+            if prev_ts is not None and (ts - prev_ts).total_seconds() <= window_seconds:
+                LOGGER.debug(
+                    "[DASH] scoreboard dedup: collapsed re-announced exit — "
+                    "price=%s dropped_msg=%s dropped_pnl_pts=%s kept_msg=%s kept_pnl_pts=%s",
+                    price,
+                    kept[prev_idx].get("message_id"),
+                    kept[prev_idx].get("pnl_points"),
+                    row.get("message_id"),
+                    row.get("pnl_points"),
+                )
+                kept[prev_idx] = row  # keep the later (settled) recompute
+                continue
+        last_idx_by_price[price] = len(kept)
+        kept.append(row)
+    return kept
+
+
+def _aggregate_seanbot_daily(rows: list[dict[str, Any]]) -> dict[str, float]:
+    """SeanBot realized $ per UTC day: sum(pnl_points × multiplier × contracts),
+    after collapsing same-close re-announcements so each exit counts ONCE."""
+    by_day: dict[str, float] = {}
+    for row in _dedup_seanbot_exits(rows):
         ts = row.get("ts")
         pts = _f(row.get("pnl_points"))
         contracts = _i(row.get("contracts"))
