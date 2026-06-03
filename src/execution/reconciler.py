@@ -31,7 +31,11 @@ from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.execution.bracket import build_bracket, build_protective_stop
 from src.execution.dirty_set import DirtySet
-from src.execution.router import ensure_protective_stop, should_heal_target
+from src.execution.router import (
+    ensure_protective_stop,
+    should_heal_target,
+    stop_leg_uses_oca,
+)
 from src.state_machine import (
     Direction,
     ExitReason,
@@ -348,18 +352,27 @@ class Reconciler:
         updates: dict[str, Any] = {}
         try:
             if not stop_order_open and lifecycle.stop_price is not None:
+                # ``stop_price`` is the RATCHETED level in trailing mode (the router
+                # persists it on every ratchet, STABILIZE-3), so the heal re-arms at
+                # the true protective floor, NEVER the stale entry−75 base.
                 stp = build_protective_stop(
                     direction=direction, qty=qty, stop_price=float(lifecycle.stop_price)
                 )
-                stp.ocaGroup = oca_group
-                stp.ocaType = _HEAL_OCA_TYPE
+                # STABILIZE-3 — match the entry leg's grouping: a trailing STP must be
+                # UNGROUPED so the bar-close ratchet can modify it (an OCA-grouped stop
+                # is rejected with Error 10326 and cancelled). Only fixed-mode stops
+                # join an OCA group (paired with the LMT take-profit).
+                heal_oca = stop_leg_uses_oca(RISK.exit_mode)
+                if heal_oca:
+                    stp.ocaGroup = oca_group
+                    stp.ocaType = _HEAL_OCA_TYPE
                 trade = await self._ib.place_order(contract, stp)
                 updates["stop_order_id"] = _order_id_of(trade)
                 LOGGER.warning(
                     "[RECOVER] %s: stop missing — re-placed STP @%.2f oca=%s id=%s",
                     lifecycle.lifecycle_id,
                     float(lifecycle.stop_price),
-                    oca_group,
+                    oca_group if heal_oca else "none(trailing)",
                     updates["stop_order_id"],
                 )
             if not target_order_open and lifecycle.target_price is not None:

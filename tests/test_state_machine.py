@@ -387,3 +387,22 @@ async def test_persist_highest_merges_into_metadata_without_clobbering():
     assert lifecycle_id_arg == lc.lifecycle_id
     assert updates == {"metadata": {"foo": "bar", "highest_price": 20120.5}}
     assert lc.metadata["highest_price"] == 20120.5  # in-memory cache updated
+
+
+# ---------------------------------------------- STABILIZE-3 — persist_stop_price
+
+
+async def test_persist_stop_price_patches_stop_column_and_updates_cache():
+    """persist_stop_price PATCHes the stop_price column (not a state transition) so the
+    reconciler's leg-heal reads the ratcheted level; the in-memory lifecycle updates too."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.ACTIVE, stop_price=19925.0)
+
+    await sm.persist_stop_price(lc, 20050.0)
+
+    db.update_lifecycle.assert_awaited_once()
+    lifecycle_id_arg, updates = db.update_lifecycle.await_args.args
+    assert lifecycle_id_arg == lc.lifecycle_id
+    assert updates == {"stop_price": 20050.0}
+    assert lc.stop_price == 20050.0  # in-memory cache updated

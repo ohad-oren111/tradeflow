@@ -233,6 +233,20 @@ class StateMachine:
         await self._db.update_lifecycle(lifecycle.lifecycle_id, {"metadata": meta})
         lifecycle.metadata = meta
 
+    async def persist_stop_price(self, lifecycle: Lifecycle, stop_price: float) -> None:
+        """Durably store the ratcheted protective-stop level in ``stop_price``.
+
+        STABILIZE-3 — the EXIT_MODE=trailing ratchet walks the resting broker STP UP
+        each bar; this persists the new level so the reconciler's leg-heal re-arms a
+        redeploy-dropped stop at the RATCHETED level, not the stale entry−75 base
+        (the bug behind a stop that announced a level it didn't hold). NOT a state
+        transition (ACTIVE→ACTIVE) — a plain PATCH of the ``stop_price`` column.
+        Mutates the in-memory ``lifecycle.stop_price`` so the router's cache stays
+        current. The invariant (a ratcheted stop is never LOWERED) is enforced by the
+        caller: ``compute_ratcheted_stop`` only moves the stop toward price."""
+        await self._db.update_lifecycle(lifecycle.lifecycle_id, {"stop_price": float(stop_price)})
+        lifecycle.stop_price = float(stop_price)
+
     # ----------------------------------------------------------------- recovery
 
     async def load_non_closed(self) -> list[Lifecycle]:
