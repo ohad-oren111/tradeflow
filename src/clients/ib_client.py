@@ -574,29 +574,51 @@ class IBClient:
 
 
 def _wire_bar_callback(bars: BarDataList, on_new_bar: BarCallback) -> None:
-    """Attach ``on_new_bar`` to ``bars.updateEvent``, supporting both sync and async forms."""
+    """Attach ``on_new_bar`` to ``bars.updateEvent``, delivering the just-CLOSED
+    SETTLED bar (§7.4 fix). Supports both sync and async callback forms.
+
+    On ``has_new_bar`` ib_async has just APPENDED the newly-opened bar
+    (``wrapper.historicalDataUpdate``: a new-timestamp bar does ``bars.append(bar)``
+    then emits ``updateEvent(bars, True)``). So at that instant ``bars_obj[-1]`` is
+    the just-OPENED forming bar — opening tick only — and ``bars_obj[-2]`` is the
+    just-CLOSED SETTLED bar. We deliver ``bars_obj[-2]``: the correct completed-candle
+    OHLC for BOTH the entry gate and the trailing-exit ratchet. Reading ``[-1]`` made
+    TF evaluate (and ratchet on) opening-tick noise — the STABILIZE-1 root cause.
+
+    Monotonic guard: ``last_date`` seeds from the initial historical fill's last bar
+    (already in the strategy's warmup seed) so the seed/live boundary bar is never
+    double-processed, and any same-/older-timestamp re-fire is dropped. Every
+    ``BarData.date`` is a parsed ``datetime`` (``wrapper.historicalData`` and
+    ``historicalDataUpdate`` both call ``parseIBDatetime``), so the compare is safe.
+    """
     import asyncio
     import inspect
 
     is_coro = inspect.iscoroutinefunction(on_new_bar)
+    state: dict[str, Any] = {"last_date": bars[-1].date if len(bars) else None}
 
     def _adapter(bars_obj: BarDataList, has_new_bar: bool) -> None:
-        if not has_new_bar or not bars_obj:
+        # Need >=2 bars: [-2] is the settled bar, [-1] the just-opened forming one.
+        if not has_new_bar or len(bars_obj) < 2:
             return
-        last = bars_obj[-1]
+        settled = bars_obj[-2]
+        last_date = state["last_date"]
+        if last_date is not None and settled.date <= last_date:
+            return  # seed-boundary bar already seeded, or an out-of-order re-fire
+        state["last_date"] = settled.date
         LOGGER.info(
-            "[BAR] %s: new — close=%.2f ts=%s",
+            "[BAR] %s: settled — close=%.2f ts=%s",
             getattr(getattr(bars_obj, "contract", None), "localSymbol", None) or "?",
-            last.close,
-            last.date,
+            settled.close,
+            settled.date,
         )
         payload: dict[str, Any] = {
-            "time": getattr(last, "date", None),
-            "open": getattr(last, "open", None),
-            "high": getattr(last, "high", None),
-            "low": getattr(last, "low", None),
-            "close": getattr(last, "close", None),
-            "volume": getattr(last, "volume", None),
+            "time": getattr(settled, "date", None),
+            "open": getattr(settled, "open", None),
+            "high": getattr(settled, "high", None),
+            "low": getattr(settled, "low", None),
+            "close": getattr(settled, "close", None),
+            "volume": getattr(settled, "volume", None),
         }
         result = on_new_bar(payload)
         if is_coro and result is not None:

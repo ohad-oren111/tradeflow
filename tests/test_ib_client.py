@@ -392,33 +392,79 @@ def _capture_adapter(bars: _FakeBars, callback) -> object:
     return bars.updateEvent.handlers[0]
 
 
-def test_adapter_logs_bar_on_new_bar(caplog):
-    bar = MagicMock(close=21500.25, date="2026-05-27T20:30:00")
-    contract = MagicMock(localSymbol="MNQM6")
-    bars = _FakeBars([bar], contract=contract)
-    callback = MagicMock(return_value=None)
-    adapter = _capture_adapter(bars, callback)
+def _mk_bar(minute: int, close: float):
+    """A BarData-shaped stub with a real datetime ``date`` (minute offset)."""
+    from datetime import UTC, datetime
 
+    return MagicMock(
+        date=datetime(2026, 5, 27, 20, minute, 0, tzinfo=UTC),
+        open=close - 1,
+        high=close + 1,
+        low=close - 2,
+        close=close,
+        volume=100,
+    )
+
+
+def test_adapter_delivers_settled_bar_not_forming(caplog):
+    # §7.4 — on has_new_bar the library has appended the just-OPENED bar; the
+    # SETTLED bar is [-2]. Initial fill ends at minute 30; minute 31 then opens.
+    settled = _mk_bar(30, 21500.25)
+    forming = _mk_bar(31, 21509.75)  # opening tick of the new minute (must be IGNORED)
+    contract = MagicMock(localSymbol="MNQM6")
+    bars = _FakeBars([_mk_bar(29, 21498.0)], contract=contract)  # initial fill -> last_date=29
+    captured: list = []
+    adapter = _capture_adapter(bars, lambda p: captured.append(p))
+
+    bars.append(settled)  # minute 30 settles (its first tick had opened earlier)
+    bars.append(forming)  # minute 31 opens -> [-2]=settled(30), [-1]=forming(31)
     with caplog.at_level(logging.INFO, logger="src.clients.ib_client"):
         adapter(bars, True)
 
+    assert len(captured) == 1
+    assert captured[0]["close"] == 21500.25  # the SETTLED bar, NOT the forming 21509.75
+    assert captured[0]["time"] == settled.date
     bar_logs = [r for r in caplog.records if r.getMessage().startswith("[BAR]")]
-    assert len(bar_logs) == 1
-    message = bar_logs[0].getMessage()
-    assert "MNQM6" in message
-    assert "21500.25" in message
-    assert "2026-05-27T20:30:00" in message
+    assert len(bar_logs) == 1 and "settled" in bar_logs[0].getMessage()
 
 
-def test_adapter_no_log_when_no_new_bar(caplog):
-    bar = MagicMock(close=21500.25, date="2026-05-27T20:30:00")
-    contract = MagicMock(localSymbol="MNQM6")
-    bars = _FakeBars([bar], contract=contract)
-    callback = MagicMock(return_value=None)
-    adapter = _capture_adapter(bars, callback)
+def test_adapter_warmup_guard_needs_two_bars():
+    # <2 bars (no settled predecessor yet) -> deliver nothing, never raise.
+    bars = _FakeBars([_mk_bar(30, 21500.0)], contract=MagicMock(localSymbol="MNQM6"))
+    captured: list = []
+    adapter = _capture_adapter(bars, lambda p: captured.append(p))
+    adapter(bars, True)
+    assert captured == []
 
+
+def test_adapter_no_delivery_when_no_new_bar(caplog):
+    bars = _FakeBars([_mk_bar(29, 21498.0)], contract=MagicMock(localSymbol="MNQM6"))
+    captured: list = []
+    adapter = _capture_adapter(bars, lambda p: captured.append(p))
+    bars.append(_mk_bar(30, 21500.0))
+    bars.append(_mk_bar(31, 21501.0))
     with caplog.at_level(logging.INFO, logger="src.clients.ib_client"):
-        adapter(bars, False)
+        adapter(bars, False)  # forming-bar tick update, not a new bar
+    assert captured == []
+    assert [r for r in caplog.records if r.getMessage().startswith("[BAR]")] == []
 
-    bar_logs = [r for r in caplog.records if r.getMessage().startswith("[BAR]")]
-    assert len(bar_logs) == 0
+
+def test_adapter_dedup_seed_boundary_and_no_double_process():
+    # Seed boundary: the first settled bar [-2] equals the initial fill's last bar
+    # (already in the warmup seed) -> must be skipped, then each later settled bar
+    # delivered exactly once, in order, none repeated.
+    contract = MagicMock(localSymbol="MNQM6")
+    bars = _FakeBars([_mk_bar(30, 21500.0)], contract=contract)  # last_date = minute 30
+    captured: list = []
+    adapter = _capture_adapter(bars, lambda p: captured.append(p))
+
+    bars.append(_mk_bar(31, 21501.0))  # minute 31 opens; [-2]=minute30 == seed -> SKIP
+    adapter(bars, True)
+    bars.append(_mk_bar(32, 21502.0))  # minute 32 opens; [-2]=minute31 -> deliver
+    adapter(bars, True)
+    adapter(bars, True)  # spurious re-fire, same state -> must NOT re-deliver minute31
+    bars.append(_mk_bar(33, 21503.0))  # minute 33 opens; [-2]=minute32 -> deliver
+    adapter(bars, True)
+
+    closes = [p["close"] for p in captured]
+    assert closes == [21501.0, 21502.0]  # minute30 skipped; 31,32 once each; no dup
