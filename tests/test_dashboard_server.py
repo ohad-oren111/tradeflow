@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from dashboard.scoreboard import _aggregate_seanbot_daily, _dedup_seanbot_exits
 from dashboard.server import create_app
 
 _TEST_USER = "test_ohad"
@@ -386,6 +387,173 @@ def test_scoreboard_read_error_surfaces_not_500(_env):
     r = client.get("/scoreboard", auth=(_TEST_USER, _TEST_PASS))
     assert r.status_code == 200
     assert "Failed to load" in r.text
+
+
+# ------------------------- PR #100: SeanBot exit over-capture dedup (§7.3)
+# A fixed 2-ct book closes at most ONCE at a price; same-price exit rows within
+# the dedup window are the SAME close re-announced (SeanBot's reconciler recomputes
+# P&L on each post, so points drift). Pure-helper tests use explicit args, fresh
+# fixtures per test, and assert on the aggregated number — never call order.
+
+
+def test_dedup_collapses_reannounced_same_price_exit_keeping_last():
+    # The real 2026-06-01 13:22 cluster: three "2 ct" exits @30365.25 within 35s
+    # (−127 → −101 → −94 as SeanBot recomputed) is ONE close, not three.
+    rows = [
+        {
+            "type": "exit",
+            "ts": "2026-06-01T13:22:18+00:00",
+            "message_id": 152,
+            "price": 30365.25,
+            "pnl_points": -127.0,
+            "contracts": 2,
+        },
+        {
+            "type": "exit",
+            "ts": "2026-06-01T13:22:53+00:00",
+            "message_id": 153,
+            "price": 30365.25,
+            "pnl_points": -101.0,
+            "contracts": 2,
+        },
+        {
+            "type": "exit",
+            "ts": "2026-06-01T13:22:53+00:00",
+            "message_id": 154,
+            "price": 30365.25,
+            "pnl_points": -94.0,
+            "contracts": 2,
+        },
+    ]
+    kept = _dedup_seanbot_exits(rows)
+    assert len(kept) == 1
+    assert kept[0]["message_id"] == 154  # the last (settled) recompute wins
+    # Counted exactly once: −94 pt × $2 × 2 ct = −$376.00 (not the −2032 triple-sum).
+    by_day = _aggregate_seanbot_daily(rows)
+    assert by_day["2026-06-01"] == pytest.approx(-376.0, abs=0.05)
+
+
+def test_dedup_exact_duplicate_counted_once():
+    # The real 2026-06-02 19:57:45/19:58:05 @30694.25 exact +49/+49 pair.
+    rows = [
+        {
+            "type": "exit",
+            "ts": "2026-06-02T19:57:45+00:00",
+            "message_id": 208,
+            "price": 30694.25,
+            "pnl_points": 49.0,
+            "contracts": 2,
+        },
+        {
+            "type": "exit",
+            "ts": "2026-06-02T19:58:05+00:00",
+            "message_id": 209,
+            "price": 30694.25,
+            "pnl_points": 49.0,
+            "contracts": 2,
+        },
+    ]
+    assert len(_dedup_seanbot_exits(rows)) == 1
+    by_day = _aggregate_seanbot_daily(rows)
+    assert by_day["2026-06-02"] == pytest.approx(196.0, abs=0.05)  # +49 × $2 × 2 ct, once
+
+
+def test_dedup_keeps_distinct_and_far_apart_same_price_exits():
+    # Different prices, plus the SAME price > window apart (genuinely two closes)
+    # must NOT collapse — only tight same-price bursts are re-announcements.
+    rows = [
+        {
+            "type": "exit",
+            "ts": "2026-06-01T08:00:00+00:00",
+            "message_id": 1,
+            "price": 30500.0,
+            "pnl_points": -75.0,
+            "contracts": 2,
+        },
+        {
+            "type": "exit",
+            "ts": "2026-06-01T12:00:00+00:00",
+            "message_id": 2,
+            "price": 30400.0,
+            "pnl_points": -75.0,
+            "contracts": 2,
+        },
+        {
+            "type": "exit",
+            "ts": "2026-06-01T18:00:00+00:00",
+            "message_id": 3,
+            "price": 30500.0,
+            "pnl_points": 40.0,
+            "contracts": 2,
+        },  # same px, 10h later
+    ]
+    assert len(_dedup_seanbot_exits(rows)) == 3
+
+
+def test_aggregate_jun01_anchor_six_true_exits_within_tolerance():
+    # Six distinct true exits whose realized $ total the operator's trusted
+    # 2026-06-01 anchor (−$866.72). A 7th row duplicates the first close (same
+    # price within window) and MUST NOT change the total — dedup counts it once.
+    # contracts=2 × multiplier 2.0 ⇒ $4 per point; −216.68 pt ⇒ −$866.72.
+    base = [
+        ("2026-06-01T07:50:00+00:00", 30506.75, -36.0),
+        ("2026-06-01T08:16:00+00:00", 30482.75, -36.0),
+        ("2026-06-01T08:19:00+00:00", 30481.0, -36.0),
+        ("2026-06-01T12:25:00+00:00", 30423.25, -36.0),
+        ("2026-06-01T13:22:00+00:00", 30365.25, -36.0),
+        ("2026-06-01T19:50:00+00:00", 30563.0, -36.68),
+    ]
+    rows = [
+        {"type": "exit", "ts": ts, "message_id": i, "price": px, "pnl_points": pts, "contracts": 2}
+        for i, (ts, px, pts) in enumerate(base)
+    ]
+    # duplicate re-announcement of the first close (same price, +30s) — dedup
+    # keeps the later (settled) row, so it carries that close's settled −36.0 pt.
+    rows.append(
+        {
+            "type": "exit",
+            "ts": "2026-06-01T07:50:30+00:00",
+            "message_id": 99,
+            "price": 30506.75,
+            "pnl_points": -36.0,
+            "contracts": 2,
+        }
+    )
+    by_day = _aggregate_seanbot_daily(rows)
+    assert by_day["2026-06-01"] == pytest.approx(-866.72, abs=0.05)
+
+
+def test_aggregate_excludes_non_exit_rows():
+    # entry / stop_moved rows must never contribute to realized P&L.
+    rows = [
+        {
+            "type": "entry",
+            "ts": "2026-06-01T07:00:00+00:00",
+            "message_id": 1,
+            "price": 30600.0,
+            "pnl_points": None,
+            "contracts": 2,
+        },
+        {
+            "type": "stop_moved",
+            "ts": "2026-06-01T07:30:00+00:00",
+            "message_id": 2,
+            "price": 30600.0,
+            "pnl_points": 50.0,
+            "contracts": 2,
+        },
+        {
+            "type": "exit",
+            "ts": "2026-06-01T08:00:00+00:00",
+            "message_id": 3,
+            "price": 30525.0,
+            "pnl_points": -75.0,
+            "contracts": 2,
+        },
+    ]
+    by_day = _aggregate_seanbot_daily(rows)
+    # only the single exit: −75 × $2 × 2 = −$300; the +50 stop_moved is excluded.
+    assert by_day == {"2026-06-01": pytest.approx(-300.0, abs=0.05)}
 
 
 # --------------------------------------- PR 2: decision divergence panel
