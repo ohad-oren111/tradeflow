@@ -13,8 +13,10 @@ from src.state_machine import Direction
 
 # --------------------------------------------------------------------- PR B —
 # build_entry_oca_bracket: native server-side OCA bracket. Fixed mode = parent +
-# fixed STP + LMT TP. Trailing mode = parent + fixed STP ONLY (no tp child); the
-# trailing exit is a STANDALONE post-fill TRAIL (Error 328, §0.5.190 → §13a).
+# fixed STP + LMT TP. STABILIZE-5: trailing mode = parent ALONE (stop_child=None);
+# the protective STP is placed STANDALONE (parentId=0, ungrouped) post-fill by the
+# router — a parentId-linked bracket child is auto-OCA'd by the gateway and an
+# OCA-grouped order can't be ratcheted (Error 10326 → cancel).
 
 
 def _oca(direction=Direction.LONG, qty=2, exit_mode="fixed", entry_ref=20000.0):
@@ -37,34 +39,37 @@ def test_oca_fixed_bracket_returns_three_legs():
     assert parent is not None and stop_child is not None and tp_child is not None
 
 
-def test_oca_trailing_has_no_tp_child_stp_is_sole_transmitting_leg():
-    # Trailing mode: the entry bracket is parent + fixed STP only. The STP is the
-    # last/transmitting leg; the trailing exit is placed standalone post-fill.
+def test_oca_trailing_is_parent_only_no_bracket_child_stop():
+    # STABILIZE-5: trailing mode returns (parent, None, None). The parent is the
+    # SOLE leg and transmits itself; the protective STP is NOT a bracket child (it
+    # would be auto-OCA'd by the gateway → Error 10326 on the ratchet's modify).
     parent, stop_child, tp_child = _oca(exit_mode="trailing", entry_ref=20000.0)
     assert parent.action == "BUY"
     assert parent.orderType == "MKT"
-    assert parent.transmit is False
-    # Fixed protective stop @ entry-75 — STP, never a TRAIL; it is the LAST leg.
-    assert stop_child.action == "SELL"
-    assert stop_child.orderType == "STP"
-    assert stop_child.auxPrice == 20000.0 - 75.0
-    assert stop_child.transmit is True  # sole exit leg → transmits the bracket
-    # STABILIZE-3 — the trailing STP carries NO OCA group. An OCA-grouped order
-    # cannot be modified (IBKR Error 10326 cancels it), which would defeat the
-    # bar-close ratchet that walks this STP UP. A single-member OCA group buys
-    # nothing in trailing mode (there is no sibling leg).
-    assert not stop_child.ocaGroup
-    assert stop_child.ocaType == 0
-    # NO tp child in trailing mode (the trail is the exit, placed post-fill).
-    assert tp_child is None
+    assert parent.transmit is True  # parent is the only leg → it transmits
+    assert stop_child is None  # NO bracket-child STP in trailing mode
+    assert tp_child is None  # NO tp child either
+
+
+def test_oca_trailing_standalone_stp_is_ungrouped_stop_market_parent_zero():
+    # The protective STP the router places post-fill in trailing mode comes from
+    # build_protective_stop: parentId=0 (so the gateway can't auto-OCA it), no
+    # ocaGroup, and a stop-MARKET STP (not stop-limit → guaranteed exit, Harris Ch.4).
+    stp = build_protective_stop(direction=Direction.LONG, qty=2, stop_price=20000.0 - 75.0)
+    assert stp.parentId == 0
+    assert not stp.ocaGroup
+    assert getattr(stp, "ocaType", 0) == 0
+    assert stp.orderType == "STP"  # stop-MARKET, never STP LMT
+    assert stp.auxPrice == 20000.0 - 75.0
+    assert stp.tif == "GTC"
+    assert stp.outsideRth is True
 
 
 def test_oca_fixed_stop_never_trails():
-    # In BOTH modes the protective stop is a fixed STP — never a TRAIL.
-    for mode in ("trailing", "fixed"):
-        _parent, stop_child, _tp = _oca(exit_mode=mode)
-        assert stop_child.orderType == "STP"
-        assert stop_child.auxPrice == 20000.0 - 75.0
+    # In fixed mode the protective stop is a fixed STP — never a TRAIL.
+    _parent, stop_child, _tp = _oca(exit_mode="fixed")
+    assert stop_child.orderType == "STP"
+    assert stop_child.auxPrice == 20000.0 - 75.0
 
 
 def test_oca_fixed_mode_is_legacy_lmt_take_profit_no_regression():
@@ -85,12 +90,6 @@ def test_oca_fixed_both_exit_legs_are_gtc_outside_rth():
     assert tp_child.tif == "GTC"
     assert stop_child.outsideRth is True
     assert tp_child.outsideRth is True
-
-
-def test_oca_trailing_stp_is_gtc_outside_rth():
-    _parent, stop_child, _tp = _oca(exit_mode="trailing")
-    assert stop_child.tif == "GTC"
-    assert stop_child.outsideRth is True
 
 
 def test_oca_fixed_transmit_chains_on_last_leg_only():

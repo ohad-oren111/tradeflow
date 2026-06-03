@@ -109,26 +109,27 @@ def build_entry_oca_bracket(
     the post-fill :func:`ensure_protective_stop` stay as backstops for the
     residual window between the parent fill and the OCA group activating.
 
-    - ``stop_child`` is ALWAYS a fixed STP @ ``stop_price`` — it NEVER trails.
-    - ``tp_child`` is a fixed LMT @ ``target_price`` when ``exit_mode='fixed'``
-      (the legacy take-profit, no regression). When ``exit_mode='trailing'`` there
-      is NO tp child at entry (``tp_child is None``): the fixed STP is the sole exit
-      leg of the entry bracket AND the protective floor, and the orchestrator's
-      bar-close hook (``OrderRouter.ratchet_stop_on_bar`` → ``trail_manager``) walks
-      that STP UP on each closed bar — the SeanBot V3/V12 ratchet (+50 lock, +200
-      trail, +1000 hard cap). No native ``TRAIL`` order is used (Error 328 designed
-      out, §0.5.190); the resting STP is modified in place.
-    - Children are GTC, ``outsideRth=True`` (live overnight Globex), and carry the
-      ``oca_group`` with ``ocaType=1`` (one fill cancels the sibling broker-side);
-      in trailing mode the lone STP keeps the group (harmless single-member OCA)
-      OCA-join it during the never-naked handoff.
+    - ``exit_mode='fixed'`` → returns ``(parent, stop_child, tp_child)``: a fixed STP
+      @ ``stop_price`` + a fixed LMT @ ``target_price``, both carrying ``oca_group``
+      with ``ocaType=1`` (one fill cancels the sibling broker-side). The fixed STP is
+      never ratcheted, so its OCA membership is safe.
+    - ``exit_mode='trailing'`` → returns ``(parent, None, None)``: the entry is the
+      parent ALONE (transmit=True) and the protective STP is placed STANDALONE
+      (parentId=0, ungrouped) post-fill by ``OrderRouter`` — NOT a bracket child.
+      STABILIZE-5: a parentId-linked bracket child is auto-OCA'd by the gateway
+      (ocaType=3), and an OCA-grouped order cannot be modified (Error 10326 → cancel),
+      which would silently break the bar-close ratchet (``ratchet_stop_on_bar`` →
+      ``trail_manager``: +50 lock, +200 trail, +1000 hard cap). A standalone STP is
+      freely modifiable. No native ``TRAIL`` is used (Error 328 designed out,
+      §0.5.190); the STP is stop-MARKET, modified in place.
 
     Transmit chaining: ``parent.transmit=False`` and the LAST placed leg has
-    ``transmit=True`` — fixed mode chains parent → stop → tp (tp transmits);
-    trailing mode chains parent → stop (the STP transmits, as it is the last leg).
-    Either way a failure before the final leg leaves nothing live (never a naked
-    parent). The caller MUST set each child's ``parentId`` to the parent's
-    broker-assigned orderId between the parent placement and each child placement.
+    ``transmit=True`` — fixed mode chains parent → stop → tp (tp transmits). In
+    trailing mode the parent is the sole leg and transmits itself. Either way a
+    failure before the final leg leaves nothing live (never a naked parent). For
+    fixed mode the caller MUST set each child's ``parentId`` to the parent's
+    broker-assigned orderId between the parent placement and each child placement;
+    in trailing mode there is no child to stitch.
     """
     if qty <= 0:
         raise ValueError(f"qty must be positive, got {qty}")
@@ -152,8 +153,37 @@ def build_entry_oca_bracket(
     parent.transmit = False
     parent.tif = "DAY"
 
-    # Fixed protective stop @ stop_price. In fixed mode it never moves; in trailing
-    # mode it is the floor the bar-close ratchet walks UP (router/trail_manager).
+    if exit_mode == "trailing":
+        # STABILIZE-5 — in trailing mode the entry is the parent ALONE; the
+        # protective STP is NOT a native bracket child. Returning ``stop_child=None``
+        # tells :meth:`OrderRouter.place_entry` to place a STANDALONE STP (parentId=0,
+        # ungrouped) inside the parent fillEvent handler (§0.5.T2 option-γ), via
+        # :func:`build_protective_stop` / :func:`ensure_protective_stop`.
+        #
+        # Why not a bracket child: a parentId-linked STP is AUTO-OCA'd by the IB
+        # gateway (ocaType=3, ocaGroup = parent permId) even when the code sets no
+        # ocaGroup — and an OCA-grouped order cannot be modified (IBKR Error 10326
+        # "OCA group revision is not allowed" → the gateway CANCELS it). That silently
+        # destroys the bar-close ratchet's modify-in-place and leaves the position on
+        # the stale base stop. STABILIZE-3 tried to fix this by not setting an ocaGroup
+        # in code, but the gateway re-introduces it for ANY bracket child. The only
+        # robust cure is to never make the protective stop a bracket child. A
+        # standalone parentId=0 STP is never auto-OCA'd, so the ratchet walks it freely.
+        #
+        # Never-naked holds via the synchronous post-fill placement + the reconciler
+        # leg-heal backstop; never-orphan (cancel the lone STP when the position closes
+        # by any other path) is OrderRouter._cancel_sibling_legs + the reconciler's
+        # _cancel_open_legs. There is no native TRAIL (Error 328, §0.5.190); the STP is
+        # stop-MARKET so a fast move always exits (Harris Ch.4 — guaranteed exit beats
+        # guaranteed price for the protective leg). ``trail_offset`` / ``entry_ref_price``
+        # are validated/retained above for API stability.
+        parent.transmit = True
+        return parent, None, None
+
+    # Fixed protective stop @ stop_price — it never moves in fixed mode. The STP shares
+    # an OCA group with the LMT take-profit so a fill on one cancels the other
+    # broker-side. (Fixed-mode STPs are never ratcheted, so the OCA grouping is safe —
+    # no modify → no Error 10326. Only the trailing STP must stay ungrouped.)
     stop_child = Order()
     stop_child.action = exit_action
     stop_child.totalQuantity = qty
@@ -161,28 +191,6 @@ def build_entry_oca_bracket(
     stop_child.auxPrice = float(stop_price)
     stop_child.tif = "GTC"
     stop_child.outsideRth = True
-
-    if exit_mode == "trailing":
-        # NO tp child at entry — the STP is the sole exit leg AND the last leg, so it
-        # transmits the bracket. No native TRAIL order is used (a TRAIL cannot be a
-        # child of a MKT parent: Error 328, §0.5.190); instead the bar-close ratchet
-        # (router/trail_manager) walks this STP UP each bar. ``trail_offset`` /
-        # ``entry_ref_price`` are validated/retained for API stability.
-        #
-        # STABILIZE-3 — the trailing STP carries NO OCA group. IBKR rejects a modify
-        # of any OCA-grouped order with Error 10326 ("OCA group revision is not
-        # allowed") and CANCELS it — so a single-member OCA group is not "harmless":
-        # it makes the ratchet's modify-in-place illegal, the broker silently drops
-        # the protective stop, and the reconciler then re-arms at the BASE level. With
-        # no group the STP is freely modifiable and the ratchet walks it as intended.
-        # There is no sibling leg in trailing mode, so the OCA group bought nothing;
-        # exit-fill cleanup is handled by OrderRouter._cancel_sibling_legs / the
-        # never-naked backstops.
-        stop_child.transmit = True
-        return parent, stop_child, None
-
-    # Fixed mode — the STP shares an OCA group with the LMT take-profit so a fill on
-    # one cancels the other broker-side. (Fixed-mode STPs are never ratcheted.)
     stop_child.ocaGroup = oca_group
     stop_child.ocaType = 1
 

@@ -107,8 +107,16 @@ These rules are referenced directly in production source (`src/orchestrator.py`,
 - **§0.5.T1** — IBKR client IDs: orchestrator/broker uses `IBKR_CLIENT_ID`. (If a separate market-data feed client is added later, allocate `IBKR_CLIENT_ID + 1` to avoid gateway clashes.)
 - **§0.5.T2** — Long-only bracket-child SL is **disabled by default**; protective stop is placed separately as a GTC STP order by the order router on parent fill.
 - **§0.5.T3** — Use `IB.portfolio()` not `IB.positions()` for runtime reconcile (portfolio carries `marketPrice` and `unrealizedPnL`).
-- **§0.5.T4** — Kill switch exits process with code `42`; systemd has `RestartPreventExitStatus=42` so the unit will NOT auto-restart after a kill-switch trip.
+- **§0.5.T4** — Kill switch: ⚠️ DOC DRIFT — the historical "exits code `42` + systemd `RestartPreventExitStatus=42`" does NOT match this Docker-compose deployment. The kill switch raises an in-process halt + flattens (no process exit); it stays halted until a manual Supabase `halt_acks` / `/tmp/halt_clear` reset. See `docs/runbooks/kill_switch_restart.md`.
 - **§0.5.T5** — Never leave a futures position open on IBKR without a working GTC protective stop. Verify after every entry fill.
+
+## Standing rules — STABILIZE-5 + change management (§0.5.205–209)
+
+- **§0.5.205 — A parentId-linked bracket child is AUTO-OCA'd by the IB gateway** (ocaType=3, group = parent permId) even when the code sets NO ocaGroup. An OCA-grouped order cannot be modified (Error 10326 → the gateway cancels it). Therefore a *modifiable* protective stop (the trailing STP) must be a **STANDALONE order (`parentId=0`), never a native bracket child.** It is placed post-fill by the router (`build_protective_stop` / `ensure_protective_stop`). Fixed-mode STP+LMT may stay an OCA bracket (never ratcheted). STABILIZE-3 (don't set ocaGroup in code) was insufficient — the gateway re-adds it for any child; STABILIZE-5 removes the child entirely.
+- **§0.5.206 — The protective stop is stop-MARKET (`STP`), never stop-limit (`STP LMT`).** A guaranteed exit beats a guaranteed price for the protective leg — a stop-limit can fail to fill in a fast move and leave the position naked (Harris Ch.4). See `docs/research/book_principles.md`.
+- **§0.5.207 — NEVER-ORPHAN.** A standalone stop has no OCA sibling to auto-cancel it, so when the position closes by ANY non-stop path (target / manual flatten / opposite or EOD fill / missed event) the stop must be explicitly cancelled: router `_cancel_sibling_legs` (event-driven, on the exit fill it sees) + reconciler `_cancel_open_legs` (broker-truth backstop on the flat-position close). Pairs with the never-naked leg-heal.
+- **§0.5.208 — Change-management discipline.** Every change runs the loop (observe→hypothesize→build→verify→promote→monitor) in exactly one of four lanes (STABILIZE > REPLICATE > MEASURE > OPTIMIZE) and must clear the promotion gate. Never work a lower lane while a higher lane has an open defect; strategy invention stays shelved. See the `change-management` skill and `docs/ROADMAP.md`.
+- **§0.5.209 — Kill-switch restart is a manual halt-ack, not a process restart.** Clear via a Supabase `halt_acks` row (primary) or `touch /tmp/halt_clear` (fallback); the reconciler polls and clears (~30s). A redeploy/force-recreate silently UN-halts a flat bot (§0.5.202) — re-halt if it must stay parked. Runbook: `docs/runbooks/kill_switch_restart.md`.
 
 ## Session start protocol
 

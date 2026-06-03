@@ -435,6 +435,33 @@ async def test_cancel_all_for_swallows_errors():
     assert ib.cancel_order_by_id.await_count == 3
 
 
+async def test_manual_flatten_trailing_cancels_standalone_stop_then_market_exits():
+    # STABILIZE-5: a manual /flatten on a trailing ACTIVE position (standalone STP
+    # 1003, NO resting TARGET) must cancel the standalone STP — so no SELL leg is left
+    # resting once the position is flattened — then place the market exit. There is no
+    # OCA to auto-cancel the stop, so close_position's cancel_all_for is the guarantee.
+    ib = _make_mock_ib()
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+    ib.place_order = AsyncMock(return_value=_make_trade(7001))  # the MKT exit
+    sm = _make_mock_sm()
+    active_lc = _make_lifecycle(State.ACTIVE, target_order_id=None)  # trailing shape
+    sm.load_non_closed = AsyncMock(return_value=[active_lc])
+    sm.transition.return_value = _make_lifecycle(State.EXITING, target_order_id=None)
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._contracts[active_lc.lifecycle_id] = _make_contract()
+
+    result = await router.close_position("MNQM6", reason="manual_flatten")
+
+    assert result.status == "exit_submitted"
+    # The standalone STP was cancelled (no orphan); the None target is skipped.
+    assert active_lc.stop_order_id in _cancelled_order_ids(ib)
+    # A market exit order was placed to flatten.
+    exit_order = ib.place_order.await_args.args[1]
+    assert exit_order.orderType == "MKT"
+    assert exit_order.action == "SELL"  # closing a LONG
+
+
 # ------------------------------------------------ W-S15.1 sibling-cancel on exit
 
 
@@ -1013,28 +1040,65 @@ async def test_place_entry_exit_mode_mismatch_warns_but_does_not_crash(monkeypat
 # --------------------------- PR 99: entry bracket shape honors exit_mode (§0.5.196)
 
 
-async def test_place_entry_trailing_places_stp_only_no_lmt(monkeypatch):
-    """Trailing entry → parent + STP child ONLY, no resting LMT TARGET. Asserts on the
-    placed order TYPES (not call index): exactly one STP, zero LMT, and the lifecycle
-    transition records target_order_id=None."""
+async def test_place_entry_trailing_places_parent_only_stp_deferred(monkeypatch):
+    """STABILIZE-5: trailing entry places the parent ALONE — NO bracket-child STP and
+    no LMT TARGET. The protective STP is deferred to a standalone post-fill placement
+    (parentId=0), so place_entry makes exactly ONE place_order call and the ENTERING
+    transition records both stop_order_id and target_order_id as None."""
     _trailing(monkeypatch)
     ib = _make_mock_ib()
     sm = _make_mock_sm()
     sm.create_lifecycle.return_value = _make_lifecycle(State.IDLE)
-    sm.transition.return_value = _make_lifecycle(State.ENTERING, target_order_id=None)
-    # Exactly TWO legs in trailing (parent + STP). A 3rd place_order would raise
-    # StopIteration — proving no LMT TARGET is placed.
-    ib.place_order = AsyncMock(side_effect=[_make_trade(2001), _make_trade(2002)])
+    sm.transition.return_value = _make_lifecycle(
+        State.ENTERING, stop_order_id=None, target_order_id=None
+    )
+    # Exactly ONE leg in trailing (the parent). A 2nd place_order would raise
+    # StopIteration — proving neither a bracket-child STP nor an LMT is placed here.
+    ib.place_order = AsyncMock(side_effect=[_make_trade(2001)])
 
     router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
     await router.place_entry(_make_signal(), _make_contract())
 
-    assert ib.place_order.await_count == 2  # parent + STP only
-    placed = [call.args[1] for call in ib.place_order.await_args_list]
-    types = [o.orderType for o in placed]
-    assert types.count("STP") == 1  # one protective stop
-    assert "LMT" not in types  # NO take-profit TARGET in trailing mode
-    assert sm.transition.await_args.kwargs["target_order_id"] is None
+    assert ib.place_order.await_count == 1  # parent only
+    parent = ib.place_order.await_args_list[0].args[1]
+    assert parent.orderType == "MKT"
+    assert parent.transmit is True  # parent is the sole transmitting leg
+    transition = sm.transition.await_args
+    assert transition.kwargs["stop_order_id"] is None  # STP placed post-fill, standalone
+    assert transition.kwargs["target_order_id"] is None  # no resting TARGET in trailing
+
+
+async def test_on_fill_trailing_places_standalone_ungrouped_stp(monkeypatch):
+    """STABILIZE-5: on the trailing parent fill (lc.stop_order_id is None), the router
+    places the protective STP STANDALONE — parentId=0, NO ocaGroup, stop-MARKET — so
+    the gateway can't auto-OCA it and the bar-close ratchet can modify it freely."""
+    _trailing(monkeypatch)
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    # Trailing ENTERING row has NO stop_order_id (deferred to this fill handler).
+    entering_lc = _make_lifecycle(State.ENTERING, stop_order_id=None, target_order_id=None)
+    active_lc = _make_lifecycle(State.ACTIVE)
+    active_lc.lifecycle_id = entering_lc.lifecycle_id
+    sm.transition.return_value = active_lc
+    ib.place_order = AsyncMock(return_value=_make_trade(3001))  # the standalone STP
+
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    router._by_order_id[entering_lc.entry_order_id] = entering_lc  # type: ignore[arg-type]
+    router._by_lifecycle_id[entering_lc.lifecycle_id] = entering_lc
+    router._contracts[entering_lc.lifecycle_id] = _make_contract()
+
+    trade = _make_trade_with_fill(entering_lc.entry_order_id, qty=2, price=20000.0)  # type: ignore[arg-type]
+    await router.on_fill(trade, None)
+
+    # Exactly one STP placed, standalone + ungrouped.
+    ib.place_order.assert_awaited_once()
+    stp = ib.place_order.await_args.args[1]
+    assert stp.orderType == "STP"  # stop-MARKET, never STP LMT
+    assert stp.parentId == 0  # standalone — gateway can't auto-OCA it
+    assert not stp.ocaGroup
+    assert getattr(stp, "ocaType", 0) == 0
+    # The new standalone STP id lands on the ACTIVE transition.
+    assert sm.transition.await_args.kwargs["stop_order_id"] == 3001
 
 
 async def test_place_entry_fixed_places_stp_and_lmt():
@@ -1061,11 +1125,13 @@ async def test_on_fill_trailing_seeds_and_persists_highest(monkeypatch):
     _trailing(monkeypatch)
     ib = _make_mock_ib()
     sm = _make_mock_sm()
-    entering_lc = _make_lifecycle(State.ENTERING, stop_order_id=2002, target_order_id=None)
+    # STABILIZE-5: trailing ENTERING row has no stop_order_id (the standalone STP is
+    # placed on this fill); highest seeding is independent of that placement.
+    entering_lc = _make_lifecycle(State.ENTERING, stop_order_id=None, target_order_id=None)
     active_lc = _make_lifecycle(State.ACTIVE)
     active_lc.lifecycle_id = entering_lc.lifecycle_id  # same lifecycle (mirror real transition)
     sm.transition.return_value = active_lc
-    ib.place_order = AsyncMock(return_value=_make_trade(9999))  # STP already rests → no-op
+    ib.place_order = AsyncMock(return_value=_make_trade(9999))  # the standalone STP
 
     router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
     router._by_order_id[entering_lc.entry_order_id] = entering_lc  # type: ignore[arg-type]
