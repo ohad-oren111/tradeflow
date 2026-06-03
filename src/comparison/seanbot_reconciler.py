@@ -26,7 +26,7 @@ import asyncio
 import json
 import logging
 import pathlib
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -153,6 +153,47 @@ def record_to_row(record: dict) -> dict:
     }
 
 
+def evaluate_sb_trigger(
+    *,
+    direction: str | None,
+    symbol: str | None,
+    sb_price: float | None,
+    current_price: float | None,
+    sma100: float | None,
+    near_below_pts: float,
+    near_above_pts: float,
+    no_chase_max_pts: float,
+) -> tuple[bool, str]:
+    """Pure validity check for the REPLICATE SeanBot-triggered entry path.
+
+    Returns ``(ok, reason)``. ``ok`` is True only if ALL hold: the signal is a
+    LONG MNQ entry, indicators are warm (``sma100`` present), the *current* price
+    is inside the near-MA window ``[sma100 - near_below, sma100 + near_above]``,
+    and it is NOT a stale chase (current price is not more than ``no_chase_max``
+    points above SeanBot's signal price). ``current_price`` is TradeFlow's
+    freshest SETTLED-bar truth (no look-ahead) supplied by the caller.
+
+    Halt and FLAT/no-stack are NOT checked here — they are enforced downstream by
+    the orchestrator entry path (``is_halted`` drop + ``create_lifecycle`` reject).
+    Pure: no IO, no side effects, fully unit-testable.
+    """
+    if (direction or "").strip().lower() != "long":
+        return False, f"not-long:{direction!r}"
+    if not (symbol or "").strip().upper().startswith("MNQ"):
+        return False, f"not-mnq:{symbol!r}"
+    if sb_price is None or current_price is None:
+        return False, "no-price"
+    if sma100 is None:
+        return False, "warmup-no-sma"
+    delta_ma = current_price - sma100
+    if delta_ma < -near_below_pts or delta_ma > near_above_pts:
+        return False, f"far-from-ma:{delta_ma:+.2f}"
+    drift = current_price - sb_price
+    if drift > no_chase_max_pts:
+        return False, f"stale-chase:{drift:+.2f}"
+    return True, f"ok:px-sma={delta_ma:+.2f},px-sb={drift:+.2f}"
+
+
 class SeanbotReconciler:
     """Polls Supabase ``seanbot_signals`` for new entries and reconciles each.
 
@@ -168,11 +209,16 @@ class SeanbotReconciler:
         tolerance_sec: float = _TOLERANCE_SEC,
         poll_interval_sec: float = _POLL_INTERVAL_SEC,
         journal_path: str = _RECON_JSONL_PATH,
+        entry_handler: Callable[[dict], Awaitable[None]] | None = None,
     ) -> None:
         self._decisions_getter = decisions_getter
         self._tolerance_sec = tolerance_sec
         self._poll_interval_sec = poll_interval_sec
         self._journal_path = journal_path
+        # REPLICATE — optional async callback invoked once per freshly-reconciled
+        # (deduped) entry. The orchestrator wires this to its validity-checked
+        # SeanBot-triggered entry path. None keeps the reconciler observe-only.
+        self._entry_handler = entry_handler
         self._seen: set[tuple[Any, Any]] = set()
         # Only reconcile signals captured after startup — set on first poll.
         self._cursor_iso: str | None = None
@@ -277,6 +323,19 @@ class SeanbotReconciler:
                 # _persist_reconciliation never raises.
                 await self._persist_reconciliation(db, record)
                 count += 1
+                # REPLICATE — fire the SeanBot-triggered entry path on this fresh
+                # entry. reconcile_row deduped already (returns None on a re-poll),
+                # so this fires at most once per (channel, message_id). Best-effort:
+                # an entry-path error must never break the observe/eval loop.
+                if self._entry_handler is not None:
+                    try:
+                        await self._entry_handler(row)
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "[RECON] seanbot entry_handler error — type=%s msg=%s",
+                            type(exc).__name__,
+                            exc,
+                        )
         return count
 
     async def run_until_stopped(self, stop_event: asyncio.Event, db: Any) -> None:

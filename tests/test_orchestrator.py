@@ -803,3 +803,121 @@ def test_readiness_fragment_warming_and_ready(monkeypatch):
     frag2 = Orchestrator._readiness_fragment(ready, now)
     assert "warmup=ready (120 bars)" in frag2
     assert "last_bar=n/a" in frag2
+
+
+# ----- REPLICATE: SeanBot-triggered validity-checked entry ------------------
+
+
+def _fresh_decision(close: float, sma100: float) -> dict:
+    from datetime import UTC, datetime
+
+    return {"ts": datetime.now(UTC).isoformat(), "close": close, "sma100": sma100}
+
+
+async def test_sb_entry_fires_on_valid_in_window_signal():
+    from types import SimpleNamespace
+
+    captured = {}
+
+    async def fake_handle(sig):
+        captured["sig"] = sig
+
+    fake = SimpleNamespace(
+        _strategy=SimpleNamespace(last_decision=_fresh_decision(30502.0, 30500.0)),
+        _instrument="MNQM6",
+        _handle_trade_signal=fake_handle,
+    )
+    row = {"direction": "long", "symbol": "MNQ", "price": 30500.0}
+    await Orchestrator._maybe_enter_on_seanbot(fake, row)
+
+    sig = captured["sig"]
+    assert sig.direction == "LONG"
+    assert sig.instrument == "MNQM6"
+    assert sig.entry_price == 30502.0
+    assert sig.stop_price == 30502.0 - RISK.stop_loss_pts
+    assert sig.target_price == 30502.0 + RISK.take_profit_pts
+
+
+async def test_sb_entry_rejects_stale_chase():
+    from types import SimpleNamespace
+
+    calls = []
+
+    async def fake_handle(sig):
+        calls.append(sig)
+
+    # current 30540 is +40 above SB's 30500 signal (> no_chase 25) -> reject.
+    fake = SimpleNamespace(
+        _strategy=SimpleNamespace(last_decision=_fresh_decision(30540.0, 30510.0)),
+        _instrument="MNQM6",
+        _handle_trade_signal=fake_handle,
+    )
+    row = {"direction": "long", "symbol": "MNQ", "price": 30500.0}
+    await Orchestrator._maybe_enter_on_seanbot(fake, row)
+    assert calls == []
+
+
+async def test_sb_entry_rejects_stale_bar():
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+
+    calls = []
+
+    async def fake_handle(sig):
+        calls.append(sig)
+
+    old_ts = (datetime.now(UTC) - timedelta(seconds=600)).isoformat()
+    fake = SimpleNamespace(
+        _strategy=SimpleNamespace(
+            last_decision={"ts": old_ts, "close": 30502.0, "sma100": 30500.0}
+        ),
+        _instrument="MNQM6",
+        _handle_trade_signal=fake_handle,
+    )
+    row = {"direction": "long", "symbol": "MNQ", "price": 30500.0}
+    await Orchestrator._maybe_enter_on_seanbot(fake, row)
+    assert calls == []  # not fresh -> no entry
+
+
+async def test_sb_entry_no_stack_when_already_in_position():
+    """De-dup vs own-gate / no-stack: place_entry rejects with
+    InvariantViolationError (a non-CLOSED lifecycle exists); the SB path must
+    swallow it via _handle_trade_signal and record the suppression, not crash."""
+    from datetime import UTC, datetime
+
+    from src.state_machine import InvariantViolationError
+
+    mock_ib = _make_mock_ib()
+    mock_db = _make_mock_db()
+    orch = Orchestrator(mock_ib, mock_db, paper_account="DUQ1234567")
+    orch._strategy._last_decision = {
+        "ts": datetime.now(UTC).isoformat(),
+        "close": 30502.0,
+        "sma100": 30500.0,
+    }
+    orch._router.place_entry = AsyncMock(side_effect=InvariantViolationError("already in position"))
+    row = {"direction": "long", "symbol": "MNQ", "price": 30500.0}
+    await orch._maybe_enter_on_seanbot(row)
+
+    orch._router.place_entry.assert_awaited_once()  # attempted the entry
+    assert len(orch._suppressed_entry_ts) == 1  # suppressed, no stack, no crash
+
+
+async def test_sb_entry_disabled_is_noop():
+    from types import SimpleNamespace
+
+    calls = []
+
+    async def fake_handle(sig):
+        calls.append(sig)
+
+    fake = SimpleNamespace(
+        _strategy=SimpleNamespace(last_decision=_fresh_decision(30502.0, 30500.0)),
+        _instrument="MNQM6",
+        _handle_trade_signal=fake_handle,
+    )
+    row = {"direction": "long", "symbol": "MNQ", "price": 30500.0}
+    # RISK is a frozen dataclass — patch the orchestrator's module-level symbol.
+    with patch("src.orchestrator.RISK", SimpleNamespace(sb_trigger_enabled=False)):
+        await Orchestrator._maybe_enter_on_seanbot(fake, row)
+    assert calls == []
