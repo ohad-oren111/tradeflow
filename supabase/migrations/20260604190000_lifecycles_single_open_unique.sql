@@ -1,0 +1,33 @@
+-- =====================================================================
+-- GATE-1: durable single-open-position invariant.
+--
+-- Enforces "at most one non-CLOSED lifecycle per (symbol, strategy)" at the
+-- DB layer as a PARTIAL UNIQUE INDEX — the race-proof, restart-surviving
+-- backstop behind the in-code probe + asyncio.Lock in
+-- StateMachine.create_lifecycle.
+--
+-- Why it is needed: the strategy bar-eval loop and the SeanBot-trigger task
+-- run on the same event loop and interleave at the await boundary inside
+-- create_lifecycle; both can pass the probe-before-insert and both insert,
+-- producing a double bracket / 4 contracts (proven 2026-06-01: lifecycles
+-- c06ed026 + 347d5a12, identical entry 30559.25, 124ms apart, -$1,854
+-- combined). The asyncio.Lock closes the in-process race; THIS index closes
+-- the cross-process / cross-restart race and makes the invariant durable.
+-- A second insert hits 23505 (unique_violation) -> PostgREST 409, which
+-- create_lifecycle catches and converts to InvariantViolationError.
+--
+-- NOT identity coupling (cf. the create_lifecycle docstring / Botty G105/G106):
+--   * the primary key stays the surrogate lifecycle_id UUID;
+--   * the index is PARTIAL (WHERE state <> 'CLOSED'), so UNLIMITED CLOSED rows
+--     remain per (symbol, strategy) — full trade history and re-entry after a
+--     close are untouched. Only the live-position subset is constrained, which
+--     is exactly the invariant the code already tries to hold.
+--
+-- Additive + idempotent (CREATE UNIQUE INDEX IF NOT EXISTS). The index build
+-- succeeds only while <=1 non-CLOSED row exists per (symbol, strategy);
+-- verified exactly 1 non-CLOSED row at authoring time (GATE-1 pre-flight V5,
+-- lifecycle 2812b3fb MNQM6/sma100_bounce).
+-- =====================================================================
+CREATE UNIQUE INDEX IF NOT EXISTS lifecycles_one_open_per_symbol_strategy
+  ON public.lifecycles (symbol, strategy)
+  WHERE state <> 'CLOSED';

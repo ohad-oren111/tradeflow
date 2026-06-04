@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from src.clients.ib_client import IBClient
@@ -315,6 +317,88 @@ async def test_create_lifecycle_inserts_idle_row():
     event_payload = db.insert_lifecycle_event.await_args.args[0]
     assert event_payload["to_state"] == "IDLE"
     assert event_payload["from_state"] is None
+
+
+# ----------------------------------------------- GATE-1 — race-proof single-open
+
+
+def _http_409() -> httpx.HTTPStatusError:
+    """A PostgREST unique-violation: 23505 surfaces as HTTP 409 via raise_for_status."""
+    req = httpx.Request("POST", "https://example.supabase.co/rest/v1/lifecycles")
+    resp = httpx.Response(409, request=req, text='{"code":"23505"}')
+    return httpx.HTTPStatusError("conflict", request=req, response=resp)
+
+
+async def test_create_lifecycle_converts_db_409_to_invariant_violation():
+    """The DB partial-unique-index backstop: a 409 on insert is surfaced as the
+    SAME InvariantViolationError the in-code probe raises, so callers handle one
+    exception type. No lifecycle_event is written for the rejected insert."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    # Probe passes (simulates the racing task that slipped past probe-before-insert);
+    # the DB index then rejects the second insert.
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=[])
+    db.insert_lifecycle = AsyncMock(side_effect=_http_409())
+    sm = StateMachine(db=db, ib=ib)
+
+    with pytest.raises(InvariantViolationError, match="db-unique"):
+        await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG)
+
+    db.insert_lifecycle.assert_awaited_once()
+    db.insert_lifecycle_event.assert_not_awaited()
+
+
+async def test_create_lifecycle_reraises_non_409_http_error():
+    """A non-conflict HTTP error (e.g. 500) is NOT swallowed — it propagates so an
+    outage is never masked as an invariant rejection."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=[])
+    req = httpx.Request("POST", "https://example.supabase.co/rest/v1/lifecycles")
+    resp = httpx.Response(500, request=req)
+    db.insert_lifecycle = AsyncMock(
+        side_effect=httpx.HTTPStatusError("server error", request=req, response=resp)
+    )
+    sm = StateMachine(db=db, ib=ib)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG)
+
+
+async def test_concurrent_create_lifecycle_only_one_wins():
+    """The proven TOCTOU race: two entry tasks for the same (symbol, strategy) both
+    pass the probe, but exactly ONE insert succeeds — the second is rejected. The
+    asyncio.Lock serialises the critical section and the DB 409 is the backstop, so
+    no second bracket can ever be created."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    new_id = str(uuid.uuid4())
+    # Probe ALWAYS returns [] — models both tasks slipping past probe-before-insert
+    # at the await boundary (the exact 2026-06-01 interleave).
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=[])
+    inserted_row = {
+        "lifecycle_id": new_id,
+        "symbol": "MNQM6",
+        "strategy": "sma100_bounce",
+        "direction": "LONG",
+        "state": "IDLE",
+        "metadata": {},
+    }
+    # 2 entries: call 1 inserts (the winner), call 2 hits the unique index (409).
+    db.insert_lifecycle = AsyncMock(side_effect=[[inserted_row], _http_409()])
+    sm = StateMachine(db=db, ib=ib)
+
+    results = await asyncio.gather(
+        sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG),
+        sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG),
+        return_exceptions=True,
+    )
+
+    winners = [r for r in results if isinstance(r, Lifecycle)]
+    losers = [r for r in results if isinstance(r, InvariantViolationError)]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    assert winners[0].lifecycle_id == new_id
+    # Both reached insert (serialised by the lock); only the winner emitted an event.
+    assert db.insert_lifecycle.await_count == 2
+    db.insert_lifecycle_event.assert_awaited_once()
 
 
 # ---------------------------------------------------------------- event + identity
