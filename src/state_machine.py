@@ -29,6 +29,7 @@ from typing import Any
 
 import httpx
 
+from config.risk_params import RISK
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
 
@@ -127,9 +128,21 @@ class StateMachine:
         State.CLOSED: set(),
     }
 
-    def __init__(self, db: SupabaseClient, ib: IBClient) -> None:
+    def __init__(
+        self,
+        db: SupabaseClient,
+        ib: IBClient,
+        *,
+        max_concurrent: int = RISK.max_concurrent,
+    ) -> None:
         self._db = db
         self._ib = ib
+        # PR-A — max non-CLOSED lifecycles allowed per (symbol, strategy). DEFAULT
+        # 1 (RISK.max_concurrent) → today's single-open behavior; the count gate in
+        # create_lifecycle is then identical to the prior existence reject. Injected
+        # (mirrors KillSwitch's ``params``) so tests can exercise N without mutating
+        # the frozen RISK dataclass.
+        self._max_concurrent = max_concurrent
         # GATE-1: serialises the create_lifecycle probe→insert critical section so
         # the two on-loop entry tasks (strategy bar-eval + SeanBot-trigger) cannot
         # interleave at the await boundary and both insert. The DB partial unique
@@ -164,10 +177,22 @@ class StateMachine:
         dir_value = direction.value if isinstance(direction, Direction) else direction
         async with self._create_lock:
             existing = await self._db.select_lifecycles_non_closed_for(symbol, strategy)
-            if existing:
+            # PR-A — count gate vs ``max_concurrent`` (was: reject if ANY existing).
+            # At the default max_concurrent=1, ``len(existing) >= 1`` is identical to
+            # the prior ``if existing`` existence reject → no behavior change. The
+            # exception message keeps the "non-CLOSED lifecycle already exists"
+            # substring so callers (orchestrator suppression) and tests are unchanged.
+            if len(existing) >= self._max_concurrent:
+                LOGGER.info(
+                    "[STATE] %s: entry gated — %d/%d concurrent",
+                    symbol,
+                    len(existing),
+                    self._max_concurrent,
+                )
                 raise InvariantViolationError(
                     f"non-CLOSED lifecycle already exists for symbol={symbol} "
-                    f"strategy={strategy} (count={len(existing)}) — refusing to create"
+                    f"strategy={strategy} (count={len(existing)}/{self._max_concurrent}) "
+                    "— refusing to create"
                 )
 
             payload = {

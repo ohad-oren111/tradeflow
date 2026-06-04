@@ -631,12 +631,15 @@ class OrderRouter:
                 stop_price,
             )
 
-    def _active_trailing_lifecycle(self) -> Lifecycle | None:
-        """The single ACTIVE lifecycle to ratchet this bar (≤1 open position)."""
-        for lc in self._by_lifecycle_id.values():
-            if lc.state == State.ACTIVE.value:
-                return lc
-        return None
+    def _active_trailing_lifecycles(self) -> list[Lifecycle]:
+        """Every ACTIVE lifecycle to ratchet this bar (PR-A: N simultaneous, was ≤1).
+
+        Each carries its own standalone parentId=0 STP and its own high-water mark
+        (keyed by lifecycle_id in ``_highest`` / ``_contracts``), so the bar-close
+        ratchet trails each independently. Insertion-ordered; at the current
+        max_concurrent=1 this yields exactly the single lifecycle the prior
+        singular helper returned — no behavior change."""
+        return [lc for lc in self._by_lifecycle_id.values() if lc.state == State.ACTIVE.value]
 
     async def _broker_in_position(self, lc: Lifecycle) -> bool:
         """§0.5.98 — confirm the broker still holds the position in lc.direction
@@ -669,25 +672,26 @@ class OrderRouter:
     ) -> None:
         """SeanBot V3/V12 bar-close exit ratchet (EXIT_MODE=trailing only).
 
-        Updates the open position's high-water mark from this bar, walks the single
+        For EVERY open ACTIVE lifecycle (PR-A: N simultaneous; was the single open
+        position), updates its own high-water mark from this bar, walks its own
         resting GTC SELL STP UP only (cancel-free: modify-in-place via re-placeOrder
-        — one resting stop the whole time, no naked window), and market-exits on the
-        +hard_ceiling cap. A no-op in fixed mode or with no open position. NEVER
-        raises into the bar loop; any failure leaves the existing stop live."""
+        — one resting stop the whole time, no naked window), and market-exits that
+        position on the +hard_ceiling cap. A no-op in fixed mode or with no open
+        position. NEVER raises into the bar loop; a failure on one lifecycle is
+        isolated (per-lifecycle try/except) and leaves every stop live."""
         if RISK.exit_mode != "trailing":
             return
-        lc = self._active_trailing_lifecycle()
-        if lc is None:
-            return
-        try:
-            await self._ratchet_one(lc, bar_high=bar_high, bar_low=bar_low, bar_close=bar_close)
-        except Exception as exc:  # noqa: BLE001 — never break the bar feed; keep the stop
-            LOGGER.error(
-                "[EXEC] %s: ratchet_error — type=%s msg=%s (stop unchanged)",
-                lc.symbol,
-                type(exc).__name__,
-                exc,
-            )
+        for lc in self._active_trailing_lifecycles():
+            try:
+                await self._ratchet_one(lc, bar_high=bar_high, bar_low=bar_low, bar_close=bar_close)
+            except Exception as exc:  # noqa: BLE001 — never break the bar feed; keep the stop
+                LOGGER.error(
+                    "[EXEC] %s: ratchet_error — lifecycle=%s type=%s msg=%s (stop unchanged)",
+                    lc.symbol,
+                    lc.lifecycle_id,
+                    type(exc).__name__,
+                    exc,
+                )
 
     async def _ratchet_one(
         self,
