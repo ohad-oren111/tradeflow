@@ -216,6 +216,10 @@ class Orchestrator:
             dirty_set=self._dirty_set,
             db=db,
             orchestrator=self,
+            # GATE-ZERO — lets the reconciler arm the bar-close ratchet when it
+            # force-fills an entry the router's fillEvent missed (else the trailing
+            # STP is modifiable but never walks; see Reconciler._reconcile_entering).
+            router=self._router,
         )
         # Kill switch — halt-on-loss/drawdown circuit breaker (stop-only). Reuses
         # the existing halt (blocks entries) + flatten_all (safe cancel+exit) +
