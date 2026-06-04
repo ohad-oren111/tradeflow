@@ -152,7 +152,12 @@ async def test_place_entry_happy_path_creates_lifecycle_and_transitions_to_enter
 
     assert lc is entering_lc
     assert ib.place_order.await_count == 3
-    sm.create_lifecycle.assert_awaited_once_with("MNQM6", STRAT_NAME, Direction.LONG)
+    # PR-B — place_entry now threads the per-bar setup_key (None when not dispatched
+    # via _handle_trade_signal, as here) and this entry's qty into create_lifecycle
+    # (same-setup dedup + aggregate contract cap).
+    sm.create_lifecycle.assert_awaited_once_with(
+        "MNQM6", STRAT_NAME, Direction.LONG, setup_key=None, qty=2
+    )
     transition_call = sm.transition.await_args
     assert transition_call.args[1] is State.ENTERING
     assert transition_call.kwargs["entry_order_id"] == 2001
