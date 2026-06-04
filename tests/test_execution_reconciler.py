@@ -162,6 +162,7 @@ def _build_reconciler(
     dirty_set: DirtySet | None = None,
     db: AsyncMock | None = None,
     orchestrator: MagicMock | None = None,
+    router: MagicMock | None = None,
     halt_ack_file_path: Path | None = None,
     dirty_interval: float = 0.01,
     full_interval: float = 0.02,
@@ -182,6 +183,7 @@ def _build_reconciler(
         dirty_set=dirty_set,
         db=db,
         orchestrator=orchestrator,
+        router=router,
         dirty_drain_interval_sec=dirty_interval,
         full_scan_interval_sec=full_interval,
         halt_ack_file_path=halt_ack_file_path,
@@ -267,6 +269,61 @@ async def test_reconcile_entering_with_matching_position_transitions_to_active_w
     # router never saw the fillEvent), and stamps its id onto the ACTIVE row.
     ib_ref.place_order.assert_awaited_once()
     assert call.kwargs["stop_order_id"] == 9001
+
+
+async def test_force_fill_trailing_arms_router_ratchet(monkeypatch, caplog):
+    # GATE-ZERO: when the router misses the parent fill and the reconciler force-fills
+    # the entry in trailing mode, it must adopt the position into the router's ratchet
+    # (register_recovered) — else the standalone STP never walks (it round-trips to
+    # base even after a +50 run-up). Asserts the adoption call + the arming log.
+    monkeypatch.setattr("src.execution.reconciler.RISK", replace(RISK, exit_mode="trailing"))
+    caplog.set_level(logging.INFO)
+    ib = _make_mock_ib(positions=[_make_position(qty=2, avg_cost=17501.25)], open_trades=[])
+    sm = _make_mock_sm()
+    active_lc = _make_lifecycle(State.ACTIVE)
+    sm.transition.return_value = active_lc
+    router = MagicMock(name="router")
+    rec, _ib, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm, router=router)
+    lc = _make_lifecycle(State.ENTERING)
+
+    action = await rec.reconcile_one(lc)
+
+    assert action is ReconcileAction.ENTERING_TO_ACTIVE
+    # adopted the ACTIVE lifecycle (not the stale ENTERING one) with the broker contract
+    router.register_recovered.assert_called_once()
+    adopted_lc, adopted_contract = router.register_recovered.call_args.args
+    assert adopted_lc is active_lc
+    assert adopted_contract.localSymbol == "MNQM6"
+    assert any("trailing_armed_on_force_fill" in r.getMessage() for r in caplog.records)
+
+
+async def test_force_fill_fixed_mode_does_not_arm_ratchet(monkeypatch):
+    # Fixed mode never ratchets — the force-fill path must NOT call register_recovered.
+    monkeypatch.setattr("src.execution.reconciler.RISK", replace(RISK, exit_mode="fixed"))
+    ib = _make_mock_ib(positions=[_make_position(qty=2, avg_cost=17501.25)], open_trades=[])
+    sm = _make_mock_sm()
+    sm.transition.return_value = _make_lifecycle(State.ACTIVE)
+    router = MagicMock(name="router")
+    rec, _ib, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm, router=router)
+
+    action = await rec.reconcile_one(_make_lifecycle(State.ENTERING))
+
+    assert action is ReconcileAction.ENTERING_TO_ACTIVE
+    router.register_recovered.assert_not_called()
+
+
+async def test_force_fill_trailing_no_router_is_safe(monkeypatch):
+    # Router is optional — force-fill in trailing mode with no router still transitions
+    # (no crash), it simply cannot arm the ratchet (legacy construction path).
+    monkeypatch.setattr("src.execution.reconciler.RISK", replace(RISK, exit_mode="trailing"))
+    ib = _make_mock_ib(positions=[_make_position(qty=2, avg_cost=17501.25)], open_trades=[])
+    sm = _make_mock_sm()
+    sm.transition.return_value = _make_lifecycle(State.ACTIVE)
+    rec, _ib, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm)  # router defaults to None
+
+    action = await rec.reconcile_one(_make_lifecycle(State.ENTERING))
+
+    assert action is ReconcileAction.ENTERING_TO_ACTIVE
 
 
 async def test_reconcile_entering_no_order_no_position_transitions_to_closed_manual():

@@ -62,6 +62,16 @@ class HaltCoordinator(Protocol):
     def halt_raised_at(self) -> datetime | None: ...
 
 
+class RatchetArmer(Protocol):
+    """Subset of ``OrderRouter`` the reconciler needs to arm the bar-close ratchet
+    on the force-fill path. Same loose-coupling rationale as ``HaltCoordinator``:
+    a Protocol keeps the reconciler decoupled from the concrete router and lets
+    tests pass a ``MagicMock``. ``register_recovered`` registers the ACTIVE
+    in-memory copy + contract and seeds the high-water mark."""
+
+    def register_recovered(self, lifecycle: Lifecycle, contract: Any) -> None: ...
+
+
 DEFAULT_HALT_ACK_FILE = Path("/tmp/halt_clear")
 
 
@@ -93,6 +103,7 @@ class Reconciler:
         db: SupabaseClient,
         orchestrator: HaltCoordinator,
         *,
+        router: RatchetArmer | None = None,
         dirty_drain_interval_sec: float = 30.0,
         full_scan_interval_sec: float = 300.0,
         halt_ack_file_path: Path = DEFAULT_HALT_ACK_FILE,
@@ -102,6 +113,10 @@ class Reconciler:
         self._dirty_set = dirty_set
         self._db = db
         self._orchestrator = orchestrator
+        # GATE-ZERO — used to arm the bar-close ratchet on a force-filled entry
+        # (the router only seeds its ratchet on the fillEvent it sees; see
+        # _reconcile_entering). Optional so existing test construction is unchanged.
+        self._router = router
         self._dirty_drain_interval_sec = dirty_drain_interval_sec
         self._full_scan_interval_sec = full_scan_interval_sec
         self._halt_ack_file_path = halt_ack_file_path
@@ -228,7 +243,7 @@ class Reconciler:
             extra: dict[str, Any] = {}
             if stop_order_id is not None:
                 extra["stop_order_id"] = stop_order_id
-            await self._sm.transition(
+            active = await self._sm.transition(
                 lifecycle,
                 State.ACTIVE,
                 reason="recon_entering_to_active",
@@ -238,6 +253,34 @@ class Reconciler:
                 entry_filled_at=_now_iso(),
                 **extra,
             )
+            # GATE-ZERO — arm the bar-close ratchet on the force-fill path.
+            # The router seeds its high-water mark + registers the ACTIVE in-memory
+            # copy ONLY in _handle_parent_fill (the fillEvent it sees). When the router
+            # MISSES the parent fill and we force-fill the entry here, that seeding
+            # never runs: the standalone STP (placed above, STABILIZE-5) is modifiable
+            # but the ratchet stays UN-ARMED, so _active_trailing_lifecycle() never
+            # selects the position and the stop never walks — it round-trips to base
+            # even after a +50 run-up (lifecycle e912f9c2 rode +110.31 and exited at
+            # base −$363). Adopt the now-ACTIVE position into the router's ratchet,
+            # reusing the recovery primitive (registers the ACTIVE copy + contract +
+            # seeds _highest to entry). Trailing-only: fixed mode never ratchets.
+            if (
+                self._router is not None
+                and RISK.exit_mode == "trailing"
+                and active is not None
+                and getattr(active, "state", None) == State.ACTIVE.value
+            ):
+                position = _broker_position_for(positions, lifecycle.symbol)
+                contract = getattr(position, "contract", None) if position is not None else None
+                if contract is not None:
+                    self._router.register_recovered(active, contract)
+                    LOGGER.info(
+                        "[RECON] %s: trailing_armed_on_force_fill — adopted into router "
+                        "ratchet (highest seeded=entry=%.2f) lifecycle=%s",
+                        lifecycle.symbol,
+                        entry_price,
+                        lifecycle.lifecycle_id,
+                    )
             self._log_action(lifecycle, ReconcileAction.ENTERING_TO_ACTIVE)
             return ReconcileAction.ENTERING_TO_ACTIVE
 
