@@ -271,6 +271,40 @@ async def test_recovery_does_not_call_ib_on_empty_lifecycle_list():
     ib.get_open_trades.assert_not_awaited()
 
 
+async def test_recovery_arms_all_active_lifecycles(caplog):
+    # PR-A — boot recovery must arm the ratchet for EVERY non-CLOSED lifecycle
+    # (N, not one). Two ACTIVE positions (distinct symbols) are both registered with
+    # the router and both seeded in the per-position high-water map.
+    caplog.set_level(logging.INFO)
+    db = _make_mock_db()
+    row_a = _make_lifecycle_row(State.ACTIVE, symbol="MNQM6")
+    row_b = _make_lifecycle_row(State.ACTIVE, symbol="MESM6")
+    db.select_lifecycles_non_closed = AsyncMock(return_value=[row_a, row_b])
+    ib = _make_mock_ib_for_recovery(
+        positions=[_make_position("MNQM6", 2), _make_position("MESM6", 2)]
+    )
+
+    orch = Orchestrator(ib, db, paper_account="DUQ1234567", healthcheck_interval=10.0)
+
+    async def stopper():
+        for _ in range(20):
+            await asyncio.sleep(0)
+        if orch._stop_event is not None:
+            orch._stop_event.set()
+
+    with patch.object(orch, "_install_signal_handlers"):
+        await asyncio.wait_for(asyncio.gather(orch.run(), stopper()), timeout=2.0)
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("[ORCH] state: recovery_loaded — count=2" in m for m in msgs)
+    # BOTH lifecycles armed in the router (N, not 1) — cache + high-water seed.
+    router = orch._router
+    assert row_a["lifecycle_id"] in router._by_lifecycle_id
+    assert row_b["lifecycle_id"] in router._by_lifecycle_id
+    assert row_a["lifecycle_id"] in router._highest
+    assert row_b["lifecycle_id"] in router._highest
+
+
 @pytest.fixture(autouse=True)
 def _stable_event_loop():
     """No-op — placeholder to keep this file's fixture surface explicit."""

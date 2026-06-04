@@ -317,3 +317,35 @@ def test_max_consec_eval_errors_defaults_to_three_not_zero():
     # Unset env → default 3 (a 0 default would fail-safe halt on the first blip).
     assert RISK.kill_switch_max_consec_eval_errors == 3
     assert RISK.kill_switch_max_consec_eval_errors > 0
+
+
+# ----------------------------- PR-A — consecutive losses are time-ordered over N
+
+
+async def test_evaluate_orders_closes_globally_by_time_across_lifecycles():
+    # PR-A — with N simultaneous positions the consecutive-loss streak must be
+    # computed over ALL lifecycles' closes in TIME order, not per-symbol. The
+    # evaluator selects every CLOSED row ordered by exit_filled_at desc with NO
+    # symbol filter, so two symbols' closes interleave correctly: a WIN that closed
+    # between two losses (newest-first) breaks the streak.
+    now = datetime.now(UTC)
+    rows = [
+        {"pnl_net": -1.0, "exit_filled_at": (now - timedelta(seconds=10)).isoformat()},  # loss
+        {"pnl_net": 5.0, "exit_filled_at": (now - timedelta(seconds=20)).isoformat()},  # win
+        {"pnl_net": -1.0, "exit_filled_at": (now - timedelta(seconds=30)).isoformat()},  # loss
+    ]
+    db = _db(rows)
+    ks, raised, flat = _build(db=db)
+
+    verdict = await ks.poll_once()
+
+    # Leading run is a single loss (broken by the interleaved win) → ok, no halt.
+    assert verdict.action == "ok"
+    assert raised == [] and flat == []
+    # Query is global + time-ordered: CLOSED, exit_filled_at.desc, NO symbol filter.
+    call = db.select.await_args
+    assert call.args[0] == "lifecycles"
+    filters = call.kwargs["filters"]
+    assert filters["state"] == "eq.CLOSED"
+    assert filters["order"] == "exit_filled_at.desc"
+    assert "symbol" not in filters

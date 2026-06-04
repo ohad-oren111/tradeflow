@@ -977,6 +977,102 @@ async def test_recovery_persisted_below_entry_clamped_to_entry(monkeypatch):
     assert router._highest[lc.lifecycle_id] == 20000.0
 
 
+# ----------------------------------------- PR-A — ratchet/recovery over N positions
+
+
+async def test_ratchet_trails_two_lifecycles_independently_on_their_own_highest(monkeypatch):
+    # PR-A — with two simultaneous open positions, the bar-close ratchet must walk
+    # EACH lifecycle's own standalone STP off ITS own high-water mark, not a single
+    # shared position. Same bar, different seeded peaks → different ratcheted levels,
+    # exactly one broker modify per lifecycle.
+    _trailing(monkeypatch)
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    lc_a = _active_long_lc(stop_order_id=2002, entry=20000.0, stop_price=19925.0)
+    lc_b = _active_long_lc(stop_order_id=3003, entry=20000.0, stop_price=19925.0)
+    order_a = _stop_order(2002, 19925.0)
+    order_b = _stop_order(3003, 19925.0)
+    by_id = {2002: order_a, 3003: order_b}
+
+    async def _find(order_id):  # live STP per id; the same object is mutated by the modify
+        return by_id.get(order_id)
+
+    ib.find_open_order_by_id = AsyncMock(side_effect=_find)
+    ib.get_positions = AsyncMock(return_value=[_position("MNQM6", 4.0)])  # both legs in-position
+    ib.place_order = AsyncMock(return_value=_make_trade_with_status(0, "PreSubmitted"))
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    # Distinct seeded peaks: A at +100 (→ lock-in 20050), B at +300 (→ trail 20150).
+    _wire_active(router, lc_a, seed_highest=20100.0)
+    _wire_active(router, lc_b, seed_highest=20300.0)
+
+    # Bar high 20050 is below BOTH seeded peaks → each keeps its own highest and so
+    # computes off its OWN peak (proves no shared-bar / single-position coupling).
+    await router.ratchet_stop_on_bar(bar_high=20050.0, bar_low=20030.0, bar_close=20040.0)
+
+    # One broker modify per lifecycle, each carrying ITS own ratcheted aux.
+    assert ib.place_order.await_count == 2
+    moved = {call.args[1].orderId: call.args[1].auxPrice for call in ib.place_order.await_args_list}
+    assert moved == {2002: 20050.0, 3003: 20150.0}
+    # Each lifecycle's cached stop advanced to its own independent level.
+    assert router._by_lifecycle_id[lc_a.lifecycle_id].stop_price == 20050.0
+    assert router._by_lifecycle_id[lc_b.lifecycle_id].stop_price == 20150.0
+    assert sm.persist_stop_price.await_count == 2
+
+
+async def test_ratchet_isolates_a_per_lifecycle_failure(monkeypatch):
+    # PR-A — a failure ratcheting one lifecycle must NOT stop the others (per-lc
+    # try/except). lc_a's modify raises; lc_b must still ratchet to its own level.
+    _trailing(monkeypatch)
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    lc_a = _active_long_lc(stop_order_id=2002, entry=20000.0, stop_price=19925.0)
+    lc_b = _active_long_lc(stop_order_id=3003, entry=20000.0, stop_price=19925.0)
+    order_a = _stop_order(2002, 19925.0)
+    order_b = _stop_order(3003, 19925.0)
+    by_id = {2002: order_a, 3003: order_b}
+
+    async def _find(order_id):  # live STP per id
+        return by_id.get(order_id)
+
+    async def _place(_contract, order):  # lc_a's modify fails; lc_b's succeeds
+        if order.orderId == 2002:
+            raise RuntimeError("Error 321 reject")
+        return _make_trade_with_status(order.orderId, "PreSubmitted")
+
+    ib.find_open_order_by_id = AsyncMock(side_effect=_find)
+    ib.get_positions = AsyncMock(return_value=[_position("MNQM6", 4.0)])
+    ib.place_order = AsyncMock(side_effect=_place)
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    _wire_active(router, lc_a, seed_highest=20100.0)
+    _wire_active(router, lc_b, seed_highest=20300.0)
+
+    await router.ratchet_stop_on_bar(bar_high=20050.0, bar_low=20030.0, bar_close=20040.0)
+
+    # lc_a kept its prior stop (modify failed); lc_b still ratcheted to its level.
+    assert router._by_lifecycle_id[lc_a.lifecycle_id].stop_price == 19925.0
+    assert router._by_lifecycle_id[lc_b.lifecycle_id].stop_price == 20150.0
+
+
+def test_register_recovered_arms_each_active_lifecycle():
+    # PR-A — boot recovery must arm the ratchet for EVERY recovered ACTIVE lifecycle
+    # (N, not one): each gets its own high-water seed + contract + cache entry.
+    ib = _make_mock_ib()
+    sm = _make_mock_sm()
+    router = OrderRouter(ib=ib, sm=sm, strategy_name=STRAT_NAME)
+    lc_a = _active_long_lc(stop_order_id=2002, entry=20000.0)
+    lc_a.metadata = {"highest_price": 20120.0}
+    lc_b = _active_long_lc(stop_order_id=3003, entry=21000.0)
+    lc_b.metadata = {"highest_price": 21080.0}
+
+    router.register_recovered(lc_a, _make_contract())
+    router.register_recovered(lc_b, _make_contract())
+
+    assert router._highest[lc_a.lifecycle_id] == 20120.0  # each off its OWN peak
+    assert router._highest[lc_b.lifecycle_id] == 21080.0
+    assert {lc_a.lifecycle_id, lc_b.lifecycle_id} <= set(router._by_lifecycle_id)
+    assert {lc_a.lifecycle_id, lc_b.lifecycle_id} <= set(router._contracts)
+
+
 # -------------------------------------- PR-3: per-entry exit-mode log + mismatch guard
 
 

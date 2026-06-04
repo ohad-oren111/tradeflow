@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from typing import Any
 from unittest.mock import AsyncMock
@@ -399,6 +400,67 @@ async def test_concurrent_create_lifecycle_only_one_wins():
     # Both reached insert (serialised by the lock); only the winner emitted an event.
     assert db.insert_lifecycle.await_count == 2
     db.insert_lifecycle_event.assert_awaited_once()
+
+
+# ------------------------------------------- PR-A — count gate vs max_concurrent
+
+
+def _idle_insert_row() -> dict:
+    """A minimal inserted IDLE row for the allow-path tests."""
+    return {
+        "lifecycle_id": str(uuid.uuid4()),
+        "symbol": "MNQM6",
+        "strategy": "sma100_bounce",
+        "direction": "LONG",
+        "state": "IDLE",
+        "metadata": {},
+    }
+
+
+def _non_closed(n: int) -> list[dict]:
+    """``n`` existing non-CLOSED rows as the probe would return them."""
+    return [{"lifecycle_id": str(uuid.uuid4()), "state": "ACTIVE"} for _ in range(n)]
+
+
+async def test_create_lifecycle_noop_at_max_concurrent_one_rejects_second(caplog):
+    """No-op proof: at the default max_concurrent=1, one existing non-CLOSED row
+    rejects the second entry — observably identical to today's existence reject."""
+    caplog.set_level(logging.INFO)
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=_non_closed(1))
+    sm = StateMachine(db=db, ib=ib)  # default max_concurrent=1
+
+    with pytest.raises(InvariantViolationError, match="non-CLOSED lifecycle already exists"):
+        await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG)
+
+    db.insert_lifecycle.assert_not_awaited()
+    assert any("[STATE] MNQM6: entry gated — 1/1 concurrent" in m for m in caplog.messages)
+
+
+async def test_create_lifecycle_allows_up_to_max_concurrent():
+    """At max_concurrent=3, an entry with 2 existing non-CLOSED rows is ALLOWED
+    (2 < 3) — the count gate, not a bare existence check."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=_non_closed(2))
+    db.insert_lifecycle = AsyncMock(return_value=[_idle_insert_row()])
+    sm = StateMachine(db=db, ib=ib, max_concurrent=3)
+
+    lc = await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG)
+
+    assert lc.state == State.IDLE.value
+    db.insert_lifecycle.assert_awaited_once()
+
+
+async def test_create_lifecycle_rejects_the_max_plus_one_th():
+    """At max_concurrent=3, the 4th entry (3 existing) is rejected — no insert."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=_non_closed(3))
+    sm = StateMachine(db=db, ib=ib, max_concurrent=3)
+
+    with pytest.raises(InvariantViolationError, match="count=3/3"):
+        await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG)
+
+    db.insert_lifecycle.assert_not_awaited()
 
 
 # ---------------------------------------------------------------- event + identity
