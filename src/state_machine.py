@@ -9,17 +9,25 @@ state machine validates transitions and per-state field invariants and raises
 ``InvariantViolationError`` on misuse so bugs fail loud in dev.
 
 The "at most one non-CLOSED lifecycle per (symbol, strategy)" invariant is
-enforced in code via probe-before-insert (see ``create_lifecycle``) — NOT via a
-DB UNIQUE constraint. Botty's G105/G106 root cause was identity coupling via
-such a constraint; TradeFlow schema explicitly omits it.
+enforced defence-in-depth (see ``create_lifecycle``, GATE-1): an in-process
+``asyncio.Lock`` + a fast-path probe + a PARTIAL UNIQUE INDEX on
+``(symbol, strategy) WHERE state <> 'CLOSED'`` (migration
+``20260604190000_lifecycles_single_open_unique``). This is deliberately NOT the
+full natural-key UNIQUE constraint that caused Botty's G105/G106 identity
+coupling: the surrogate ``lifecycle_id`` UUID stays the primary key and the index
+is PARTIAL, so unlimited CLOSED rows (full history + re-entry after close) remain
+per (symbol, strategy) — only the live-position subset is constrained.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from typing import Any
+
+import httpx
 
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
@@ -122,6 +130,11 @@ class StateMachine:
     def __init__(self, db: SupabaseClient, ib: IBClient) -> None:
         self._db = db
         self._ib = ib
+        # GATE-1: serialises the create_lifecycle probe→insert critical section so
+        # the two on-loop entry tasks (strategy bar-eval + SeanBot-trigger) cannot
+        # interleave at the await boundary and both insert. The DB partial unique
+        # index is the cross-process/cross-restart backstop behind this.
+        self._create_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ create
 
@@ -132,41 +145,71 @@ class StateMachine:
         direction: Direction | str,
     ) -> Lifecycle:
         """Insert a new IDLE lifecycle. Rejects if a non-CLOSED row already exists
-        for ``(symbol, strategy)`` (concurrency invariant enforced in code, not DB)."""
-        dir_value = direction.value if isinstance(direction, Direction) else direction
-        existing = await self._db.select_lifecycles_non_closed_for(symbol, strategy)
-        if existing:
-            raise InvariantViolationError(
-                f"non-CLOSED lifecycle already exists for symbol={symbol} "
-                f"strategy={strategy} (count={len(existing)}) — refusing to create"
-            )
+        for ``(symbol, strategy)``.
 
-        payload = {
-            "symbol": symbol,
-            "strategy": strategy,
-            "direction": dir_value,
-            "state": State.IDLE.value,
-            "metadata": {},
-        }
-        LOGGER.info(
-            "[STATE] %s: create_lifecycle — strategy=%s direction=%s",
-            symbol,
-            strategy,
-            dir_value,
-        )
-        rows = await self._db.insert_lifecycle(payload)
-        row = rows[0] if isinstance(rows, list) else rows
-        lc = Lifecycle.from_row(row)
-        await self._db.insert_lifecycle_event(
-            {
-                "lifecycle_id": lc.lifecycle_id,
-                "from_state": None,
-                "to_state": State.IDLE.value,
-                "reason": "create_lifecycle",
-                "payload": {},
+        GATE-1 — the single-open-position invariant is enforced defence-in-depth
+        because the strategy bar-eval loop and the SeanBot-trigger task run on the
+        same event loop and interleave at the ``await`` boundary below; both could
+        pass a bare probe and both insert (proven 2026-06-01: lifecycles c06ed026 +
+        347d5a12, identical entry 124ms apart → double bracket / 4 contracts):
+          1. ``_create_lock`` serialises probe→insert so the two in-process tasks
+             can never interleave (closes the proven race).
+          2. the probe (fast-path) rejects the common already-open case cheaply.
+          3. a PARTIAL UNIQUE INDEX ``(symbol, strategy) WHERE state <> 'CLOSED'``
+             makes the DB reject a racing / cross-process / cross-restart second
+             insert with 23505 → PostgREST 409, caught here and surfaced as the
+             same ``InvariantViolationError`` the probe raises (so callers handle
+             one exception type). See migration
+             ``20260604190000_lifecycles_single_open_unique``."""
+        dir_value = direction.value if isinstance(direction, Direction) else direction
+        async with self._create_lock:
+            existing = await self._db.select_lifecycles_non_closed_for(symbol, strategy)
+            if existing:
+                raise InvariantViolationError(
+                    f"non-CLOSED lifecycle already exists for symbol={symbol} "
+                    f"strategy={strategy} (count={len(existing)}) — refusing to create"
+                )
+
+            payload = {
+                "symbol": symbol,
+                "strategy": strategy,
+                "direction": dir_value,
+                "state": State.IDLE.value,
+                "metadata": {},
             }
-        )
-        return lc
+            LOGGER.info(
+                "[STATE] %s: create_lifecycle — strategy=%s direction=%s",
+                symbol,
+                strategy,
+                dir_value,
+            )
+            try:
+                rows = await self._db.insert_lifecycle(payload)
+            except httpx.HTTPStatusError as exc:
+                resp = exc.response
+                if resp is not None and resp.status_code == 409:
+                    LOGGER.warning(
+                        "[STATE] %s: create rejected — concurrent non-CLOSED "
+                        "lifecycle exists (db-unique)",
+                        symbol,
+                    )
+                    raise InvariantViolationError(
+                        f"non-CLOSED lifecycle already exists for symbol={symbol} "
+                        f"strategy={strategy} (db-unique) — refusing to create"
+                    ) from exc
+                raise
+            row = rows[0] if isinstance(rows, list) else rows
+            lc = Lifecycle.from_row(row)
+            await self._db.insert_lifecycle_event(
+                {
+                    "lifecycle_id": lc.lifecycle_id,
+                    "from_state": None,
+                    "to_state": State.IDLE.value,
+                    "reason": "create_lifecycle",
+                    "payload": {},
+                }
+            )
+            return lc
 
     # -------------------------------------------------------------- transition
 
