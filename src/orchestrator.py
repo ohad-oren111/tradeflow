@@ -1005,6 +1005,35 @@ class Orchestrator:
         commit = (os.environ.get("TRADEFLOW_COMMIT") or "unknown")[:8]
         return f"warmup={warm_str} last_bar={bar_age} commit={commit}"
 
+    def _setup_key_for(self, signal: Signal) -> str | None:
+        """PR-B — a deterministic per-bar identifier shared by BOTH entry paths.
+
+        Both the strategy bar-eval and the SeanBot-trigger task converge here via
+        :meth:`_handle_trade_signal` and read the SAME ``self._strategy.last_decision``
+        (the freshest settled 1-min bar). Keying off its bar-close time truncated to
+        the minute yields an IDENTICAL ``setup_key`` when both react to the same bar
+        (so ``create_lifecycle`` deduples the second to one bracket) and a DISTINCT
+        key across bars (so genuine stacking up to ``max_concurrent`` is allowed).
+
+        Returns ``None`` if there is no settled bar yet (warmup) or the timestamp is
+        unparseable — create_lifecycle then falls back to the count gate + lock only.
+        Not derived from ``signal.timestamp`` (that is ``now()`` at signal build time,
+        which differs by path and can straddle a minute boundary)."""
+        ld = self._strategy.last_decision
+        if not ld:
+            return None
+        raw_ts = ld.get("ts")
+        if not raw_ts:
+            return None
+        try:
+            bar_ts = datetime.fromisoformat(str(raw_ts))
+        except ValueError:
+            return None
+        if bar_ts.tzinfo is None:
+            bar_ts = bar_ts.replace(tzinfo=UTC)
+        bar_minute = bar_ts.replace(second=0, microsecond=0)
+        return f"{signal.instrument}:{bar_minute.isoformat()}"
+
     async def _handle_trade_signal(self, signal: Signal) -> None:
         # PR #12 — drop new entries while halted (foreign-position detection
         # by Reconciler raises the flag; operator clears via Supabase halt_acks
@@ -1015,8 +1044,9 @@ class Orchestrator:
                 signal.direction,
             )
             return
+        setup_key = self._setup_key_for(signal)
         try:
-            await self._router.place_entry(signal, self._contract)
+            await self._router.place_entry(signal, self._contract, setup_key=setup_key)
         except InvariantViolationError:
             # Track 5b — the strategy agreed (long_signal) but a non-CLOSED
             # lifecycle already exists for this symbol/strategy: we're already

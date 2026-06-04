@@ -8,15 +8,17 @@ PR #9 scope is plumbing only — no order placement, no strategy logic. The
 state machine validates transitions and per-state field invariants and raises
 ``InvariantViolationError`` on misuse so bugs fail loud in dev.
 
-The "at most one non-CLOSED lifecycle per (symbol, strategy)" invariant is
-enforced defence-in-depth (see ``create_lifecycle``, GATE-1): an in-process
-``asyncio.Lock`` + a fast-path probe + a PARTIAL UNIQUE INDEX on
-``(symbol, strategy) WHERE state <> 'CLOSED'`` (migration
-``20260604190000_lifecycles_single_open_unique``). This is deliberately NOT the
-full natural-key UNIQUE constraint that caused Botty's G105/G106 identity
+Concurrency (PR-B) allows up to ``max_concurrent`` non-CLOSED lifecycles per
+(symbol, strategy), but never two brackets for the SAME triggering bar. This is
+enforced defence-in-depth (see ``create_lifecycle``): an in-process
+``asyncio.Lock`` + a count gate + a same-setup dedup (an in-lock probe plus a
+PARTIAL UNIQUE INDEX on ``(symbol, strategy, (metadata->>'setup_key'))
+WHERE state <> 'CLOSED'``, migration ``20260605000000_lifecycles_setup_key_dedup``,
+which REPLACES the PR-A ≤1 index) + an aggregate contract cap. This is deliberately
+NOT the full natural-key UNIQUE constraint that caused Botty's G105/G106 identity
 coupling: the surrogate ``lifecycle_id`` UUID stays the primary key and the index
 is PARTIAL, so unlimited CLOSED rows (full history + re-entry after close) remain
-per (symbol, strategy) — only the live-position subset is constrained.
+per (symbol, strategy) — only the live-position-per-setup subset is constrained.
 """
 
 from __future__ import annotations
@@ -134,15 +136,20 @@ class StateMachine:
         ib: IBClient,
         *,
         max_concurrent: int = RISK.max_concurrent,
+        aggregate_contract_cap: int = RISK.aggregate_contract_cap,
     ) -> None:
         self._db = db
         self._ib = ib
-        # PR-A — max non-CLOSED lifecycles allowed per (symbol, strategy). DEFAULT
-        # 1 (RISK.max_concurrent) → today's single-open behavior; the count gate in
-        # create_lifecycle is then identical to the prior existence reject. Injected
+        # PR-A/PR-B — max non-CLOSED lifecycles allowed per (symbol, strategy).
+        # PR-B default is 3 (RISK.max_concurrent) → up to 3 distinct-setup positions
+        # stack; the count gate in create_lifecycle rejects the (max+1)th. Injected
         # (mirrors KillSwitch's ``params``) so tests can exercise N without mutating
         # the frozen RISK dataclass.
         self._max_concurrent = max_concurrent
+        # PR-B — aggregate contract cap across ALL open positions (sum of entry_qty
+        # over every non-CLOSED lifecycle + this entry's qty). 0 = disabled. Default
+        # 8 (RISK.aggregate_contract_cap); non-binding while max_concurrent×size ≤ 8.
+        self._aggregate_contract_cap = aggregate_contract_cap
         # GATE-1: serialises the create_lifecycle probe→insert critical section so
         # the two on-loop entry tasks (strategy bar-eval + SeanBot-trigger) cannot
         # interleave at the await boundary and both insert. The DB partial unique
@@ -156,32 +163,45 @@ class StateMachine:
         symbol: str,
         strategy: str,
         direction: Direction | str,
+        *,
+        setup_key: str | None = None,
+        qty: int | None = None,
     ) -> Lifecycle:
-        """Insert a new IDLE lifecycle. Rejects if a non-CLOSED row already exists
-        for ``(symbol, strategy)``.
+        """Insert a new IDLE lifecycle, enforcing the concurrency guards.
 
-        GATE-1 — the single-open-position invariant is enforced defence-in-depth
-        because the strategy bar-eval loop and the SeanBot-trigger task run on the
-        same event loop and interleave at the ``await`` boundary below; both could
-        pass a bare probe and both insert (proven 2026-06-01: lifecycles c06ed026 +
-        347d5a12, identical entry 124ms apart → double bracket / 4 contracts):
-          1. ``_create_lock`` serialises probe→insert so the two in-process tasks
-             can never interleave (closes the proven race).
-          2. the probe (fast-path) rejects the common already-open case cheaply.
-          3. a PARTIAL UNIQUE INDEX ``(symbol, strategy) WHERE state <> 'CLOSED'``
-             makes the DB reject a racing / cross-process / cross-restart second
-             insert with 23505 → PostgREST 409, caught here and surfaced as the
-             same ``InvariantViolationError`` the probe raises (so callers handle
-             one exception type). See migration
-             ``20260604190000_lifecycles_single_open_unique``."""
+        Three in-lock gates run before the insert (GATE-1 lock held throughout, so
+        the strategy bar-eval loop and the SeanBot-trigger task — which interleave
+        at the ``await`` boundary — see a consistent view):
+
+          1. COUNT GATE (PR-A): reject the (max_concurrent+1)th non-CLOSED lifecycle
+             for ``(symbol, strategy)``.
+          2. SAME-SETUP DEDUP (PR-B): reject if a non-CLOSED lifecycle for
+             ``(symbol, strategy)`` already carries this ``setup_key``. ``setup_key``
+             is a per-triggering-bar identifier both entry paths compute identically
+             (orchestrator ``_handle_trade_signal`` from ``last_decision``); without
+             it the two paths reacting to the SAME bar would each pass the count gate
+             (count < max) and create a SECOND bracket for one market moment — the
+             2026-06-01 double-entry (lifecycles c06ed026 + 347d5a12, 124ms apart).
+             A ``None`` key (degenerate: no settled bar) skips dedup — the count gate
+             and lock still apply.
+          3. AGGREGATE CONTRACT CAP (PR-B): reject if the summed ``entry_qty`` over
+             ALL non-CLOSED lifecycles + this entry's ``qty`` would exceed
+             ``aggregate_contract_cap`` (0 = disabled). A non-binding backstop while
+             max_concurrent × size ≤ cap.
+
+        DB BACKSTOP — a PARTIAL UNIQUE INDEX
+        ``(symbol, strategy, (metadata->>'setup_key')) WHERE state <> 'CLOSED'``
+        makes the DB reject a racing / cross-process / cross-restart second insert
+        for the SAME setup with 23505 → PostgREST 409, caught here and surfaced as
+        the same ``InvariantViolationError`` the in-lock dedup raises (one exception
+        type for callers). See migration
+        ``20260605000000_lifecycles_setup_key_dedup`` (replaces the ≤1 index)."""
         dir_value = direction.value if isinstance(direction, Direction) else direction
         async with self._create_lock:
             existing = await self._db.select_lifecycles_non_closed_for(symbol, strategy)
-            # PR-A — count gate vs ``max_concurrent`` (was: reject if ANY existing).
-            # At the default max_concurrent=1, ``len(existing) >= 1`` is identical to
-            # the prior ``if existing`` existence reject → no behavior change. The
-            # exception message keeps the "non-CLOSED lifecycle already exists"
-            # substring so callers (orchestrator suppression) and tests are unchanged.
+            # PR-A — count gate vs ``max_concurrent``. The exception message keeps the
+            # "non-CLOSED lifecycle already exists" substring so callers (orchestrator
+            # suppression) and tests are unchanged.
             if len(existing) >= self._max_concurrent:
                 LOGGER.info(
                     "[STATE] %s: entry gated — %d/%d concurrent",
@@ -195,12 +215,56 @@ class StateMachine:
                     "— refusing to create"
                 )
 
+            # PR-B — same-setup dedup. If any open lifecycle for (symbol, strategy)
+            # already carries this setup_key, a sibling entry path already took this
+            # bar: reject BEFORE any order is placed (no second bracket). Only fires
+            # for a real key — a None key cannot collapse distinct entries.
+            if setup_key is not None:
+                for row in existing:
+                    meta = row.get("metadata") or {}
+                    if isinstance(meta, dict) and meta.get("setup_key") == setup_key:
+                        LOGGER.info(
+                            "[STATE] %s: entry deduped — same setup %s already open",
+                            symbol,
+                            setup_key,
+                        )
+                        raise InvariantViolationError(
+                            f"non-CLOSED lifecycle already exists for symbol={symbol} "
+                            f"strategy={strategy} setup_key={setup_key} (same-setup) "
+                            "— refusing to create"
+                        )
+
+            # PR-B — aggregate contract cap (0 = disabled). Sum entry_qty over ALL
+            # non-CLOSED lifecycles (filled positions carry it; IDLE/ENTERING None→0)
+            # and add this entry's intended qty. Broker truth for FILLED contracts
+            # equals this sum (entry_qty is stamped from the fill), so no broker
+            # round-trip is taken inside the lock.
+            if self._aggregate_contract_cap > 0:
+                all_open = await self._db.select_lifecycles_non_closed()
+                open_contracts = sum(int(r.get("entry_qty") or 0) for r in all_open)
+                projected = open_contracts + int(qty or 0)
+                if projected > self._aggregate_contract_cap:
+                    LOGGER.info(
+                        "[STATE] %s: entry gated — aggregate cap %d/%d contracts",
+                        symbol,
+                        projected,
+                        self._aggregate_contract_cap,
+                    )
+                    raise InvariantViolationError(
+                        f"aggregate contract cap exceeded for symbol={symbol} "
+                        f"strategy={strategy} (projected={projected}/"
+                        f"{self._aggregate_contract_cap}) — refusing to create"
+                    )
+
+            metadata: dict[str, Any] = {}
+            if setup_key is not None:
+                metadata["setup_key"] = setup_key
             payload = {
                 "symbol": symbol,
                 "strategy": strategy,
                 "direction": dir_value,
                 "state": State.IDLE.value,
-                "metadata": {},
+                "metadata": metadata,
             }
             LOGGER.info(
                 "[STATE] %s: create_lifecycle — strategy=%s direction=%s",
@@ -214,13 +278,14 @@ class StateMachine:
                 resp = exc.response
                 if resp is not None and resp.status_code == 409:
                     LOGGER.warning(
-                        "[STATE] %s: create rejected — concurrent non-CLOSED "
-                        "lifecycle exists (db-unique)",
+                        "[STATE] %s: create rejected — same setup %s already open " "(db-unique)",
                         symbol,
+                        setup_key,
                     )
                     raise InvariantViolationError(
                         f"non-CLOSED lifecycle already exists for symbol={symbol} "
-                        f"strategy={strategy} (db-unique) — refusing to create"
+                        f"strategy={strategy} setup_key={setup_key} (db-unique) "
+                        "— refusing to create"
                     ) from exc
                 raise
             row = rows[0] if isinstance(rows, list) else rows

@@ -97,22 +97,21 @@ class RiskParams:
     max_contracts_per_trade: int = 2
     contracts_per_trade: int = 2  # default standard sizing
 
-    # PR-A — concurrency foundation (behavior-preserving at the default).
-    # ``max_concurrent`` caps how many non-CLOSED lifecycles may exist per
-    # (symbol, strategy): ``create_lifecycle`` rejects the (max+1)th INSIDE the
-    # GATE-1 lock. DEFAULT 1 → byte-for-byte today's single-open behavior (the
-    # count gate ``len(existing) >= 1`` is identical to the prior existence
-    # reject). PR-B bumps this knob (and swaps the GATE-1 ≤1 index for a
-    # same-setup dedup); PR-A only makes the exit/recovery/kill-switch machinery
-    # correct for N. Env: MAX_CONCURRENT. Distinct from the legacy, unwired
-    # ``max_simultaneous_positions``.
-    max_concurrent: int = 1
-    # PR-A — aggregate contract cap across all open positions, PLUMBED BUT
-    # DISABLED in PR-A: the sentinel 0 means "no cap" (inert). PR-B wires the
-    # binding check (reject an entry whose qty would push total broker contracts
-    # over the cap). Defined here so the knob exists; no runtime check reads it
-    # in PR-A, so it cannot change behavior. Env: AGGREGATE_CONTRACT_CAP.
-    aggregate_contract_cap: int = 0
+    # PR-A/PR-B — concurrency. ``max_concurrent`` caps how many non-CLOSED
+    # lifecycles may exist per (symbol, strategy): ``create_lifecycle`` rejects the
+    # (max+1)th INSIDE the GATE-1 lock. PR-A shipped this at DEFAULT 1 (single-open,
+    # no behavior change). PR-B turns concurrency ON — DEFAULT 3 — alongside the
+    # same-setup dedup (so two entry paths reacting to the SAME bar still produce
+    # exactly one bracket) and the GATE-1 ≤1 index swap. Env: MAX_CONCURRENT.
+    # Distinct from the legacy, unwired ``max_simultaneous_positions``.
+    max_concurrent: int = 3
+    # PR-A/PR-B — aggregate contract cap across ALL open positions. PR-A plumbed it
+    # DISABLED (sentinel 0 = no cap). PR-B WIRES the binding check (create_lifecycle
+    # rejects an entry whose qty would push the summed open contracts over the cap)
+    # and sets the DEFAULT to 8. With max_concurrent=3 × 2 contracts = 6 ≤ 8, the
+    # cap is a NON-BINDING backstop today (the count gate binds first) — intended:
+    # it only bites if sizing or max_concurrent later grows. Env: AGGREGATE_CONTRACT_CAP.
+    aggregate_contract_cap: int = 8
 
     # STABILIZE-4 — foreign-position auto-flatten guard. A broker position that does
     # not reconcile to tracked INTENT (its non-CLOSED lifecycles) is flattened at
@@ -253,11 +252,12 @@ RISK = RiskParams(
     # Tolerate up to N consecutive transient evaluator faults before halting
     # (default 3; never treated as 0 — a 0 would halt on the first blip).
     kill_switch_max_consec_eval_errors=_env_int("KILL_SWITCH_MAX_CONSEC_EVAL_ERRORS", 3),
-    # PR-A — concurrency foundation (default = today's single-open behavior).
-    #   MAX_CONCURRENT (1 = single open per symbol/strategy, no behavior change),
-    #   AGGREGATE_CONTRACT_CAP (0 = disabled/inert; PR-B wires the binding check).
-    max_concurrent=_env_int("MAX_CONCURRENT", 1),
-    aggregate_contract_cap=_env_int("AGGREGATE_CONTRACT_CAP", 0),
+    # PR-B — concurrency ON (default = up to 3 distinct-setup positions).
+    #   MAX_CONCURRENT (3 = stack up to 3 non-CLOSED per symbol/strategy; 1 reverts
+    #     to single-open), AGGREGATE_CONTRACT_CAP (8 = total open-contract ceiling;
+    #     0 disables the check). Same-setup dedup makes the higher cap safe.
+    max_concurrent=_env_int("MAX_CONCURRENT", 3),
+    aggregate_contract_cap=_env_int("AGGREGATE_CONTRACT_CAP", 8),
     # PR-1 — entry-gate parity with SeanBot live check_signal (env-tunable):
     #   BULLISH_TOLERANCE (0.0 = strict close>=open),
     #   REGIME_GATE_ENABLED (False = excluded, per operator).

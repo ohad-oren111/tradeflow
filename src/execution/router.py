@@ -265,7 +265,13 @@ class OrderRouter:
 
     # ----------------------------------------------------------------- placement
 
-    async def place_entry(self, signal: Signal, contract: Contract) -> Lifecycle:
+    async def place_entry(
+        self,
+        signal: Signal,
+        contract: Contract,
+        *,
+        setup_key: str | None = None,
+    ) -> Lifecycle:
         """Submit the entry bracket and transition IDLE → ENTERING.
 
         On any failure mid-sequence the router attempts a best-effort cancel of
@@ -277,7 +283,16 @@ class OrderRouter:
         direction = Direction(signal.direction)
         qty = self._contracts_per_signal()
 
-        lc = await self._sm.create_lifecycle(signal.instrument, self._strategy_name, direction)
+        # PR-B — pass the per-bar setup_key (same-setup dedup) and this entry's qty
+        # (aggregate contract cap) into the in-lock create gates. setup_key is None
+        # when the caller is not the bar-dispatch path (e.g. direct integration use).
+        lc = await self._sm.create_lifecycle(
+            signal.instrument,
+            self._strategy_name,
+            direction,
+            setup_key=setup_key,
+            qty=qty,
+        )
 
         # PR B — native server-side OCA bracket: entry parent + fixed-STP child +
         # trailing-TP child, all submitted atomically (transmit chains on the last
