@@ -87,6 +87,14 @@ services:
       # stays 0.0 (source-faithful); 2.0 is the live-parity value. Tune via
       # /divergence agreement.
       BULLISH_TOLERANCE: ${BULLISH_TOLERANCE:-2.0}
+      # Concurrency HOLD — PR-B merged the max_concurrent default of 3 into
+      # config, but concurrency stays OFF until a clean force-fill ratchet is
+      # verified on the PR #114 build. Pin to 1 here (repo-tracked injection
+      # point, overrides env_file + the config default) so the bot reverts to
+      # single-open-per-symbol/strategy. The ≤1 Supabase index
+      # (lifecycles_one_open_per_symbol_strategy) is the DB backstop — two layers.
+      # Literal (not ${...:-1}) so it cannot be silently shadowed by .env (§0.5.159).
+      MAX_CONCURRENT: "1"
     depends_on:
       - ib-gateway
     ports:
