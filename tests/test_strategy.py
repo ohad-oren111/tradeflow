@@ -12,6 +12,8 @@ import pandas as pd
 from config.risk_params import RISK
 from src.indicators import add_all_indicators
 from src.strategy import (
+    _BAR_BUFFER_MAX,
+    _REGIME_WARMUP_30M_BUCKETS,
     GateEval,
     Signal,
     Sma100BounceStrategy,
@@ -20,6 +22,7 @@ from src.strategy import (
     _regime_ok,
     detect_signal,
     evaluate_gates,
+    thirty_min_bucket_count,
 )
 
 ET = ZoneInfo("America/New_York")
@@ -555,8 +558,8 @@ def test_on_new_bar_fires_signal_on_thursday_overnight():
 
 # ----------------------------------------- C1 regime gate (PR #33 addendum)
 # `_regime_ok` requires >=202 30-min bars to evaluate non-warmup behavior. The
-# Sma100BounceStrategy buffer caps at 150 1-min bars, so the live-path tests
-# below directly exercise `_regime_ok` with hand-built 30-min-spaced frames.
+# live-path tests below feed a short (<202-bucket) 1-min stream so the gate
+# fail-opens, and directly exercise `_regime_ok` with hand-built 30-min frames.
 # `test_regime_gate_fails_open_during_warmup` is the integration test that
 # confirms the gate doesn't break the existing 1-min strategy flow.
 
@@ -593,7 +596,7 @@ def test_regime_gate_blocks_long_when_price_below_30m_ema200(caplog):
 
 
 def test_regime_gate_fails_open_during_warmup():
-    """A 1-min bar stream of 150 bars resamples to ~5 30-min bars → fail-open.
+    """A short 1-min bar stream resamples to far fewer than 202 30-min bars → fail-open.
 
     The strategy fixture flow is exactly what production sees, so this also
     confirms the gate (explicitly ENABLED here — it is excluded by default after
@@ -637,6 +640,61 @@ def test_regime_gate_excluded_by_default_after_pr1():
     df = _thirty_minute_close_frame(closes)
     assert RISK.regime_gate_enabled is False
     assert _regime_ok(df, RISK) is True  # excluded → never blocks
+
+
+# ------------------------------- regime-armable buffer (30-min bucket retention)
+# The regime gate resamples the 1-min buffer to 30-min and needs >=202 VALID
+# buckets. These guard that the buffer is sized to RETAIN that many and that the
+# bucket-count diagnostics mirror the gate's resample.
+
+
+def _one_min_close_dicts(n: int, *, start_ts: datetime | None = None) -> list[dict]:
+    """Contiguous 1-min bars (time + close) — n/30 30-min buckets when contiguous."""
+    if start_ts is None:
+        start_ts = datetime(2026, 5, 18, 0, 0, tzinfo=UTC)
+    return [
+        {"time": start_ts + pd.Timedelta(minutes=i), "close": 18000.0 + i * 0.1} for i in range(n)
+    ]
+
+
+def test_bar_buffer_cap_retains_enough_for_regime_arming():
+    """The buffer must retain >=202 thirty-min buckets (~6,060 contiguous 1-min
+    bars) so the regime gate is armable — the old 150 cap could never reach 202."""
+    assert _BAR_BUFFER_MAX >= _REGIME_WARMUP_30M_BUCKETS * 30
+
+
+def test_thirty_min_bucket_count_one_min_stream_collapses_to_30min():
+    """6,060 contiguous 1-min bars resample to exactly 202 thirty-min buckets."""
+    bars = _one_min_close_dicts(_REGIME_WARMUP_30M_BUCKETS * 30)
+    assert thirty_min_bucket_count(bars) == _REGIME_WARMUP_30M_BUCKETS
+
+
+def test_thirty_min_bucket_count_thirty_min_spaced_is_one_per_bar():
+    """30-min-spaced rows are one bucket each (mirrors `_regime_ok`'s resample)."""
+    df = _thirty_minute_close_frame([18000.0 + i for i in range(250)])
+    assert thirty_min_bucket_count(df.to_dict("records")) == 250
+
+
+def test_thirty_min_bucket_count_zero_on_empty_or_no_timestamps():
+    assert thirty_min_bucket_count([]) == 0
+    assert thirty_min_bucket_count([{"close": 1.0}, {"close": 2.0}]) == 0
+
+
+def test_strategy_buffer_retains_more_than_old_150_cap():
+    """seed_bars now retains far more than the old 150-bar cap — proves the deque
+    maxlen was actually raised (300 seeded bars are all kept)."""
+    strat = Sma100BounceStrategy("MNQM6")
+    seeded = strat.seed_bars(_one_min_close_dicts(300))
+    assert seeded == 300
+    assert strat.bar_count == 300
+
+
+def test_regime_bucket_count_method_reflects_buffer():
+    """`regime_bucket_count` reports the gate's live 30-min bucket view (>=202
+    once enough history is buffered)."""
+    strat = Sma100BounceStrategy("MNQM6")
+    strat.seed_bars(_one_min_close_dicts(_REGIME_WARMUP_30M_BUCKETS * 30))
+    assert strat.regime_bucket_count() >= _REGIME_WARMUP_30M_BUCKETS
 
 
 # ----------------------------------------- PR-D3a — per-bar [STRAT] eval log
@@ -843,7 +901,7 @@ def test_on_new_bar_label_noop_warmup_when_indicators_not_ready():
 def test_on_new_bar_label_noop_regime(monkeypatch):
     """C1 — when evaluate_gates reports regime blocked, label is noop_regime.
 
-    The live 150-bar buffer always fail-opens the regime gate (resamples to
+    The short test bar stream always fail-opens the regime gate (resamples to
     < 202 30-min bars), so we force a regime-blocked GateEval to exercise the
     label-derivation branch deterministically.
     """

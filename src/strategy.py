@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -35,8 +36,40 @@ LOGGER = logging.getLogger(__name__)
 STRATEGY_NAME = "sma100_bounce"
 
 _ET = ZoneInfo("America/New_York")
-# Rolling buffer big enough for MA100 + ADX(14) warmup with headroom.
-_BAR_BUFFER_MAX = 150
+# Rolling buffer sized for the 30-min EMA200 regime gate, not just MA100/ADX(14)
+# warmup. `_regime_ok` resamples the 1-min buffer to 30-min and needs >=202 valid
+# buckets (~6,060 contiguous 1-min bars). 7,000 1-min bars resamples to ~233-239
+# 30-min buckets through CME session gaps (measured) — clears 202 with margin so
+# the gate is ARMABLE on boot, while still comfortably covering MA100/ADX warmup.
+_BAR_BUFFER_MAX = 7000
+
+# Minimum VALID 30-min buckets `_regime_ok` needs before it stops failing open and
+# actually evaluates the EMA200 (mirrors the literal in `_regime_ok`). Used only by
+# the armable-state diagnostics below — the gate's own threshold is unchanged.
+_REGIME_WARMUP_30M_BUCKETS = 202
+
+
+def thirty_min_bucket_count(bars: Iterable[Mapping]) -> int:
+    """Number of VALID 30-min buckets these 1-min bars resample to.
+
+    Mirrors :func:`_regime_ok`'s ``close.resample("30min").last().dropna()`` so the
+    ``[REGIME-ARMABLE]`` diagnostics report exactly what the gate would see. Pure /
+    read-only — it does NOT feed the gate. Returns 0 on an empty / timestamp-less
+    frame or any error (never raises; diagnostics must never break the bar loop).
+    """
+    try:
+        rows = list(bars)
+        if len(rows) < 2:
+            return 0
+        df = pd.DataFrame(rows)
+        if "close" not in df.columns or "time" not in df.columns:
+            return 0
+        close = df.set_index("time")["close"]
+        if not isinstance(close.index, pd.DatetimeIndex):
+            close.index = pd.to_datetime(close.index, utc=True, errors="coerce")
+        return int(len(close.resample("30min").last().dropna()))
+    except Exception:  # noqa: BLE001 — diagnostics only, never raise
+        return 0
 
 
 def _parse_hhmm(s: str) -> time:
@@ -432,6 +465,11 @@ class Sma100BounceStrategy:
     @property
     def bar_count(self) -> int:
         return len(self._bars)
+
+    def regime_bucket_count(self) -> int:
+        """Diagnostics: how many VALID 30-min buckets the regime gate currently sees
+        from the live bar buffer. Read-only; does not run or affect the gate."""
+        return thirty_min_bucket_count(self._bars)
 
     @property
     def last_decision(self) -> dict | None:
