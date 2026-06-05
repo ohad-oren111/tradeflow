@@ -52,6 +52,7 @@ from src.state_machine import ExitReason, InvariantViolationError, Lifecycle, St
 # "expected bar window" definition has a single source of truth with the
 # strategy. This is the only consumer outside src.strategy itself.
 from src.strategy import (
+    _REGIME_WARMUP_30M_BUCKETS,
     STRATEGY_NAME,
     Signal,
     Sma100BounceStrategy,
@@ -89,6 +90,17 @@ _DIGEST_FEED_OK_SEC = 5 * 60
 # (src/indicators.py: sma_100), so 100 1-min bars (~99 min) seeds the slow MA;
 # the strategy's own indicators-ready gate is authoritative, this is the ETA.
 _WARMUP_BARS_NEEDED = 100
+
+# Boot warmup backfill windows. The regime gate needs >=202 thirty-min buckets
+# (~7,000 retained 1-min bars), so the boot seed asks for the larger "10 D" window.
+# If IB rejects/short-returns the larger 1-min request (a documented duration/pacing
+# risk — ib_client.get_historical_bars), we fall back to the proven "5 D" window so
+# the SMA is still warm on boot (~5,762 bars); only the regime buffer would be short.
+_REGIME_BACKFILL_DURATION = "10 D"
+_SMA_BACKFILL_DURATION = "5 D"
+# Re-emit the [REGIME-ARMABLE] diagnostics every N live bars (1 bar/min → hourly).
+# Throttled so the 30-min resample (~0.7ms at 7k rows) never runs on every bar.
+_REGIME_ARMABLE_LOG_EVERY = 60
 
 
 def _bar_size_seconds(bar_size: str) -> float:
@@ -294,6 +306,10 @@ class Orchestrator:
             "no",
             "",
         )
+        # regime-armable diagnostics — throttle counter for the periodic
+        # [REGIME-ARMABLE] log emitted from _on_new_bar (observe-only; the gate
+        # itself stays governed by RISK.regime_gate_enabled, untouched here).
+        self._regime_log_counter = 0
 
     async def run(self) -> int:
         """Start orchestrator, loop on healthcheck, return process exit code."""
@@ -568,29 +584,71 @@ class Orchestrator:
             LOGGER.info("[WARMUP-ENABLE] disabled (WARMUP_BACKFILL_TRADE off) — live warmup")
             return
         try:
-            bars = await self._ib.get_historical_bars(self._contract, bar_size=self._bar_size)
-            seed = hist_bars_to_dicts(bars)
-            ok, reason, sma = validate_seed(seed, needed=_WARMUP_BARS_NEEDED)
-            if not ok:
+            seed, sma, used = await self._fetch_warmup_seed()
+            if seed is None:
                 LOGGER.warning(
-                    "[WARMUP-ENABLE] backfill rejected (%s) — falling back to live warmup",
-                    reason,
+                    "[WARMUP-ENABLE] backfill rejected at all windows — falling back to live warmup"
                 )
                 return
             seeded = self._strategy.seed_bars(seed)
             LOGGER.info(
-                "[WARMUP-ENABLE] strategy buffer seeded from backfill — bars=%d sma100=%.2f "
-                "indicators_ready=%s (trades from first live bar)",
+                "[WARMUP-ENABLE] strategy buffer seeded from backfill — bars=%d duration=%s "
+                "sma100=%.2f indicators_ready=%s (trades from first live bar)",
                 seeded,
+                used,
                 sma if sma is not None else float("nan"),
                 seeded >= _WARMUP_BARS_NEEDED,
             )
+            self._log_regime_armable("post-boot-seed")
         except Exception as exc:  # noqa: BLE001 — backfill must never block boot/trading
             LOGGER.warning(
                 "[WARMUP-ENABLE] seed failed — %s: %s (falling back to live warmup)",
                 type(exc).__name__,
                 exc,
             )
+
+    async def _fetch_warmup_seed(
+        self,
+    ) -> tuple[list[dict] | None, float | None, str | None]:
+        """Fetch a boot warmup seed, preferring the regime-armable ``"10 D"`` window
+        and falling back to the proven ``"5 D"`` SMA window if the larger 1-min
+        request is rejected/short (a documented IB duration/pacing risk). Returns
+        ``(seed, sma100, duration)`` on the first window that validates, else
+        ``(None, None, None)``. Does not swallow exceptions — the caller's outer
+        try/except keeps a fetch failure from blocking boot.
+        """
+        for dur in (_REGIME_BACKFILL_DURATION, _SMA_BACKFILL_DURATION):
+            bars = await self._ib.get_historical_bars(
+                self._contract, bar_size=self._bar_size, duration=dur
+            )
+            seed = hist_bars_to_dicts(bars)
+            ok, reason, sma = validate_seed(seed, needed=_WARMUP_BARS_NEEDED)
+            if ok:
+                return seed, sma, dur
+            LOGGER.warning(
+                "[WARMUP-ENABLE] backfill at %s rejected (%s) — trying fallback window",
+                dur,
+                reason,
+            )
+        return None, None, None
+
+    def _log_regime_armable(self, when: str) -> None:
+        """Observe-only — report the live 30-min bucket count + WOULD-arm state so
+        the regime gate's armability is verifiable in logs WITHOUT enabling it.
+        Never raises (diagnostics must not break boot or the bar loop)."""
+        try:
+            buckets = self._strategy.regime_bucket_count()
+            LOGGER.info(
+                "[REGIME-ARMABLE] thirty_min_buckets=%d needed=%d would_arm=%s "
+                "gate_enabled=%s (%s)",
+                buckets,
+                _REGIME_WARMUP_30M_BUCKETS,
+                buckets >= _REGIME_WARMUP_30M_BUCKETS,
+                RISK.regime_gate_enabled,
+                when,
+            )
+        except Exception as exc:  # noqa: BLE001 — diagnostics only
+            LOGGER.debug("[REGIME-ARMABLE] log skipped — %s", exc)
 
     def _arm_farm_flap_resubscribe(self) -> None:
         """Wire the IB client's farm-flap watcher to re-arm the bar sub.
@@ -652,6 +710,13 @@ class Orchestrator:
         # warmup-enable — log the live-only SMA vs the strategy's backfilled SMA
         # this bar. Observe-only: the trade decision above is already made.
         self._warmup_shadow.observe(bar, self._strategy.last_decision)
+        # regime-armable diagnostics — throttled so the 30-min resample never runs
+        # every bar. Observe-only; reports whether the gate WOULD arm without
+        # enabling it (gate stays governed by RISK.regime_gate_enabled).
+        self._regime_log_counter += 1
+        if self._regime_log_counter >= _REGIME_ARMABLE_LOG_EVERY:
+            self._regime_log_counter = 0
+            self._log_regime_armable("live")
         # EXIT_MODE=trailing — walk the resting protective stop on this closed bar
         # (SeanBot V3/V12 ratchet). Dispatched on the loop because it does async
         # broker I/O; a no-op in fixed mode or with no open position, and it never
@@ -708,28 +773,32 @@ class Orchestrator:
 
     async def _reseed_strategy_after_gap(self, gap_bars: int) -> None:
         """PR C — re-seed the (already invalidated) strategy buffer from history so
-        the SMA is warm and contiguous again after a feed gap. Mirrors the boot
-        warmup seed; FAIL-SAFE: a failed/short/absurd backfill leaves the buffer
-        empty and the existing live warmup re-warms it (never a junk SMA, never a
-        trade on a gapped buffer). Never raises. Clears _reseed_in_progress.
+        the SMA is warm and contiguous again after a feed gap. Routes through the
+        SAME regime-armable seed as boot (``_fetch_warmup_seed``: "10 D" with a
+        "5 D" fallback) so the buffer refills to >=202 thirty-min buckets and the
+        regime gate RE-ARMS after a gap — not just the SMA. FAIL-SAFE: a
+        failed/short/absurd backfill leaves the buffer empty and the existing live
+        warmup re-warms it (never a junk SMA, never a trade on a gapped buffer).
+        Never raises. Clears _reseed_in_progress.
         """
         try:
-            bars = await self._ib.get_historical_bars(self._contract, bar_size=self._bar_size)
-            seed = hist_bars_to_dicts(bars)
-            ok, reason, sma = validate_seed(seed, needed=_WARMUP_BARS_NEEDED)
-            if not ok:
+            seed, sma, used = await self._fetch_warmup_seed()
+            if seed is None:
                 LOGGER.warning(
-                    "[FEED] gap re-seed rejected (%s) — buffer empty, live re-warm", reason
+                    "[FEED] gap re-seed rejected at all windows — buffer empty, live re-warm"
                 )
                 return
             seeded = self._strategy.seed_bars(seed)
             LOGGER.warning(
-                "[FEED] gap re-seeded — gap_bars=%d bars=%d sma100=%.2f indicators_ready=%s",
+                "[FEED] gap re-seeded — gap_bars=%d bars=%d duration=%s sma100=%.2f "
+                "indicators_ready=%s",
                 gap_bars,
                 seeded,
+                used,
                 sma if sma is not None else float("nan"),
                 seeded >= _WARMUP_BARS_NEEDED,
             )
+            self._log_regime_armable("post-gap-reseed")
         except Exception as exc:  # noqa: BLE001 — re-seed must never crash the feed
             LOGGER.warning(
                 "[FEED] gap re-seed failed — %s: %s (live re-warm)",

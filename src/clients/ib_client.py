@@ -405,9 +405,12 @@ class IBClient:
         # of the 100 the SMA100 warmup seed needs. "5 D" spans prior session(s)
         # INCLUDING across the weekend, so a Sunday-evening restart right after the
         # reopen (foreseeable under our unstable API) still clears 100 — where "2 D"
-        # would span only Saturday (no bars) + minutes of Sunday. Capped at "5 D":
-        # a much longer 1-min-bar request risks an IB duration/pacing rejection. The
-        # validate_seed >=100 fail-safe still rejects any short result.
+        # would span only Saturday (no bars) + minutes of Sunday. "5 D" is the safe
+        # DEFAULT: a much longer 1-min-bar request risks an IB duration/pacing
+        # rejection. The regime-armable boot seed passes an explicit larger window
+        # ("10 D") and falls back to this "5 D" on rejection (orchestrator
+        # _fetch_warmup_seed); the validate_seed >=100 fail-safe rejects any short
+        # result regardless of duration.
         duration: str = "5 D",
     ) -> list[Any]:
         """One-shot historical bars (``keepUpToDate=False``) — for warmup backfill.
