@@ -6,6 +6,8 @@ import asyncio
 import logging
 import pathlib
 import signal
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from config.risk_params import RISK
@@ -921,3 +923,73 @@ async def test_sb_entry_disabled_is_noop():
     with patch("src.orchestrator.RISK", SimpleNamespace(sb_trigger_enabled=False)):
         await Orchestrator._maybe_enter_on_seanbot(fake, row)
     assert calls == []
+
+
+# ------------------------------- regime-armable boot seed (10 D window + fallback)
+
+
+def _hist_bars(n: int, *, start: datetime, close: float = 20000.0) -> list[SimpleNamespace]:
+    """ib_async BarData-like objects (.date/.open/.high/.low/.close/.volume)."""
+    return [
+        SimpleNamespace(
+            date=start + timedelta(minutes=i),
+            open=close,
+            high=close + 1,
+            low=close - 1,
+            close=close,
+            volume=100,
+        )
+        for i in range(n)
+    ]
+
+
+async def test_seed_warmup_requests_10d_window_and_logs_armable(caplog):
+    """Boot seed asks for the regime-armable '10 D' window; with >=202 thirty-min
+    buckets buffered, [REGIME-ARMABLE] reports would_arm=True — gate still OFF."""
+    caplog.set_level(logging.INFO)
+    orch = Orchestrator(_make_mock_ib(), _make_mock_db(), paper_account="DUQ1234567")
+    orch._warmup_backfill_trade = True
+    start = datetime(2026, 5, 18, 0, 0, tzinfo=UTC)
+    orch._ib.get_historical_bars = AsyncMock(return_value=_hist_bars(6060, start=start))
+
+    await orch._seed_strategy_warmup()
+
+    # assert-by-arg: the larger window was requested.
+    assert orch._ib.get_historical_bars.await_args.kwargs["duration"] == "10 D"
+    assert orch._strategy.bar_count == 6060
+    armable = [r.getMessage() for r in caplog.records if "[REGIME-ARMABLE]" in r.getMessage()]
+    assert armable, "expected a [REGIME-ARMABLE] log line"
+    assert "would_arm=True" in armable[-1]
+    assert "gate_enabled=False" in armable[-1]  # PR keeps the gate OFF
+
+
+async def test_seed_warmup_falls_back_to_5d_when_10d_short():
+    """If the '10 D' 1-min request comes back too short (IB duration/pacing reject),
+    the seed falls back to the proven '5 D' window so the SMA is still warm."""
+    orch = Orchestrator(_make_mock_ib(), _make_mock_db(), paper_account="DUQ1234567")
+    orch._warmup_backfill_trade = True
+    start = datetime(2026, 5, 18, 0, 0, tzinfo=UTC)
+    orch._ib.get_historical_bars = AsyncMock(
+        side_effect=[
+            _hist_bars(50, start=start),  # "10 D" rejected/short (<100 → invalid)
+            _hist_bars(200, start=start),  # "5 D" fallback validates
+        ]
+    )
+
+    await orch._seed_strategy_warmup()
+
+    durations = [c.kwargs["duration"] for c in orch._ib.get_historical_bars.await_args_list]
+    assert durations == ["10 D", "5 D"]
+    assert orch._strategy.bar_count == 200  # seeded from the fallback window
+
+
+async def test_seed_warmup_disabled_skips_fetch():
+    """WARMUP_BACKFILL_TRADE off → no historical fetch, no seed (live warmup)."""
+    orch = Orchestrator(_make_mock_ib(), _make_mock_db(), paper_account="DUQ1234567")
+    orch._warmup_backfill_trade = False
+    orch._ib.get_historical_bars = AsyncMock()
+
+    await orch._seed_strategy_warmup()
+
+    orch._ib.get_historical_bars.assert_not_awaited()
+    assert orch._strategy.bar_count == 0
