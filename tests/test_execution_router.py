@@ -15,7 +15,7 @@ from config.instruments import MNQ
 from config.risk_params import RISK
 from src.clients.ib_client import IBClient
 from src.execution.dirty_set import DirtySet
-from src.execution.router import OrderRouter
+from src.execution.router import OrderRouter, ensure_protective_stop
 from src.state_machine import (
     Direction,
     InvariantViolationError,
@@ -1246,3 +1246,85 @@ async def test_on_fill_trailing_seeds_and_persists_highest(monkeypatch):
     assert router._highest[entering_lc.lifecycle_id] == 20000.0
     sm.persist_highest.assert_awaited_once()
     assert sm.persist_highest.await_args.args[1] == 20000.0
+
+
+# ----------------------------------------- force-fill STP exchange (Error 321)
+
+
+def _make_contract_with_exchange(exchange: str | None) -> MagicMock:
+    """A bare contract whose ``exchange`` is set EXPLICITLY (a plain MagicMock
+    auto-creates a truthy attr, masking the missing-exchange case). ``""`` mirrors
+    the IB.positions() force-fill contract that triggered Error 321."""
+    c = _make_contract()
+    c.exchange = exchange
+    return c
+
+
+async def test_ensure_protective_stop_defaults_missing_exchange_to_cme():
+    # Force-fill-style contract (from IB.positions()) carries no exchange → the STP
+    # placed on it was cancelled by IBKR Error 321. The fix normalizes it to CME
+    # BEFORE place_order, so the order that reaches the broker is valid.
+    ib = _make_mock_ib()
+    ib.place_order = AsyncMock(return_value=_make_trade(154))
+    contract = _make_contract_with_exchange("")
+    lifecycle = _make_lifecycle(State.ACTIVE)
+
+    stop_id = await ensure_protective_stop(
+        ib,
+        contract,
+        lifecycle,
+        qty=2,
+        existing_stop_is_live=False,
+        component="RECON",
+        path="recon_force_fill",
+    )
+
+    ib.place_order.assert_awaited_once()
+    placed_contract = ib.place_order.await_args.args[0]
+    assert placed_contract.exchange == "CME"  # no Error 321 — broker accepts it
+    assert stop_id == 154
+
+
+async def test_ensure_protective_stop_preserves_existing_exchange():
+    # Idempotent: a contract that already carries an exchange is left untouched
+    # (never override). GLOBEX is a sentinel distinct from CME to prove no clobber.
+    ib = _make_mock_ib()
+    ib.place_order = AsyncMock(return_value=_make_trade(160))
+    contract = _make_contract_with_exchange("GLOBEX")
+    lifecycle = _make_lifecycle(State.ACTIVE)
+
+    await ensure_protective_stop(
+        ib,
+        contract,
+        lifecycle,
+        qty=2,
+        existing_stop_is_live=False,
+        component="RECON",
+        path="recon_force_fill",
+    )
+
+    placed_contract = ib.place_order.await_args.args[0]
+    assert placed_contract.exchange == "GLOBEX"  # unchanged
+
+
+async def test_ensure_protective_stop_returns_live_placed_id_for_caller_to_cache():
+    # The id the caller caches (and the ratchet then tracks) is the orderId of the
+    # order that was actually placed — i.e. a LIVE resting id from the start, not a
+    # dead/stale id. With the exchange defaulted, that placement is not rejected.
+    ib = _make_mock_ib()
+    placed_trade = _make_trade(207)
+    ib.place_order = AsyncMock(return_value=placed_trade)
+    contract = _make_contract_with_exchange(None)
+    lifecycle = _make_lifecycle(State.ACTIVE)
+
+    stop_id = await ensure_protective_stop(
+        ib,
+        contract,
+        lifecycle,
+        qty=2,
+        existing_stop_is_live=False,
+        component="RECON",
+        path="recon_force_fill",
+    )
+
+    assert stop_id == placed_trade.order.orderId == 207

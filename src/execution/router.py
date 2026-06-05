@@ -1302,6 +1302,20 @@ async def ensure_protective_stop(
         qty=qty,
         stop_price=float(lifecycle.stop_price),
     )
+    # §0.5.192 — the force-fill path passes an IB.positions() contract, which
+    # omits exchange → IBKR Error 321 ("Missing order exchange") cancels the STP
+    # ~1ms after placement, leaving the position momentarily naked and pinning the
+    # ratchet to a dead order id (it never walks; the position round-trips to base).
+    # Normalize before placement, mirroring the sibling paths (router ratchet-modify
+    # L799, reconciler heal). Idempotent: never overrides an existing exchange.
+    if not getattr(contract, "exchange", None):
+        contract.exchange = "CME"
+        LOGGER.info(
+            "[%s] %s: stop contract exchange defaulted — CME — %s",
+            component,
+            lifecycle.symbol,
+            path,
+        )
     stp_trade = await ib.place_order(contract, stp)
     order = getattr(stp_trade, "order", None)
     raw_oid = getattr(order, "orderId", 0) if order is not None else 0
