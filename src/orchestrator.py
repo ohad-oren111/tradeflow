@@ -773,28 +773,32 @@ class Orchestrator:
 
     async def _reseed_strategy_after_gap(self, gap_bars: int) -> None:
         """PR C — re-seed the (already invalidated) strategy buffer from history so
-        the SMA is warm and contiguous again after a feed gap. Mirrors the boot
-        warmup seed; FAIL-SAFE: a failed/short/absurd backfill leaves the buffer
-        empty and the existing live warmup re-warms it (never a junk SMA, never a
-        trade on a gapped buffer). Never raises. Clears _reseed_in_progress.
+        the SMA is warm and contiguous again after a feed gap. Routes through the
+        SAME regime-armable seed as boot (``_fetch_warmup_seed``: "10 D" with a
+        "5 D" fallback) so the buffer refills to >=202 thirty-min buckets and the
+        regime gate RE-ARMS after a gap — not just the SMA. FAIL-SAFE: a
+        failed/short/absurd backfill leaves the buffer empty and the existing live
+        warmup re-warms it (never a junk SMA, never a trade on a gapped buffer).
+        Never raises. Clears _reseed_in_progress.
         """
         try:
-            bars = await self._ib.get_historical_bars(self._contract, bar_size=self._bar_size)
-            seed = hist_bars_to_dicts(bars)
-            ok, reason, sma = validate_seed(seed, needed=_WARMUP_BARS_NEEDED)
-            if not ok:
+            seed, sma, used = await self._fetch_warmup_seed()
+            if seed is None:
                 LOGGER.warning(
-                    "[FEED] gap re-seed rejected (%s) — buffer empty, live re-warm", reason
+                    "[FEED] gap re-seed rejected at all windows — buffer empty, live re-warm"
                 )
                 return
             seeded = self._strategy.seed_bars(seed)
             LOGGER.warning(
-                "[FEED] gap re-seeded — gap_bars=%d bars=%d sma100=%.2f indicators_ready=%s",
+                "[FEED] gap re-seeded — gap_bars=%d bars=%d duration=%s sma100=%.2f "
+                "indicators_ready=%s",
                 gap_bars,
                 seeded,
+                used,
                 sma if sma is not None else float("nan"),
                 seeded >= _WARMUP_BARS_NEEDED,
             )
+            self._log_regime_armable("post-gap-reseed")
         except Exception as exc:  # noqa: BLE001 — re-seed must never crash the feed
             LOGGER.warning(
                 "[FEED] gap re-seed failed — %s: %s (live re-warm)",

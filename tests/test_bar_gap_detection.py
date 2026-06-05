@@ -6,6 +6,7 @@ and the orchestrator's _handle_post_resubscribe_gap / _reseed_strategy_after_gap
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -13,7 +14,7 @@ from unittest.mock import AsyncMock
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.orchestrator import Orchestrator, _bar_gap_count, _bar_size_seconds
-from src.strategy import Sma100BounceStrategy
+from src.strategy import _REGIME_WARMUP_30M_BUCKETS, Sma100BounceStrategy
 
 # --------------------------------------------------------------------- helpers
 
@@ -228,4 +229,51 @@ async def test_reseed_short_backfill_rejected_keeps_buffer_empty():
     await orch._reseed_strategy_after_gap(gap_bars=9)
 
     assert orch._strategy.bar_count == 0
+    assert orch._reseed_in_progress is False
+
+
+async def test_reseed_after_gap_requests_10d_window_and_rearms(caplog):
+    """The gap re-seed routes through the boot path's regime-armable "10 D" window
+    so the buffer refills to >=202 thirty-min buckets and the gate RE-ARMS after a
+    gap (not just the SMA). Logs [REGIME-ARMABLE] ... post-gap-reseed."""
+    caplog.set_level(logging.INFO)
+    orch = _make_orch()
+    orch._reseed_in_progress = True
+    orch._strategy.invalidate()
+    start = datetime(2026, 6, 2, 9, 0, tzinfo=UTC)
+    n = _REGIME_WARMUP_30M_BUCKETS * 30  # 6,060 contiguous 1-min bars → 202 buckets
+    orch._ib.get_historical_bars = AsyncMock(return_value=_hist_bars(n, start=start))
+
+    await orch._reseed_strategy_after_gap(gap_bars=9)
+
+    # assert-by-arg: the larger regime window was requested.
+    assert orch._ib.get_historical_bars.await_args.kwargs["duration"] == "10 D"
+    assert orch._strategy.bar_count == n
+    assert orch._strategy.regime_bucket_count() >= _REGIME_WARMUP_30M_BUCKETS
+    armable = [r.getMessage() for r in caplog.records if "[REGIME-ARMABLE]" in r.getMessage()]
+    assert armable, "expected a [REGIME-ARMABLE] log line"
+    assert "would_arm=True" in armable[-1]
+    assert "post-gap-reseed" in armable[-1]
+    assert orch._reseed_in_progress is False
+
+
+async def test_reseed_after_gap_falls_back_to_5d_when_10d_short():
+    """If the '10 D' 1-min request comes back too short (IB reject/pacing), the gap
+    re-seed falls back to the proven '5 D' window — SMA stays warm, never naked."""
+    orch = _make_orch()
+    orch._reseed_in_progress = True
+    orch._strategy.invalidate()
+    start = datetime(2026, 6, 2, 9, 0, tzinfo=UTC)
+    orch._ib.get_historical_bars = AsyncMock(
+        side_effect=[
+            _hist_bars(50, start=start),  # "10 D" rejected/short (<100 → invalid)
+            _hist_bars(200, start=start),  # "5 D" fallback validates
+        ]
+    )
+
+    await orch._reseed_strategy_after_gap(gap_bars=9)
+
+    durations = [c.kwargs["duration"] for c in orch._ib.get_historical_bars.await_args_list]
+    assert durations == ["10 D", "5 D"]
+    assert orch._strategy.bar_count == 200  # seeded from the fallback window
     assert orch._reseed_in_progress is False
