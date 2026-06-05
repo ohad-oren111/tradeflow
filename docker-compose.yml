@@ -95,6 +95,12 @@ services:
       # (lifecycles_one_open_per_symbol_strategy) is the DB backstop — two layers.
       # Literal (not ${...:-1}) so it cannot be silently shadowed by .env (§0.5.159).
       MAX_CONCURRENT: "1"
+      # Regime gate ON — block LONG entries when price <= 30-min EMA200 (SeanBot C1,
+      # strategy._regime_ok). Sim on 27 live lifecycles: cuts net loss ~50% by
+      # screening the sustained down-leg; SB shows no profitable below-EMA200 cohort.
+      # Literal (not ${...}) so .env cannot shadow it (§0.5.159). Reversible: delete
+      # this line or set "false" + force-recreate.
+      REGIME_GATE_ENABLED: "true"
     depends_on:
       - ib-gateway
     ports:
