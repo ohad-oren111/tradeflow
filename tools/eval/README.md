@@ -40,6 +40,16 @@ strategy or exit math:
 - **Phase 5 — consolidated report** (`python -m tools.eval.report [--quick]`) — assembles
   the backtest preview + scenario matrix + live/fault status + the one residual.
 
+- **Phase 6 — exit sweep + walk-forward** (`python -m tools.eval.exit_sweep --validate`) —
+  sweeps the exit knobs (stop_loss × lock_in × trail_offset) over the REAL exit, with
+  rolling train→test **walk-forward** so no number is in-sample cherry-picked. Builds the
+  entry tape ONCE (entries are invariant to the exit knobs) then replays each config
+  trade-by-trade; `--validate` asserts the replay is byte-identical to `simulate_segment`
+  on the baseline (also `tests/test_exit_sweep.py`, synthetic, CI-safe). Reports baseline
+  anchor, in-sample sweep, neighbor-plateau robustness, and the OOS verdict vs the §7 bar.
+  `sb_exit_probe.py` (READ-ONLY Supabase) runs captured SeanBot entries through TF's
+  current vs the best swept exit — directional, small-n.
+
 - `fetch_history.py` — read-only (re)fetch of the saved 1-min history (dry-run by default).
 
 ## Fidelity
