@@ -64,6 +64,23 @@ strategy or exit math:
   full-sample (no selection → no in-sample bias). `--validate` asserts the masked replay is
   byte-identical to `simulate_segment` (also `tests/test_below_trend_study.py`, CI-safe).
 
+- **Phase 8 — short-side edge study** (`python -m tools.eval.short_side_study
+  [--validate] [--adx-threshold 20]`) — the symmetric question: a long-only MA100-bounce
+  bot can't profit in a sustained downtrend (it sits out via the regime gate). Does the
+  MIRRORED SHORT — sell SMA100 *rejections* in the DOWN-regime (close < 30m EMA200) — have
+  a real OUT-OF-SAMPLE edge? The entry is a **NEW mirrored entry** (`evaluate_gates_dir`):
+  the documented long gates with the inequalities flipped (ma_order MA50>MA100; `high` in
+  [ma_slow−buf, ma_slow+15]; bearish/doji confirm). **No prod short path exists — this does
+  NOT drive prod.** The exit is the REAL direction-aware exit (`compute_ratcheted_stop` /
+  `should_hard_exit` with `direction=SHORT`: stop ABOVE entry, ratchets DOWN). Entry+exit are
+  DIRECTION-PARAMETERIZED in one path; the **fidelity anchor** (`--validate`,
+  `tests/test_short_side_study.py`) asserts the same path with `direction=LONG` reproduces
+  `simulate_segment` byte-for-byte, and that a price-REFLECTED long fixture fires an
+  identical-P&L short. Primary partition = down-regime shorts ("trade the regime the long
+  bot sits out"); above-regime shorts are reported for reference. Rolling 6mo→2mo
+  walk-forward selects (adx-threshold, exit) on train and scores OOS; the unconditional
+  down-regime set is the honest headline (no selection).
+
 - `fetch_history.py` — read-only (re)fetch of the saved 1-min history (dry-run by default).
 
 ## Fidelity
