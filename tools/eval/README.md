@@ -50,6 +50,20 @@ strategy or exit math:
   `sb_exit_probe.py` (READ-ONLY Supabase) runs captured SeanBot entries through TF's
   current vs the best swept exit — directional, small-n.
 
+- **Phase 7 — below-trend long edge study** (`python -m tools.eval.below_trend_study
+  [--validate] [--chop-threshold 20]`) — the question the regime gate raises: do the
+  below-30m-EMA200 longs the gate now BLOCKS (the trades SB profits from in chop) have a
+  real OUT-OF-SAMPLE edge — unconditionally, or only filtered to chop, and under a fast
+  SB-style exit? It drives the REAL gates with regime OFF (so below-trend entries fire),
+  tags each entry at fill time as ABOVE/BELOW the **same** 30m EMA200 `_regime_ok` uses
+  (same window/resample/EMA200), splits the below set CHOP vs TREND by a **causal** 1-min
+  ADX(14) at the entry bar, and runs each partition through the REAL exit as an independent
+  single-position book — for TF-current (stop75/lock50/trail150), an SB-fast exit
+  (lock15/trail40), and a LABELLED +50-TP what-if. Rolling 6mo→2mo walk-forward selects the
+  (chop-threshold, exit) on train and scores it OOS; the unconditional below set is reported
+  full-sample (no selection → no in-sample bias). `--validate` asserts the masked replay is
+  byte-identical to `simulate_segment` (also `tests/test_below_trend_study.py`, CI-safe).
+
 - `fetch_history.py` — read-only (re)fetch of the saved 1-min history (dry-run by default).
 
 ## Fidelity
