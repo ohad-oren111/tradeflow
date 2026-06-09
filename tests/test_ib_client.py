@@ -468,3 +468,78 @@ def test_adapter_dedup_seed_boundary_and_no_double_process():
 
     closes = [p["close"] for p in captured]
     assert closes == [21501.0, 21502.0]  # minute30 skipped; 31,32 once each; no dup
+
+
+# ----------------------------------------------------------------- FEED-GAP FIX
+# subscribe_bars must CANCEL the prior keepUpToDate subscription before it
+# re-requests, so a self-heal resubscribe replaces the wedged stream instead of
+# colliding with it (Error 162 / seeded=0). See the 2026-06-07 reopen leak.
+
+
+def _connected_client(mock_ib_factory):
+    fake_ib = mock_ib_factory()
+    fake_ib.isConnected.return_value = True
+    fake_ib.cancelHistoricalData = MagicMock(return_value=None)
+    client = IBClient(host="h", port=4002, client_id=1, ib_factory=lambda: fake_ib)
+    return client, fake_ib
+
+
+async def test_subscribe_bars_first_call_does_not_cancel(mock_ib_factory):
+    client, fake_ib = _connected_client(mock_ib_factory)
+    fake_ib.reqHistoricalDataAsync = AsyncMock(return_value=["b1", "b2"])
+
+    await client.subscribe_bars(MagicMock(localSymbol="MNQM6"))
+
+    # No prior subscription existed -> nothing to cancel.
+    fake_ib.cancelHistoricalData.assert_not_called()
+    assert client._active_bar_sub == ["b1", "b2"]
+
+
+async def test_subscribe_bars_cancels_prior_before_resubscribe(mock_ib_factory):
+    client, fake_ib = _connected_client(mock_ib_factory)
+    first = ["b1", "b2"]
+    second = ["c1", "c2", "c3"]
+    fake_ib.reqHistoricalDataAsync = AsyncMock(side_effect=[first, second])
+
+    # Attach both calls to one parent so their relative order is observable.
+    parent = MagicMock()
+    parent.attach_mock(fake_ib.cancelHistoricalData, "cancel")
+    parent.attach_mock(fake_ib.reqHistoricalDataAsync, "req")
+
+    contract = MagicMock(localSymbol="MNQM6")
+    await client.subscribe_bars(contract)  # establishes `first`
+    await client.subscribe_bars(contract)  # resubscribe -> must cancel `first` first
+
+    # The prior BarDataList was cancelled exactly once, with the prior handle.
+    fake_ib.cancelHistoricalData.assert_called_once_with(first)
+    assert client._active_bar_sub == second
+    # Cancel of the prior sub happened BEFORE the second re-request (ordering
+    # matters: the gateway cancels a duplicate keepUpToDate otherwise).
+    ordered = [name for name, _, _ in parent.mock_calls]
+    assert ordered == ["req", "cancel", "req"]
+
+
+async def test_subscribe_bars_cancel_failure_does_not_block_resubscribe(mock_ib_factory):
+    client, fake_ib = _connected_client(mock_ib_factory)
+    fake_ib.reqHistoricalDataAsync = AsyncMock(side_effect=[["b1"], ["c1", "c2"]])
+    fake_ib.cancelHistoricalData = MagicMock(side_effect=RuntimeError("stale reqId"))
+
+    contract = MagicMock(localSymbol="MNQM6")
+    await client.subscribe_bars(contract)
+    out = await client.subscribe_bars(contract)  # cancel raises -> must still resubscribe
+
+    assert out == ["c1", "c2"]
+    assert client._active_bar_sub == ["c1", "c2"]
+
+
+async def test_disconnect_clears_active_bar_sub_so_no_stale_cancel(mock_ib_factory):
+    client, fake_ib = _connected_client(mock_ib_factory)
+    fake_ib.reqHistoricalDataAsync = AsyncMock(side_effect=[["b1"], ["c1"]])
+
+    contract = MagicMock(localSymbol="MNQM6")
+    await client.subscribe_bars(contract)
+    client.disconnect()  # handle is bound to the dropped socket -> cleared
+    assert client._active_bar_sub is None
+
+    await client.subscribe_bars(contract)  # fresh socket -> nothing stale to cancel
+    fake_ib.cancelHistoricalData.assert_not_called()

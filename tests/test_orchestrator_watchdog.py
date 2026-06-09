@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 from src.clients.ib_client import IBClient
 from src.clients.supabase_client import SupabaseClient
 from src.orchestrator import (
+    _FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS,
     _WATCHDOG_ALERT_COOLDOWN_SEC,
     _WATCHDOG_FEED_HEAL_COOLDOWN_SEC,
     _WATCHDOG_STALE_THRESHOLD_SEC,
@@ -319,3 +320,74 @@ async def test_maybe_heal_never_raises_on_resubscribe_failure(monkeypatch):
     # Must not raise — self-heal failure can't crash the healthcheck loop.
     await orch._maybe_heal_stale_feed()
     assert orch._last_feed_heal_at == _IN_SESSION
+
+
+# ----------------------------------------------- FEED-GAP FIX: reconnect escalation
+# A resubscribe over a still-up socket cannot clear a wedged keepUpToDate stream
+# (2026-06-07 reopen: 5.5h dark, every same-socket resubscribe = no-op). After
+# _FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS consecutive stale heals fail to restore
+# bars, escalate to the proven recovery: a forced socket reconnect.
+
+
+async def test_maybe_heal_escalates_to_reconnect_after_threshold(caplog, monkeypatch):
+    caplog.set_level(logging.INFO)
+    orch = _make_orch()
+    orch._start_bar_subscription = AsyncMock()
+    orch._resilient_reconnect = AsyncMock()
+    # One short of the threshold; this call pushes the count to the escalation point.
+    orch._consecutive_feed_heals = _FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS - 1
+    monkeypatch.setattr("src.orchestrator.datetime", _FrozenDatetime(_IN_SESSION))
+
+    await orch._maybe_heal_stale_feed()
+
+    # Escalated: forced socket teardown + resilient reconnect, NOT a plain resubscribe.
+    orch._ib.disconnect.assert_called_once()
+    orch._resilient_reconnect.assert_awaited_once()
+    orch._start_bar_subscription.assert_not_awaited()
+    assert any("ESCALATING to socket reconnect" in r.getMessage() for r in caplog.records)
+    assert any(
+        "[ALERT] feed_self_heal_reconnect_escalation" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_maybe_heal_resubscribes_below_threshold(monkeypatch):
+    orch = _make_orch()
+    orch._start_bar_subscription = AsyncMock()
+    orch._resilient_reconnect = AsyncMock()
+    monkeypatch.setattr("src.orchestrator.datetime", _FrozenDatetime(_IN_SESSION))
+
+    # First stale heal — well below threshold → resubscribe, never reconnect.
+    await orch._maybe_heal_stale_feed()
+
+    assert orch._consecutive_feed_heals == 1
+    orch._start_bar_subscription.assert_awaited_once()
+    orch._resilient_reconnect.assert_not_awaited()
+    orch._ib.disconnect.assert_not_called()
+
+
+async def test_maybe_heal_escalation_never_raises(monkeypatch):
+    orch = _make_orch()
+    orch._start_bar_subscription = AsyncMock()
+    orch._resilient_reconnect = AsyncMock(side_effect=RuntimeError("reconnect boom"))
+    orch._consecutive_feed_heals = _FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS - 1
+    monkeypatch.setattr("src.orchestrator.datetime", _FrozenDatetime(_IN_SESSION))
+
+    # A failed escalation must not crash the healthcheck loop.
+    await orch._maybe_heal_stale_feed()
+    orch._resilient_reconnect.assert_awaited_once()
+
+
+def test_on_new_bar_resets_feed_heal_counter(caplog, monkeypatch):
+    caplog.set_level(logging.INFO)
+    orch = _make_orch()
+    orch._strategy = MagicMock()
+    orch._strategy.on_new_bar = MagicMock(return_value=None)
+    orch._consecutive_feed_heals = 2  # mid-escalation count
+    monkeypatch.setattr("src.orchestrator.datetime", _FrozenDatetime(_IN_SESSION))
+
+    orch._on_new_bar({"close": 100.0})
+
+    # A live bar means the feed is healthy again → counter clears so the next
+    # wedge starts its escalation count fresh.
+    assert orch._consecutive_feed_heals == 0
+    assert any("self-heal counter reset: 2 -> 0" in r.getMessage() for r in caplog.records)

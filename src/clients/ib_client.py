@@ -169,6 +169,14 @@ class IBClient:
         self._last_resubscribe_monotonic: float | None = None
         self._farm_flap_loop: asyncio.AbstractEventLoop | None = None
         self._farm_flap_resubscribe: Callable[[], Awaitable[None]] | None = None
+        # FEED-GAP FIX — the most recent live keepUpToDate BarDataList. Tracked so a
+        # resubscribe can CANCEL it before re-requesting; re-issuing
+        # reqHistoricalData(keepUpToDate=True) while the prior subscription is still
+        # registered makes the gateway cancel the NEW query (Error 162, seeded=0) so
+        # the live feed never resumes (the 2026-06-07 reopen: 5.5h dark — every
+        # same-socket self-heal resubscribe was a no-op). Cleared on disconnect (the
+        # handle is bound to the socket that dropped).
+        self._active_bar_sub: BarDataList | None = None
 
     async def connect(self, timeout: float = 10.0) -> None:
         """Connect to IB Gateway. Raises whatever ib_async raises on failure."""
@@ -215,6 +223,10 @@ class IBClient:
 
     def disconnect(self) -> None:
         """Disconnect from IB Gateway. No-op when already disconnected."""
+        # FEED-GAP FIX — the bar subscription is bound to the socket that is going
+        # away; drop the stale handle so a post-reconnect resubscribe does not try
+        # to cancel a reqId the fresh socket never issued.
+        self._active_bar_sub = None
         if self._ib.isConnected():
             LOGGER.info("[ib_client] disconnect — host=%s port=%s", self._host, self._port)
             self._ib.disconnect()
@@ -459,6 +471,13 @@ class IBClient:
         """
         if not self.is_connected:
             raise RuntimeError("not connected — call connect() first")
+        # FEED-GAP FIX — cancel any prior keepUpToDate subscription FIRST so this
+        # re-request replaces the wedged stream instead of colliding with it. A
+        # duplicate keepUpToDate request for the same contract makes the gateway
+        # cancel the new query (Error 162, seeded=0) and the live feed never
+        # resumes — the silent-feed-leak class where every same-socket self-heal
+        # resubscribe is a no-op (see the 2026-06-07 reopen, 5.5h dark).
+        self._cancel_active_bar_sub(reason="resubscribe")
         bars = await self._ib.reqHistoricalDataAsync(
             contract,
             endDateTime="",
@@ -469,6 +488,7 @@ class IBClient:
             formatDate=2,
             keepUpToDate=True,
         )
+        self._active_bar_sub = bars
         LOGGER.info(
             "[ib_client] subscribe_bars — symbol=%s bar_size=%s seeded=%s",
             getattr(contract, "localSymbol", None) or getattr(contract, "symbol", "?"),
@@ -478,6 +498,34 @@ class IBClient:
         if on_new_bar is not None:
             _wire_bar_callback(bars, on_new_bar)
         return bars
+
+    def _cancel_active_bar_sub(self, *, reason: str) -> None:
+        """Cancel the tracked keepUpToDate bar subscription, if any.
+
+        FEED-GAP FIX — must run before every resubscribe so a fresh
+        ``reqHistoricalData(keepUpToDate=True)`` does not layer on top of a
+        still-registered (wedged) subscription and get cancelled by the gateway
+        (Error 162, seeded=0). Never raises — a failed cancel must not block the
+        resubscribe that follows it.
+        """
+        prev = self._active_bar_sub
+        if prev is None:
+            return
+        self._active_bar_sub = None
+        try:
+            self._ib.cancelHistoricalData(prev)
+            LOGGER.info(
+                "[ib_client] bar_sub state: active -> cancelled — reason=%s "
+                "(freeing slot before resubscribe)",
+                reason,
+            )
+        except Exception as exc:  # noqa: BLE001 — cancel must never block a resubscribe
+            LOGGER.info(
+                "[ib_client] bar_sub prior-cancel skipped — reason=%s type=%s msg=%s",
+                reason,
+                type(exc).__name__,
+                exc,
+            )
 
     # ------------------------------------------------- farm-flap auto-resubscribe
     # §0.5.181 — re-arm the keepUpToDate bar subscription after the IBKR
