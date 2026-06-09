@@ -157,6 +157,25 @@ strategy or exit math:
   `tests/test_gate_calibration.py`. Writes `/tmp/gate_calibration_<date>.txt`. **OFFLINE
   research, READ-ONLY, drives NO prod path.**
 
+- **Phase 13 — concurrency / cluster historical replay** (`python -m
+  tools.eval.concurrency_replay [--n 2] [--m 2] [--out PATH]`) — validates the N=2 + kill-switch
+  cluster-mode ship (#129–#131, `cluster_window_bars=1`) against REAL above-trend NQ history
+  BEFORE the first live 2-stack, driving the ACTUAL prod logic: stacking/correlated-stops from
+  `portfolio_study.simulate_portfolio` (N=2×M=2, regime-ON, kill-switch OFF to see the full
+  population), and the cluster collapse + entry-bar minute derivation imported from
+  `src.execution.kill_switch` (`_collapse_loss_clusters`, `evaluate_triggers`,
+  `_entry_bar_minutes`) — **not re-implemented**. Findings (2026-06-09): **(1) STACK — PASS**
+  (max-concurrent reaches 2; 305k bars 2-open); **(2) COLLAPSE-FIRES — PASS** (the real collapse
+  merges 222 loss-events at window=1); **(3) window=1 — CHALLENGED**: only 52.6% of
+  correlated-stop entries are within 1 min (they stop together on one down-move but entered on
+  different pullback bars), and the peak consecutive-loss streak goes per-trade=11 → cluster-w1=10,
+  **still ≥ halt@10** — so window=1 fires but does NOT fully defuse the N=2 trap; the real
+  `evaluate_triggers` returns PAUSE both ways at the worst poll. A wider `cluster_window_bars`
+  (~2 min here) drops the peak below halt, surfaced as a CANDIDATE to evaluate later with the
+  false-merge tradeoff stated — **NOT applied** (a real change is a separate AUDIT). Pure
+  analysis logic pinned in `tests/test_concurrency_replay.py`. Writes
+  `/tmp/concurrency_replay_<date>.txt`. **OFFLINE research, READ-ONLY, drives NO prod path.**
+
 - `fetch_history.py` — read-only (re)fetch of the saved 1-min history (dry-run by default).
 
 ## Fidelity
