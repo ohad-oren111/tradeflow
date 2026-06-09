@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -56,6 +57,21 @@ RESTART_COUNT_DELTA_THRESHOLD = 3
 RESTART_LOOP_STABLE_CYCLES_TO_CLEAR = 3
 DISK_PCT_THRESHOLD = 85
 MEM_PCT_THRESHOLD = 90
+# W-S?? PR-C — "yellow before crash" hardening guards (N=2 era).
+# Docker disk-growth canary: reclaimable layers/build-cache above this = bloat
+# building toward a /var/lib/docker fill (ties to the per-eval log spam PR-B trims).
+DOCKER_RECLAIMABLE_GB_THRESHOLD = 10.0
+# OOM proximity: alert when free headroom thins BEFORE the 90%-used hard fail, and
+# when swap is being leaned on (memory pressure on the 4 GB CX32).
+MEM_AVAILABLE_MIN_PCT = 15.0
+SWAP_USED_PCT_THRESHOLD = 80.0
+# Container restart drift: a non-zero-and-climbing RestartCount is a crash-loop
+# canary. Absolute-since-creation proxy for the daily (stateless) report; the
+# delta-based loop detector lives in run_monitor (RESTART_COUNT_DELTA_THRESHOLD).
+RESTART_COUNT_DRIFT_THRESHOLD = 5
+# Bar-feed staleness surfaced in the daily report (the orchestrator owns the
+# session-aware live alert; this is a coarse "is the last digest's feed fresh").
+BAR_STALE_THRESHOLD_SEC = 600
 DASHBOARD_TIMEOUT_SEC = 5
 SUPABASE_TIMEOUT_SEC = 5
 IB_PROBE_TIMEOUT_SEC = 10
@@ -341,6 +357,170 @@ def probe_memory(meminfo_path: str | Path = "/proc/meminfo") -> tuple[bool, dict
     used_pct = round(100.0 * (total - available) / total, 1)
     ok = used_pct <= MEM_PCT_THRESHOLD
     return (ok, {"used_pct": used_pct, "total_kb": total, "available_kb": available})
+
+
+def _size_to_gb(token: str) -> float:
+    """Parse a docker size token ('535.2MB', '2.156GB', '0B') to GB. 0.0 on junk."""
+    token = token.strip()
+    units = (("TB", 1e3), ("GB", 1.0), ("MB", 1e-3), ("kB", 1e-6), ("KB", 1e-6), ("B", 1e-9))
+    for suffix, scale in units:
+        if token.endswith(suffix):
+            try:
+                return float(token[: -len(suffix)]) * scale
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
+def _app_log_cap(name: str = "tradeflow-app") -> str | None:
+    """The container's docker json-file ``max-size`` log cap, or None if unset.
+
+    An unset cap = unbounded container logs = the slow /var/lib/docker fill the
+    per-eval log spam (PR-B) feeds. Never raises.
+    """
+    try:
+        res = subprocess.run(
+            ["docker", "inspect", "--format", "{{json .HostConfig.LogConfig}}", name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if res.returncode != 0:
+        return None
+    try:
+        cfg = (json.loads(res.stdout) or {}).get("Config") or {}
+    except json.JSONDecodeError:
+        return None
+    return cfg.get("max-size") or None
+
+
+def probe_docker_disk(name: str = "tradeflow-app") -> tuple[bool, dict]:
+    """``docker system df`` reclaimable bloat + the app's log-rotation cap.
+
+    Fail (yellow) if reclaimable layers/build-cache exceed the threshold OR the
+    app container has no json-file ``max-size`` cap (unbounded logs). A disk-growth
+    canary that fires well before /var/lib/docker fills and crashes the box.
+    """
+    try:
+        res = subprocess.run(
+            ["docker", "system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return (False, {"error": f"docker system df: {type(exc).__name__}"})
+    if res.returncode != 0:
+        return (False, {"error": "docker system df failed", "stderr": res.stderr.strip()[:120]})
+    reclaimable_gb = 0.0
+    for line in res.stdout.strip().splitlines():
+        _typ, _, recl = line.partition("\t")
+        if not recl:
+            continue
+        # Reclaimable looks like "535.2MB (100%)" — take the size before " (".
+        reclaimable_gb += _size_to_gb(recl.split("(")[0])
+    log_cap = _app_log_cap(name)
+    ok = reclaimable_gb <= DOCKER_RECLAIMABLE_GB_THRESHOLD and bool(log_cap)
+    return (
+        ok,
+        {
+            "reclaimable_gb": round(reclaimable_gb, 2),
+            "threshold_gb": DOCKER_RECLAIMABLE_GB_THRESHOLD,
+            "app_log_max_size": log_cap or "UNSET",
+        },
+    )
+
+
+def probe_oom_proximity(meminfo_path: str | Path = "/proc/meminfo") -> tuple[bool, dict]:
+    """OOM-proximity yellow: free RAM thinning toward OOM, or swap leaned on.
+
+    Fail when MemAvailable < MEM_AVAILABLE_MIN_PCT of total OR swap used >
+    SWAP_USED_PCT_THRESHOLD. Earlier + distinct from the 90%-used hard memory fail —
+    on the 4 GB CX32 an N=2 book + gateway can creep here before a crash.
+    """
+    try:
+        text = Path(meminfo_path).read_text()
+    except OSError as exc:
+        return (False, {"error": str(exc)})
+    kv: dict[str, int] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        parts = val.strip().split()
+        if parts:
+            try:
+                kv[key] = int(parts[0])
+            except ValueError:
+                continue
+    total = kv.get("MemTotal", 0)
+    available = kv.get("MemAvailable", 0)
+    if total <= 0:
+        return (False, {"error": "MemTotal not parseable"})
+    available_pct = round(100.0 * available / total, 1)
+    swap_total = kv.get("SwapTotal", 0)
+    swap_free = kv.get("SwapFree", 0)
+    swap_used_pct = (
+        round(100.0 * (swap_total - swap_free) / swap_total, 1) if swap_total > 0 else 0.0
+    )
+    ok = available_pct >= MEM_AVAILABLE_MIN_PCT and swap_used_pct <= SWAP_USED_PCT_THRESHOLD
+    return (
+        ok,
+        {
+            "available_pct": available_pct,
+            "min_pct": MEM_AVAILABLE_MIN_PCT,
+            "swap_used_pct": swap_used_pct,
+            "swap_max_pct": SWAP_USED_PCT_THRESHOLD,
+        },
+    )
+
+
+def probe_restart_drift(
+    names: tuple[str, ...] = (
+        "tradeflow-app",
+        "tradeflow-ib-gateway",
+        "tradeflow-telegram-listener",
+    ),
+) -> tuple[bool, dict]:
+    """Per-container RestartCount drift — a crash-loop canary across the stack.
+
+    Fail (yellow) if any container's RestartCount exceeds RESTART_COUNT_DRIFT_THRESHOLD.
+    Absolute-since-creation (the daily report is stateless); run_monitor owns the
+    cycle-over-cycle delta loop detector. Never raises.
+    """
+    counts: dict[str, Any] = {}
+    worst = 0
+    for name in names:
+        try:
+            res = subprocess.run(
+                ["docker", "inspect", "--format", "{{.RestartCount}}", name],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            counts[name] = f"err:{type(exc).__name__}"
+            continue
+        if res.returncode != 0:
+            counts[name] = "err:inspect"
+            continue
+        try:
+            rc = int(res.stdout.strip())
+        except ValueError:
+            counts[name] = "err:parse"
+            continue
+        counts[name] = rc
+        worst = max(worst, rc)
+    ok = worst <= RESTART_COUNT_DRIFT_THRESHOLD
+    return (ok, {"counts": counts, "threshold": RESTART_COUNT_DRIFT_THRESHOLD})
+
+
+def _parse_last_bar_age(text: str) -> int | None:
+    """Extract ``last_bar=<N>s`` (seconds) from a digest/readiness fragment, or None."""
+    match = re.search(r"last_bar=(\d+)s", text)
+    return int(match.group(1)) if match else None
 
 
 def send_telegram(
@@ -1058,6 +1238,14 @@ def run_daily_report() -> int:
     probes.append(("Disk", ok_disk, str(disk_detail)))
     ok_mem, mem_detail = probe_memory()
     probes.append(("Memory", ok_mem, str(mem_detail)))
+    # PR-C — "yellow before crash" guards (N=2 era): docker disk-growth + log cap,
+    # OOM proximity (free RAM / swap), per-container restart-loop drift.
+    ok_dkr, dkr_detail = probe_docker_disk()
+    probes.append(("Docker disk", ok_dkr, str(dkr_detail)))
+    ok_oom, oom_detail = probe_oom_proximity()
+    probes.append(("OOM proximity", ok_oom, str(oom_detail)))
+    ok_rst, rst_detail = probe_restart_drift()
+    probes.append(("Restart drift", ok_rst, str(rst_detail)))
 
     today_iso = datetime.now(UTC).strftime("%Y-%m-%d")
     # Data reads bypass RLS via the service-role key (anon sees an empty set).
@@ -1081,6 +1269,13 @@ def run_daily_report() -> int:
     deployed_commit = _deployed_commit()
     recent_logs = _app_recent_logs()
     digest_readiness = _parse_digest_readiness(recent_logs)
+    bar_age = _parse_last_bar_age(digest_readiness)
+    if bar_age is None:
+        bar_freshness = "last_bar age unknown (no digest yet)"
+    elif bar_age > BAR_STALE_THRESHOLD_SEC:
+        bar_freshness = f"⚠ STALE — last_bar={bar_age}s (> {BAR_STALE_THRESHOLD_SEC}s)"
+    else:
+        bar_freshness = f"OK — last_bar={bar_age}s (<= {BAR_STALE_THRESHOLD_SEC}s)"
     reconnects, flaps = _count_reconnect_events(recent_logs)
     resting_orders = _broker_resting_orders(host, port, client_id)
     green = sum(1 for _, ok, _ in probes if ok)
@@ -1107,6 +1302,7 @@ def run_daily_report() -> int:
     lines.append(f"- Reconnects / farm-flap resubs (recent logs): {reconnects} / {flaps}")
     lines.append(f"- Broker resting orders (orphan canary): {resting_orders}")
     lines.append(f"- Warmup / feed (last digest): {digest_readiness}")
+    lines.append(f"- Bar-feed freshness: {bar_freshness}")
     lines.append("")
     lines.append(f"App last log: {last_log}")
     msg = "\n".join(lines)

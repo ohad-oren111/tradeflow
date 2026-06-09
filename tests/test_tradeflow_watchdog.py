@@ -467,6 +467,111 @@ def test_probe_memory_missing_file_fails(tmp_path: Path):
 
 
 # ============================================================================
+# 10b. PR-C hardening guards — docker disk, OOM proximity, restart drift, bar age
+# ============================================================================
+
+
+def _meminfo_swap(total_kb: int, available_kb: int, swap_total_kb: int, swap_free_kb: int) -> str:
+    return (
+        f"MemTotal:       {total_kb} kB\n"
+        f"MemAvailable:   {available_kb} kB\n"
+        f"SwapTotal:      {swap_total_kb} kB\n"
+        f"SwapFree:       {swap_free_kb} kB\n"
+    )
+
+
+def test_size_to_gb_units():
+    assert wd._size_to_gb("2.156GB") == pytest.approx(2.156)
+    assert wd._size_to_gb("535.2MB") == pytest.approx(0.5352)
+    assert wd._size_to_gb("0B") == 0.0
+    assert wd._size_to_gb("garbage") == 0.0
+
+
+def test_probe_docker_disk_ok_under_threshold_with_log_cap(monkeypatch):
+    monkeypatch.setattr(
+        wd.subprocess,
+        "run",
+        lambda *a, **k: _completed(stdout="Images\t0B (0%)\nBuild Cache\t535.2MB (100%)\n"),
+    )
+    monkeypatch.setattr(wd, "_app_log_cap", lambda *a, **k: "10m")
+    ok, detail = wd.probe_docker_disk()
+    assert ok is True
+    assert detail["reclaimable_gb"] == pytest.approx(0.54, abs=0.01)
+    assert detail["app_log_max_size"] == "10m"
+
+
+def test_probe_docker_disk_fails_when_reclaimable_high(monkeypatch):
+    monkeypatch.setattr(
+        wd.subprocess, "run", lambda *a, **k: _completed(stdout="Build Cache\t20GB (100%)\n")
+    )
+    monkeypatch.setattr(wd, "_app_log_cap", lambda *a, **k: "10m")
+    ok, detail = wd.probe_docker_disk()
+    assert ok is False
+    assert detail["reclaimable_gb"] == pytest.approx(20.0)
+
+
+def test_probe_docker_disk_fails_when_log_cap_unset(monkeypatch):
+    monkeypatch.setattr(
+        wd.subprocess, "run", lambda *a, **k: _completed(stdout="Images\t0B (0%)\n")
+    )
+    monkeypatch.setattr(wd, "_app_log_cap", lambda *a, **k: None)
+    ok, detail = wd.probe_docker_disk()
+    assert ok is False
+    assert detail["app_log_max_size"] == "UNSET"
+
+
+def test_probe_oom_proximity_ok(tmp_path: Path):
+    f = tmp_path / "meminfo"
+    f.write_text(_meminfo_swap(4_000_000, 1_500_000, 2_000_000, 1_900_000))  # 37% avail, 5% swap
+    ok, detail = wd.probe_oom_proximity(meminfo_path=str(f))
+    assert ok is True
+    assert detail["available_pct"] == pytest.approx(37.5)
+    assert detail["swap_used_pct"] == pytest.approx(5.0)
+
+
+def test_probe_oom_proximity_fails_low_available(tmp_path: Path):
+    f = tmp_path / "meminfo"
+    f.write_text(_meminfo_swap(4_000_000, 300_000, 2_000_000, 2_000_000))  # 7.5% avail
+    ok, detail = wd.probe_oom_proximity(meminfo_path=str(f))
+    assert ok is False
+    assert detail["available_pct"] == pytest.approx(7.5)
+
+
+def test_probe_oom_proximity_fails_high_swap(tmp_path: Path):
+    f = tmp_path / "meminfo"
+    f.write_text(_meminfo_swap(4_000_000, 2_000_000, 2_000_000, 200_000))  # 50% avail, 90% swap
+    ok, detail = wd.probe_oom_proximity(meminfo_path=str(f))
+    assert ok is False
+    assert detail["swap_used_pct"] == pytest.approx(90.0)
+
+
+def test_probe_restart_drift_ok(monkeypatch):
+    monkeypatch.setattr(wd.subprocess, "run", lambda *a, **k: _completed(stdout="0\n"))
+    ok, detail = wd.probe_restart_drift(names=("c1", "c2"))
+    assert ok is True
+    assert detail["counts"] == {"c1": 0, "c2": 0}
+
+
+def test_probe_restart_drift_fails_over_threshold(monkeypatch):
+    monkeypatch.setattr(wd.subprocess, "run", lambda *a, **k: _completed(stdout="9\n"))
+    ok, detail = wd.probe_restart_drift(names=("c1",))
+    assert ok is False
+    assert detail["counts"]["c1"] == 9
+
+
+def test_probe_restart_drift_inspect_error_is_not_fatal(monkeypatch):
+    monkeypatch.setattr(wd.subprocess, "run", lambda *a, **k: _completed(stdout="", returncode=1))
+    ok, detail = wd.probe_restart_drift(names=("c1",))
+    assert ok is True  # an inspect failure does not falsely trip the drift yellow
+    assert detail["counts"]["c1"] == "err:inspect"
+
+
+def test_parse_last_bar_age():
+    assert wd._parse_last_bar_age("warmup=ready last_bar=42s commit=abc") == 42
+    assert wd._parse_last_bar_age("no age here") is None
+
+
+# ============================================================================
 # 11. attempt_auto_heal — 3-per-hour cap
 # ============================================================================
 
@@ -836,6 +941,9 @@ def test_run_daily_report_includes_trading_section(monkeypatch, caplog):
     monkeypatch.setattr(wd, "probe_dashboard", lambda *a, **k: (True, "http 200"))
     monkeypatch.setattr(wd, "probe_disk", lambda *a, **k: (True, {"/": 13}))
     monkeypatch.setattr(wd, "probe_memory", lambda *a, **k: (True, {"used_pct": 30.0}))
+    monkeypatch.setattr(wd, "probe_docker_disk", lambda *a, **k: (True, {"reclaimable_gb": 0.5}))
+    monkeypatch.setattr(wd, "probe_oom_proximity", lambda *a, **k: (True, {"available_pct": 40.0}))
+    monkeypatch.setattr(wd, "probe_restart_drift", lambda *a, **k: (True, {"counts": {}}))
     monkeypatch.setattr(wd, "_last_app_log_line", lambda: "tail")
     monkeypatch.setattr(wd, "_count_lifecycles_today", lambda u, k: "2")
     monkeypatch.setattr(wd, "_realized_pnl_today", lambda u, k: "$599.52 (1 closed)")
@@ -895,6 +1003,9 @@ def test_daily_report_uses_service_role_for_data_reads(monkeypatch):
     monkeypatch.setattr(wd, "probe_dashboard", lambda *a, **k: (True, "http 200"))
     monkeypatch.setattr(wd, "probe_disk", lambda *a, **k: (True, {"/": 13}))
     monkeypatch.setattr(wd, "probe_memory", lambda *a, **k: (True, {"used_pct": 30.0}))
+    monkeypatch.setattr(wd, "probe_docker_disk", lambda *a, **k: (True, {"reclaimable_gb": 0.5}))
+    monkeypatch.setattr(wd, "probe_oom_proximity", lambda *a, **k: (True, {"available_pct": 40.0}))
+    monkeypatch.setattr(wd, "probe_restart_drift", lambda *a, **k: (True, {"counts": {}}))
     monkeypatch.setattr(wd, "_last_app_log_line", lambda: "tail")
     monkeypatch.setattr(wd, "_seanbot_scorecard_today", lambda u, k: "0 entries today")
     monkeypatch.setattr(wd, "_count_lifecycles_today", lambda u, k: seen_keys.append(k) or "2")
