@@ -87,14 +87,22 @@ services:
       # stays 0.0 (source-faithful); 2.0 is the live-parity value. Tune via
       # /divergence agreement.
       BULLISH_TOLERANCE: ${BULLISH_TOLERANCE:-2.0}
-      # Concurrency HOLD — PR-B merged the max_concurrent default of 3 into
-      # config, but concurrency stays OFF until a clean force-fill ratchet is
-      # verified on the PR #114 build. Pin to 1 here (repo-tracked injection
-      # point, overrides env_file + the config default) so the bot reverts to
-      # single-open-per-symbol/strategy. The ≤1 Supabase index
-      # (lifecycles_one_open_per_symbol_strategy) is the DB backstop — two layers.
+      # Concurrency ON (operator-approved, N=2) — PR-B merged the max_concurrent
+      # default of 3 into config; pin to 2 here (repo-tracked injection point,
+      # overrides env_file + the config default) so up to 2 distinct-setup
+      # positions stack. The setup-key dedup Supabase index
+      # (lifecycles_one_open_per_setup) is the DB backstop — it allows distinct
+      # setups to stack while collapsing two entry paths on the same bar to one
+      # bracket (migration 20260605000000 dropped the prior ≤1 index).
       # Literal (not ${...:-1}) so it cannot be silently shadowed by .env (§0.5.159).
-      MAX_CONCURRENT: "1"
+      MAX_CONCURRENT: "2"
+      # Kill-switch cluster mode ON — N correlated stop-outs whose entries fall in
+      # one cluster window count as ONE loss event before warn@6 / halt@10, so a
+      # concurrent book's correlated cluster does not trip the single-position-tuned
+      # halt (the §4 kill-switch trap). MUST be ON whenever N>1. Plumbed by
+      # PR #126 (accounting) + PR #130 (real entry-bar timestamps). Literal so .env
+      # cannot shadow it (§0.5.159).
+      KILL_SWITCH_CLUSTER_MODE: "true"
       # Regime gate ON — block LONG entries when price <= 30-min EMA200 (SeanBot C1,
       # strategy._regime_ok). Sim on 27 live lifecycles: cuts net loss ~50% by
       # screening the sustained down-leg; SB shows no profitable below-EMA200 cohort.
