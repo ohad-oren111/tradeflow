@@ -86,6 +86,64 @@ def _consecutive_loss_streak(pnls_newest_first: list[float]) -> int:
     return streak
 
 
+def _collapse_loss_clusters(
+    pnls_newest_first: list[float],
+    entry_bars_newest_first: list[float | None],
+    window_bars: int,
+) -> list[float]:
+    """PR #126 — collapse correlated stop-clusters into ONE loss event each.
+
+    A run of consecutive LOSING closes whose ENTRIES fall within ``window_bars`` of
+    each other (chained adjacent member to member) is replaced by a single
+    synthetic loss equal to the run's summed pnl — so a concurrent book's N
+    correlated stop-outs count as ONE loss toward the consecutive-loss streak, not
+    N. Wins/scratches pass through unchanged and break a cluster. Pure; logs once
+    per actual collapse.
+
+    Misaligned inputs (length mismatch, or a ``None`` entry bar inside a run) are
+    treated conservatively: the affected losses are NOT merged (they stay as
+    separate loss events), so clustering can only ever RELAX the halt where the
+    entry data is trustworthy — it never hides a loss it cannot prove is correlated.
+    """
+    if len(entry_bars_newest_first) != len(pnls_newest_first):
+        return list(pnls_newest_first)
+    collapsed: list[float] = []
+    i = 0
+    n = len(pnls_newest_first)
+    while i < n:
+        pnl = pnls_newest_first[i]
+        if pnl >= 0:
+            collapsed.append(pnl)
+            i += 1
+            continue
+        cluster_sum = pnl
+        members = 1
+        prev_bar = entry_bars_newest_first[i]
+        j = i + 1
+        while (
+            j < n
+            and pnls_newest_first[j] < 0
+            and prev_bar is not None
+            and entry_bars_newest_first[j] is not None
+            and abs(entry_bars_newest_first[j] - prev_bar) <= window_bars
+        ):
+            cluster_sum += pnls_newest_first[j]
+            prev_bar = entry_bars_newest_first[j]
+            members += 1
+            j += 1
+        if members > 1:
+            LOGGER.info(
+                "[KILL] cluster mode — collapsed %d correlated stops "
+                "(entry window <= %d bars) into 1 loss event (sum=%.2f)",
+                members,
+                window_bars,
+                cluster_sum,
+            )
+        collapsed.append(cluster_sum)
+        i = j
+    return collapsed
+
+
 def evaluate_triggers(
     closed_pnls_newest_first: list[float],
     realized_since_epoch: float,
@@ -94,6 +152,9 @@ def evaluate_triggers(
     warn_consec_losses: int,
     halt_consec_losses: int,
     max_drawdown_pct: float,
+    cluster_mode: bool = False,
+    cluster_window_bars: int = 1,
+    entry_bars_newest_first: list[float | None] | None = None,
 ) -> KillVerdict:
     """Pure tiered trigger logic from broker/DB truth (§0.5.98).
 
@@ -108,8 +169,28 @@ def evaluate_triggers(
 
     The drawdown brake is INERT when ``allocation_usd`` is None / ≤ 0 (the
     operator hasn't set allocation) — only the consecutive-loss tiers apply.
-    Thresholds are inclusive (the Nth loss / the exact % trips)."""
-    streak = _consecutive_loss_streak(closed_pnls_newest_first)
+    Thresholds are inclusive (the Nth loss / the exact % trips).
+
+    PR #126 — when ``cluster_mode`` is True AND ``entry_bars_newest_first`` (entry
+    bar index / epoch-seconds, aligned 1:1 with the pnls) is supplied, correlated
+    stop-clusters collapse into one loss event before the streak is computed (only
+    the consecutive-loss streak is affected; the realized-drawdown brake still uses
+    the true summed pnl). Default OFF ⇒ this whole branch is skipped and the streak
+    is byte-identical to per-trade counting. ``cluster_mode`` True with no entry-bar
+    info falls back to per-trade counting (a loud warning) — the live plumbing to
+    supply entry bars is a separate change (PR Task E)."""
+    pnls_for_streak = closed_pnls_newest_first
+    if cluster_mode:
+        if entry_bars_newest_first is None:
+            LOGGER.warning(
+                "[KILL] cluster mode set but no entry-bar info supplied — falling back "
+                "to per-trade consecutive-loss counting (entry-bar plumbing not built)"
+            )
+        else:
+            pnls_for_streak = _collapse_loss_clusters(
+                closed_pnls_newest_first, entry_bars_newest_first, cluster_window_bars
+            )
+    streak = _consecutive_loss_streak(pnls_for_streak)
     # PAUSE tier 1 — consecutive-loss hard halt.
     if halt_consec_losses > 0 and streak >= halt_consec_losses:
         return KillVerdict(
@@ -323,6 +404,13 @@ class KillSwitch:
             warn_consec_losses=self._p.kill_switch_warn_consec_losses,
             halt_consec_losses=self._p.kill_switch_halt_consec_losses,
             max_drawdown_pct=self._p.kill_switch_max_drawdown_pct,
+            # PR #126 — default OFF ⇒ identical to today. entry_bars stays None: the
+            # single-position live path has no concurrent cluster to collapse and the
+            # entry-bar plumbing for a concurrent book is NOT built here (Task E). With
+            # the flag ON, evaluate_triggers logs the fallback so the gap is visible.
+            cluster_mode=getattr(self._p, "kill_switch_cluster_mode", False),
+            cluster_window_bars=getattr(self._p, "cluster_window_bars", 1),
+            entry_bars_newest_first=None,
         )
 
     async def run_until_stopped(self, stop_event: asyncio.Event) -> None:
