@@ -132,7 +132,11 @@ def _collapse_loss_clusters(
             members += 1
             j += 1
         if members > 1:
-            LOGGER.info(
+            # DEBUG, not INFO: ``_evaluate`` recomputes the FULL closed history every
+            # ~30s poll, so this re-fires for the SAME historical cluster on every
+            # poll once one exists — at INFO that is per-poll spam, not a once-per-
+            # event signal. Kept available at DEBUG for cluster-accounting forensics.
+            LOGGER.debug(
                 "[KILL] cluster mode — collapsed %d correlated stops "
                 "(entry window <= %d bars) into 1 loss event (sum=%.2f)",
                 members,
@@ -191,6 +195,17 @@ def evaluate_triggers(
                 closed_pnls_newest_first, entry_bars_newest_first, cluster_window_bars
             )
     streak = _consecutive_loss_streak(pnls_for_streak)
+    # Per-eval streak observability (Anomaly-A: "ok" evals logged nothing). DEBUG so
+    # it never adds INFO noise on the 30s poll, but the live consecutive-loss count +
+    # thresholds are always recoverable from logs (matches HANDOFF §11). Pure log —
+    # the verdict below is byte-identical with or without this line.
+    LOGGER.debug(
+        "[KILL] eval: consec_loss_streak=%d (warn=%d halt=%d cluster_mode=%s)",
+        streak,
+        warn_consec_losses,
+        halt_consec_losses,
+        cluster_mode,
+    )
     # PAUSE tier 1 — consecutive-loss hard halt.
     if halt_consec_losses > 0 and streak >= halt_consec_losses:
         return KillVerdict(
@@ -418,9 +433,10 @@ class KillSwitch:
         realized_since_epoch = _sum_pnl_since(rows, self._pnl_epoch)
         cluster_mode = getattr(self._p, "kill_switch_cluster_mode", False)
         if cluster_mode:
-            # ON path is deploy-gated (operator decision); log the plumbing so the
-            # cluster accounting is visible. OFF (today) stays silent — no 30s spam.
-            LOGGER.info(
+            # ON path is deploy-gated (operator decision); emit the plumbing line at
+            # DEBUG so the cluster accounting is recoverable on demand WITHOUT the
+            # per-poll INFO spam this fired every ~30s with cluster_mode ON (Anomaly-A).
+            LOGGER.debug(
                 "[KILL] : entry-bar plumbing — supplied %d entry bars (cluster_mode=%s)",
                 len(entry_bars),
                 cluster_mode,
