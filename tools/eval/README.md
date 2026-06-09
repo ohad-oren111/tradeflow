@@ -137,6 +137,26 @@ strategy or exit math:
   DB mocks). Writes `/tmp/shadow_review_<date>.txt`. **OFFLINE research, READ-ONLY, drives NO
   prod path.**
 
+- **Phase 12 — regime-gate CALIBRATION study** (`python -m tools.eval.gate_calibration [--limit
+  N] [--from-json] [--out PATH]`) — resolves the §0.5.222 tension between #123 (below-30m-EMA200
+  longs are negative-EV over 26 months → gate stands) and recent SB tape (he WINS on some
+  below-trend longs the gate blocks). Reuses the cached `below_trend_study.BTTape` (every
+  regime-OFF signal over the full NQ history, tagged below/above the 30m EMA200 by the real
+  `regime_at`), ENRICHES each below-trend signal with its DEPTH below the EMA200 and ET hour,
+  and replays depth / time-of-day / EMA-slope sub-cohorts through the REAL exit
+  (`replay_masked`). A rolling train→test **walk-forward** pools OOS trades under each FIXED
+  band; a **multiple-comparison-hardened** verdict (11 bands tested) only names a band a
+  CANDIDATE if it clears PF≥1.20 on BOTH the OOS *and* full sample, net>0, n≥30, beating the
+  unconditional below-cohort. **Verdict (2026-06-09): GATE-CORRECT** — below-trend pools at OOS
+  PF 1.026 (far under the bar, ~2× the above-book drawdown) and no band robustly separates; the
+  one band that popped on OOS (mid-depth, PF 1.25) was a multiple-comparison artifact the full
+  sample (PF 1.16) did not corroborate. Above-trend anchor reproduces exactly (n=1479, +$28,729,
+  PF 1.174). SB's actual STRATEGY code is NOT on the VPS (only his Telegram parser) → flagged as
+  a **data gap** for the operator, never fabricated. Applies NOTHING; a real gate change is a
+  SEPARATE AUDIT PR. Pure logic (masks, verdict, data-gap check) pinned in
+  `tests/test_gate_calibration.py`. Writes `/tmp/gate_calibration_<date>.txt`. **OFFLINE
+  research, READ-ONLY, drives NO prod path.**
+
 - `fetch_history.py` — read-only (re)fetch of the saved 1-min history (dry-run by default).
 
 ## Fidelity
