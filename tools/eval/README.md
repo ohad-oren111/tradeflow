@@ -81,6 +81,29 @@ strategy or exit math:
   walk-forward selects (adx-threshold, exit) on train and scores OOS; the unconditional
   down-regime set is the honest headline (no selection).
 
+- **Phase 9 — portfolio sizing + drawdown-control study** (`python -m
+  tools.eval.portfolio_study [--validate] [--start-capital 25000] [--rebuild-tape]`) — the
+  existing engine is SINGLE-position; this adds the missing piece: a **portfolio-level**
+  simulator that runs up to N concurrent positions (each M contracts, each its OWN
+  independent stop/trail lifecycle) on the SAME validated edge, tracks a portfolio equity
+  curve / aggregate exposure / portfolio MaxDD, and applies SB's risk controls (real
+  `kill_switch.evaluate_triggers`, daily-loss cap, cooldown) at the portfolio level. It
+  reuses the REAL entry (`FastGateEntry`, regime ON — a signal **tape** is built once, then
+  each portfolio config replays cheaply with the cooldown re-applied) and the REAL exit
+  (`_process_exit_bar` per position). The **fidelity anchor** (`--validate`,
+  `tests/test_portfolio_study.py`) asserts N=1, M=2 reproduces `simulate_segment` (regime ON)
+  byte-for-byte — only then are the multi-position numbers trustworthy. **Part A** reproduces
+  SB's exact live config (N=3 × M=2, trailing, regime ON; his trail 250 vs ours 150) and
+  reports net$, equity-curve shape, PF, Sharpe, MaxDD ($/%), the rolling-10-trading-day P&L
+  distribution, and the **correlated-concurrency** amplification (3-concurrent MaxDD vs single
+  × √3 vs × 3). **Part B** tests MODEST drawdown-control overlays (vol-scaled sizing,
+  equity-curve de-risking, daily-loss cap, dynamic max-concurrent) under a rolling
+  train→test walk-forward that selects by **Calmar** (net/MaxDD) on train and scores OOS, with
+  a full-sample neighbor surface + selection-stability read. **This is OFFLINE research and
+  drives NO prod path** — turning live sizing/concurrency on is a SEPARATE AUDIT for the
+  operator AFTER these numbers + a forward paper window. Modeled fills; the MaxDD here is the
+  real (correlated, amplified) one.
+
 - `fetch_history.py` — read-only (re)fetch of the saved 1-min history (dry-run by default).
 
 ## Fidelity
