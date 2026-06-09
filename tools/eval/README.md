@@ -104,6 +104,23 @@ strategy or exit math:
   operator AFTER these numbers + a forward paper window. Modeled fills; the MaxDD here is the
   real (correlated, amplified) one.
 
+- **Phase 10 — SeanBot shadow ledger** (`python -m tools.eval.shadow_ledger [--qty 1]
+  [--from-json] [--out PATH]`) — a FORWARD scorecard of the gate's opportunity cost, built
+  from telemetry that ALREADY exists (no backtest, no live-bot path). For every SB LONG entry
+  TF classified `MISS-regime` or `MISS-NO-BAR` (the regime gate or a blind-feed gap BLOCKED
+  it), it pairs the entry with SB's OWN realized exit (FIFO over `seanbot_signals`;
+  `type='exit'` carries `pnl_points`) and tallies realized net$, win rate, and PF of the
+  trades the gate denied — joined to TF's `signal_reconciliations` classification by
+  `message_id`. A gate that blocks net losers is doing its job; a gate that blocks a
+  positive-PF cluster is too strict. **Why it exists (§0.5.220):** the live PF>1.2 go/no-go
+  bar takes 6-12 months; SB posts every win AND loss in real time and TF already captures
+  them, so the gate's cost accrues a (loud-caveated, noise-flagged) read in WEEKS off stored
+  data. WR/PF are sizing-invariant; $ are at TF's sizing (`--qty`, default 1; SB ran 2). The
+  fidelity invariants (FIFO pairing, scored-class scope, unpaired-not-dropped, the engine
+  `_pnl` $ model) are pinned in `tests/test_shadow_ledger.py` on hand-built telemetry (no DB
+  mocks). Writes a dated report to `/tmp/shadow_<date>.txt`. **OFFLINE research, READ-ONLY,
+  drives NO prod path.**
+
 - `fetch_history.py` — read-only (re)fetch of the saved 1-min history (dry-run by default).
 
 ## Fidelity
