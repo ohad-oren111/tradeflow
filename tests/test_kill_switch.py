@@ -462,6 +462,54 @@ def test_cluster_collapse_helper_misaligned_inputs_are_unchanged():
     assert _collapse_loss_clusters(pnls, entry_bars, window_bars=1) == pnls
 
 
+# --------------------------------------------- log hygiene: cluster accounting is
+# DEBUG, not INFO. ``KillSwitch._evaluate`` recomputes the FULL closed history on
+# every ~30s poll, so the cluster-collapse, entry-bar-plumbing, and per-eval streak
+# lines re-fire for the SAME historical data every poll — at INFO that is per-poll
+# spam, not a once-per-event signal. These guard the demotion: verdicts stay
+# byte-identical, the lines stay recoverable at DEBUG, and none of them is INFO.
+
+
+def test_cluster_collapse_logs_at_debug_not_info(caplog):
+    import logging
+
+    from src.execution.kill_switch import _collapse_loss_clusters
+
+    caplog.set_level(logging.DEBUG, logger="src.execution.kill_switch")
+    out = _collapse_loss_clusters([-2.0, -3.0], [50, 50], window_bars=1)
+    assert out == [-5.0]  # behavior unchanged — same-bar pair collapses
+    collapse = [r for r in caplog.records if "collapsed" in r.getMessage()]
+    assert collapse, "expected a cluster-collapse log record"
+    assert all(r.levelno == logging.DEBUG for r in collapse)
+    assert not any(r.levelno == logging.INFO for r in collapse)
+
+
+def test_evaluate_logs_streak_at_debug_without_changing_verdict(caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="src.execution.kill_switch")
+    v = evaluate_triggers([-1.0] * 5, 0.0, None, **_KW)
+    assert v.action == "ok"  # 5 < warn 6 — the new line is pure observability
+    streak = [r for r in caplog.records if "consec_loss_streak=" in r.getMessage()]
+    assert streak, "expected the per-eval streak DEBUG line"
+    assert all(r.levelno == logging.DEBUG for r in streak)
+    assert not any(r.levelno == logging.INFO for r in streak)
+
+
+async def test_poll_cluster_plumbing_line_logs_at_debug_not_info(caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="src.execution.kill_switch")
+    base = datetime.now(UTC)
+    params = replace(RISK, kill_switch_cluster_mode=True)
+    ks, _raised, _flat = _build(db=_db(_cluster_rows(2, base.isoformat())), params=params)
+    await ks.poll_once()
+    plumbing = [r for r in caplog.records if "entry-bar plumbing" in r.getMessage()]
+    assert plumbing, "expected the entry-bar plumbing log line"
+    assert all(r.levelno == logging.DEBUG for r in plumbing)
+    assert not any(r.levelno == logging.INFO for r in plumbing)
+
+
 def test_cluster_mode_default_field_off_on_riskparams():
     # Task F parity: the live Config (RiskParams) carries the flag, defaulted OFF.
     assert RISK.kill_switch_cluster_mode is False
