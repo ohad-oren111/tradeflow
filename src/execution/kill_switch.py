@@ -228,6 +228,20 @@ def _parse_ts(value: Any) -> datetime | None:
         return None
 
 
+def _entry_bar_minutes(value: Any) -> float | None:
+    """Entry timestamp → epoch MINUTES (float), the bar unit the cluster window uses.
+
+    MNQ trades 1-min bars, so ``cluster_window_bars`` is in MINUTES and ``window=1``
+    means two entries opened within one 1-min bar are "the same bar" for clustering.
+    Returns None when the timestamp is missing/unparseable so the collapse logic
+    (which only ever uses entry-bar DIFFERENCES) treats that loss conservatively —
+    a None bar is never merged into a cluster (§ #129 contract)."""
+    ts = _parse_ts(value)
+    if ts is None:
+        return None
+    return ts.timestamp() / 60.0
+
+
 def _sum_pnl_since(rows: list[dict], since: datetime) -> float:
     total = 0.0
     for r in rows:
@@ -393,10 +407,28 @@ class KillSwitch:
         rows = await self._db.select(
             "lifecycles",
             filters={"state": "eq.CLOSED", "order": "exit_filled_at.desc"},
-            columns="pnl_net,exit_filled_at",
+            columns="pnl_net,exit_filled_at,entry_filled_at",
         )
-        pnls = [float(r["pnl_net"]) for r in rows if r.get("pnl_net") is not None]
+        # Build the pnl + entry-bar lists from the SAME filtered rows in one pass so
+        # entry_bars stays index-aligned 1:1 with pnls (the cluster collapse relies
+        # on that alignment — a drifted index would mis-group losses).
+        closed = [r for r in rows if r.get("pnl_net") is not None]
+        pnls = [float(r["pnl_net"]) for r in closed]
+        entry_bars = [_entry_bar_minutes(r.get("entry_filled_at")) for r in closed]
         realized_since_epoch = _sum_pnl_since(rows, self._pnl_epoch)
+        cluster_mode = getattr(self._p, "kill_switch_cluster_mode", False)
+        if cluster_mode:
+            # ON path is deploy-gated (operator decision); log the plumbing so the
+            # cluster accounting is visible. OFF (today) stays silent — no 30s spam.
+            LOGGER.info(
+                "[KILL] : entry-bar plumbing — supplied %d entry bars (cluster_mode=%s)",
+                len(entry_bars),
+                cluster_mode,
+            )
+        # PR #126 + Task E — feed real entry bars (epoch-minutes, aligned to pnls) so
+        # cluster collapse operates on live data WHEN later enabled. With the flag OFF
+        # (today's default) evaluate_triggers ignores entry_bars entirely ⇒ supplying
+        # them vs None is byte-identical; this changes NO live behavior.
         return evaluate_triggers(
             pnls,
             realized_since_epoch,
@@ -404,13 +436,9 @@ class KillSwitch:
             warn_consec_losses=self._p.kill_switch_warn_consec_losses,
             halt_consec_losses=self._p.kill_switch_halt_consec_losses,
             max_drawdown_pct=self._p.kill_switch_max_drawdown_pct,
-            # PR #126 — default OFF ⇒ identical to today. entry_bars stays None: the
-            # single-position live path has no concurrent cluster to collapse and the
-            # entry-bar plumbing for a concurrent book is NOT built here (Task E). With
-            # the flag ON, evaluate_triggers logs the fallback so the gap is visible.
-            cluster_mode=getattr(self._p, "kill_switch_cluster_mode", False),
+            cluster_mode=cluster_mode,
             cluster_window_bars=getattr(self._p, "cluster_window_bars", 1),
-            entry_bars_newest_first=None,
+            entry_bars_newest_first=entry_bars,
         )
 
     async def run_until_stopped(self, stop_event: asyncio.Event) -> None:

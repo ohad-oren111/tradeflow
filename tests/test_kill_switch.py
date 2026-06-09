@@ -466,3 +466,105 @@ def test_cluster_mode_default_field_off_on_riskparams():
     # Task F parity: the live Config (RiskParams) carries the flag, defaulted OFF.
     assert RISK.kill_switch_cluster_mode is False
     assert RISK.cluster_window_bars == 1
+
+
+# ------------------ Task E (PR — entry-bar plumbing): the LIVE poller path
+# These exercise KillSwitch._evaluate end-to-end (wrapper-level db.select mock):
+# the new code reads entry_filled_at, derives epoch-minute bars aligned 1:1 with
+# the pnls, and feeds evaluate_triggers. With the flag OFF (today) the bars are
+# ignored ⇒ byte-identical; ON, a correlated book collapses but a single-position
+# book stays inert.
+
+
+def _cluster_rows(loss_count: int, entry_iso: str, *, exit_iso: str | None = None) -> list[dict]:
+    """``loss_count`` losing CLOSED rows that all entered at ``entry_iso`` (one
+    correlated cluster). Mirrors the live lifecycles columns the poller selects."""
+    xt = exit_iso if exit_iso is not None else entry_iso
+    return [
+        {"pnl_net": -1.0, "exit_filled_at": xt, "entry_filled_at": entry_iso}
+        for _ in range(loss_count)
+    ]
+
+
+async def test_poll_cluster_mode_off_ignores_supplied_entry_bars():
+    # Regression guard: 12 same-instant (correlated) losses that WOULD collapse if
+    # the flag were ON. With cluster_mode OFF (today's default) the entry bars are
+    # ignored → 12 consecutive losses → PAUSE, byte-identical to the no-bar path.
+    base = datetime.now(UTC)
+    rows = _cluster_rows(12, base.isoformat())
+    ks, raised, flat = _build(db=_db(rows))  # default RISK → cluster_mode False
+    v = await ks.poll_once()
+    assert v.action == "pause" and v.reason == "consecutive_losses"
+    assert raised == ["kill_switch:consecutive_losses"]
+    assert flat == [True]
+    # The plumbing extends the query to fetch the entry timestamp IN-MODULE.
+    call = ks._db.select.await_args
+    assert "entry_filled_at" in call.kwargs["columns"]
+
+
+async def test_poll_cluster_mode_on_collapses_correlated_book():
+    # 12 losses in 3 same-instant clusters of 4 (a concurrent book's correlated
+    # stop-outs, clusters 60 min apart). cluster_mode ON collapses each cluster to
+    # ONE loss event → 3 events < warn 6 → OK, where per-trade mode PAUSES at 10.
+    base = datetime.now(UTC)
+    rows: list[dict] = []
+    for cluster_offset in (0, 60, 120):  # newest cluster first
+        ts = (base - timedelta(minutes=cluster_offset)).isoformat()
+        rows.extend(_cluster_rows(4, ts))
+    params = replace(RISK, kill_switch_cluster_mode=True)
+    ks, raised, flat = _build(db=_db(rows), params=params)
+    v = await ks.poll_once()
+    assert v.action == "ok"  # 3 collapsed events < warn 6
+    assert raised == [] and flat == []
+
+
+async def test_poll_cluster_mode_on_single_position_shape_is_inert():
+    # 10 losses each entered 5 min apart (today's single-position book — entries
+    # never overlap). No two entries fall within the 1-bar window → 10 separate
+    # events even ON → still PAUSE, IDENTICAL to per-trade. Proves the flag is inert
+    # for today's non-concurrent book.
+    base = datetime.now(UTC)
+    rows = [
+        {
+            "pnl_net": -1.0,
+            "exit_filled_at": base.isoformat(),
+            "entry_filled_at": (base - timedelta(minutes=5 * i)).isoformat(),
+        }
+        for i in range(10)
+    ]
+    params = replace(RISK, kill_switch_cluster_mode=True)
+    ks, raised, flat = _build(db=_db(rows), params=params)
+    v = await ks.poll_once()
+    assert v.action == "pause" and v.reason == "consecutive_losses"
+    assert raised == ["kill_switch:consecutive_losses"]
+    assert flat == [True]
+
+
+async def test_poll_cluster_mode_on_null_entry_bars_fall_back_conservatively():
+    # cluster_mode ON but every row's entry_filled_at is null → all entry bars are
+    # None → NO loss is merged (conservative #129 contract) → 10 losses still PAUSE,
+    # exactly as per-trade counting would (never hides a loss it can't prove correlated).
+    base = datetime.now(UTC)
+    rows = [
+        {"pnl_net": -1.0, "exit_filled_at": base.isoformat(), "entry_filled_at": None}
+        for _ in range(10)
+    ]
+    params = replace(RISK, kill_switch_cluster_mode=True)
+    ks, raised, flat = _build(db=_db(rows), params=params)
+    v = await ks.poll_once()
+    assert v.action == "pause" and v.reason == "consecutive_losses"
+    assert raised == ["kill_switch:consecutive_losses"]
+
+
+def test_entry_bar_minutes_unit_and_none_fallback():
+    # The unit derivation: ISO entry ts → epoch-MINUTES (float); two entries 30s
+    # apart differ by 0.5 (< window 1 ⇒ same bar); missing/garbage ts → None.
+    from src.execution.kill_switch import _entry_bar_minutes
+
+    base = datetime.now(UTC)
+    a = _entry_bar_minutes(base.isoformat())
+    b = _entry_bar_minutes((base + timedelta(seconds=30)).isoformat())
+    assert a is not None and b is not None
+    assert abs(b - a) == pytest.approx(0.5)
+    assert _entry_bar_minutes(None) is None
+    assert _entry_bar_minutes("not-a-timestamp") is None
