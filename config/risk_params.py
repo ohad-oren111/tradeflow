@@ -85,6 +85,15 @@ class RiskParams:
     kill_switch_max_drawdown_pct: float = 33.0
     kill_switch_pnl_epoch: str = ""
     kill_switch_max_consec_eval_errors: int = 3
+    # PR #126 — correlation-aware consecutive-loss accounting for a FUTURE concurrent
+    # book. Default OFF ⇒ byte-identical to today's per-trade counting. When ON, N
+    # correlated stop-outs whose ENTRIES fall within ``cluster_window_bars`` collapse
+    # into ONE loss event before warn@6 / halt@10 — so a concurrent book's correlated
+    # cluster does not read as N consecutive losses and trip the single-position-tuned
+    # halt (the §4 kill-switch trap). Activating this is a SEPARATE operator decision;
+    # the entry-bar plumbing the live path needs is NOT built here (see PR Task E).
+    kill_switch_cluster_mode: bool = False
+    cluster_window_bars: int = 1
     # Equity base for the daily/weekly drawdown % triggers. None → use the live
     # broker NetLiquidation each poll. NOTE: on the ~$1M paper account, 8%/15% of
     # net-liq is ~$80k/$150k, so the DD triggers are very loose for a 2-contract
@@ -249,6 +258,8 @@ RISK = RiskParams(
     kill_switch_allocation_usd=_env_opt_float("KILL_SWITCH_ALLOCATION_USD"),
     kill_switch_max_drawdown_pct=_env_float("KILL_SWITCH_MAX_DRAWDOWN_PCT", 33.0),
     kill_switch_pnl_epoch=_env_str("KILL_SWITCH_PNL_EPOCH", ""),
+    kill_switch_cluster_mode=_env_bool("KILL_SWITCH_CLUSTER_MODE", False),
+    cluster_window_bars=_env_int("KILL_SWITCH_CLUSTER_WINDOW_BARS", 1),
     # Tolerate up to N consecutive transient evaluator faults before halting
     # (default 3; never treated as 0 — a 0 would halt on the first blip).
     kill_switch_max_consec_eval_errors=_env_int("KILL_SWITCH_MAX_CONSEC_EVAL_ERRORS", 3),

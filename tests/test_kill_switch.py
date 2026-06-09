@@ -349,3 +349,120 @@ async def test_evaluate_orders_closes_globally_by_time_across_lifecycles():
     assert filters["state"] == "eq.CLOSED"
     assert filters["order"] == "exit_filled_at.desc"
     assert "symbol" not in filters
+
+
+# --------------------------------------------- PR #126: cluster-mode accounting
+# Default OFF must be byte-identical to per-trade counting (regression guard); ON
+# collapses correlated stop-clusters (entries within the window) into one loss
+# event so a concurrent book's correlated cluster does not trip the single-
+# position-tuned halt (the §4 kill-switch trap).
+
+
+def test_cluster_mode_off_is_identical():
+    # The regression guard: a serial-loss stream halts at exactly 10 whether or not
+    # entry-bar info is passed, as long as cluster_mode stays OFF (the default).
+    pnls = [-1.0] * 10
+    entry_bars = list(range(10))  # all on distinct bars
+    off_default = evaluate_triggers(pnls, 0.0, None, **_KW)
+    off_with_bars = evaluate_triggers(
+        pnls, 0.0, None, **_KW, cluster_mode=False, entry_bars_newest_first=entry_bars
+    )
+    assert off_default.action == "pause" and off_default.reason == "consecutive_losses"
+    assert off_with_bars.action == "pause" and off_with_bars.reason == "consecutive_losses"
+    # 9 serial losses still only NOTIFY in both — no off-by-one drift from the new arg.
+    assert evaluate_triggers([-1.0] * 9, 0.0, None, **_KW).action == "notify"
+    assert (
+        evaluate_triggers(
+            [-1.0] * 9, 0.0, None, **_KW, cluster_mode=False, entry_bars_newest_first=list(range(9))
+        ).action
+        == "notify"
+    )
+
+
+def test_cluster_mode_collapses_correlated_stops():
+    # 12 losses that per-trade mode would HALT (>=10). They are 3 clusters of 4,
+    # each cluster's 4 entries on the SAME bar (correlated stop-out of a concurrent
+    # book). With cluster_mode ON they collapse to 3 loss EVENTS → below halt 10 and
+    # below warn 6 → OK, where per-trade mode pauses.
+    pnls = [-1.0] * 12
+    entry_bars = [
+        30,
+        30,
+        30,
+        30,
+        20,
+        20,
+        20,
+        20,
+        10,
+        10,
+        10,
+        10,
+    ]  # newest-first, 3 same-bar clusters
+    on = evaluate_triggers(
+        pnls,
+        0.0,
+        None,
+        **_KW,
+        cluster_mode=True,
+        cluster_window_bars=1,
+        entry_bars_newest_first=entry_bars,
+    )
+    off = evaluate_triggers(pnls, 0.0, None, **_KW)
+    assert off.action == "pause"  # per-trade: 12 >= 10
+    assert on.action == "ok"  # clustered: 3 events < warn 6
+
+
+def test_cluster_mode_collapsed_events_still_trip_when_enough_clusters():
+    # 10 DISTINCT-bar losses (no two entries within the window) form 10 separate
+    # loss events even ON — so a genuinely serial losing streak still halts.
+    pnls = [-1.0] * 10
+    entry_bars = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10]  # all > window apart
+    on = evaluate_triggers(
+        pnls,
+        0.0,
+        None,
+        **_KW,
+        cluster_mode=True,
+        cluster_window_bars=1,
+        entry_bars_newest_first=entry_bars,
+    )
+    assert on.action == "pause" and on.reason == "consecutive_losses"
+
+
+def test_cluster_mode_without_entry_bars_falls_back_to_per_trade(caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    # Flag ON but no entry-bar info → must behave EXACTLY like per-trade counting
+    # (and warn loudly that the plumbing is missing).
+    v = evaluate_triggers(
+        [-1.0] * 10, 0.0, None, **_KW, cluster_mode=True, entry_bars_newest_first=None
+    )
+    assert v.action == "pause" and v.reason == "consecutive_losses"
+    assert any("cluster mode set but no entry-bar info" in r.getMessage() for r in caplog.records)
+
+
+def test_cluster_collapse_helper_sums_and_breaks_on_win():
+    from src.execution.kill_switch import _collapse_loss_clusters
+
+    # newest-first: [loss, loss(same bar)] then a WIN then [loss(distinct)].
+    pnls = [-2.0, -3.0, 5.0, -4.0]
+    entry_bars = [50, 50, 40, 30]
+    out = _collapse_loss_clusters(pnls, entry_bars, window_bars=1)
+    # First two losses (same bar) collapse to -5.0; the win passes; the last loss alone.
+    assert out == [-5.0, 5.0, -4.0]
+
+
+def test_cluster_collapse_helper_misaligned_inputs_are_unchanged():
+    from src.execution.kill_switch import _collapse_loss_clusters
+
+    pnls = [-1.0, -1.0, -1.0]
+    entry_bars = [10, 10]  # wrong length → conservative: return unchanged
+    assert _collapse_loss_clusters(pnls, entry_bars, window_bars=1) == pnls
+
+
+def test_cluster_mode_default_field_off_on_riskparams():
+    # Task F parity: the live Config (RiskParams) carries the flag, defaulted OFF.
+    assert RISK.kill_switch_cluster_mode is False
+    assert RISK.cluster_window_bars == 1
