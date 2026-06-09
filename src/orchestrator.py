@@ -70,6 +70,14 @@ _WATCHDOG_ALERT_COOLDOWN_SEC = 15 * 60
 # effect before the next attempt; shorter than the 15-min alert cooldown so the
 # self-heal is prompt.
 _WATCHDOG_FEED_HEAL_COOLDOWN_SEC = 5 * 60
+# FEED-GAP FIX — a resubscribe over a still-up socket cannot clear a wedged
+# keepUpToDate stream once the gateway has stopped delivering on it; only a
+# socket teardown does (the 2026-06-07 reopen recovered ONLY when an unrelated
+# peer-close forced a reconnect, 5.5h late). After this many CONSECUTIVE stale
+# self-heal attempts fail to restore bars, escalate to a forced socket reconnect
+# (the evidence-proven recovery). At the 5-min heal cooldown this caps the dark
+# window at ~15 min instead of waiting hours for an external drop.
+_FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS = 3
 _BAR_TIMESTAMP_RING_MAXLEN = 4096
 
 # Track 3 — decision journal. Bounded in-memory ring of the most recent
@@ -259,6 +267,11 @@ class Orchestrator:
         self._last_daily_summary_day: str | None = None
         # PR D — last time the stale-feed self-heal resubscribe fired (cooldown).
         self._last_feed_heal_at: datetime | None = None
+        # FEED-GAP FIX — count of consecutive stale self-heal resubscribes that have
+        # NOT restored bars; reset to 0 when a live bar arrives. Drives escalation to
+        # a forced socket reconnect once a resubscribe-over-live-socket is proven not
+        # to be clearing the wedge.
+        self._consecutive_feed_heals: int = 0
         self._bar_timestamps: deque[datetime] = deque(maxlen=_BAR_TIMESTAMP_RING_MAXLEN)
         # PR C — bar-gap detection after reconnect/resubscribe. _start_bar_subscription
         # arms _pending_gap_check on any RE-subscribe (not the initial boot one); the
@@ -675,6 +688,14 @@ class Orchestrator:
         now = datetime.now(UTC)
         self._last_bar_at = now
         self._bar_timestamps.append(now)
+        # FEED-GAP FIX — a live bar means the feed is healthy; clear the consecutive
+        # self-heal escalation counter so a future wedge starts its count fresh.
+        if self._consecutive_feed_heals:
+            LOGGER.info(
+                "[FEED] self-heal counter reset: %d -> 0 — live bar received",
+                self._consecutive_feed_heals,
+            )
+            self._consecutive_feed_heals = 0
         if self._last_bar_alert_at is not None:
             LOGGER.warning("[WATCHDOG] bar feed recovered — first bar after stale window")
             LOGGER.info("[ALERT] watchdog_bar_recovered")
@@ -853,10 +874,20 @@ class Orchestrator:
         ONE bounded resubscribe via the existing tested ``_start_bar_subscription``
         path, rate-limited to once per ``_WATCHDOG_FEED_HEAL_COOLDOWN_SEC``.
 
-        Bounded + low-risk: reuses the resubscribe path (no new reconnection
-        logic), only acts when the socket is healthy + feed stale + in session, and
-        composes with PR C — the resubscribe arms the gap check, so a gapped buffer
-        is re-seeded before any signal. Never raises into the healthcheck loop.
+        FEED-GAP FIX — a resubscribe over a live socket cannot clear a wedged
+        keepUpToDate stream once the gateway has stopped delivering (2026-06-07
+        reopen: 5.5h dark, every same-socket resubscribe returned seeded=0 +
+        Error 162; recovery came ONLY from an external peer-close → reconnect). So
+        after ``_FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS`` consecutive resubscribes
+        fail to restore bars, ESCALATE to a forced socket reconnect — the
+        evidence-proven recovery — reusing the existing tested
+        ``_resilient_reconnect`` (no new reconnection logic). The counter is reset
+        in ``_on_new_bar`` when a live bar arrives.
+
+        Bounded + low-risk: only acts when the socket is healthy + feed stale + in
+        session; composes with PR C (the resubscribe arms the gap check, so a gapped
+        buffer is re-seeded before any signal). Never raises into the healthcheck
+        loop.
         """
         now = datetime.now(UTC)
         if (
@@ -865,7 +896,34 @@ class Orchestrator:
         ):
             return
         self._last_feed_heal_at = now
-        LOGGER.warning("[FEED] stale-feed self-heal — resubscribing bar feed (socket healthy)")
+        self._consecutive_feed_heals += 1
+        # Escalate once plain resubscribes have demonstrably failed to clear the
+        # wedge — a resubscribe over a live-but-wedged socket is a no-op (Error 162).
+        if self._consecutive_feed_heals >= _FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS:
+            LOGGER.warning(
+                "[FEED] stale-feed self-heal ESCALATING to socket reconnect — "
+                "%d consecutive resubscribes did not restore bars (wedged keepUpToDate)",
+                self._consecutive_feed_heals,
+            )
+            LOGGER.info("[ALERT] feed_self_heal_reconnect_escalation")
+            try:
+                # Force the wedged socket down so connect_with_resilience rebuilds it
+                # fresh — the only action proven to clear a gateway-side wedge. The
+                # bar subscription is re-armed inside _resilient_reconnect.
+                self._ib.disconnect()
+                await self._resilient_reconnect()
+            except Exception as exc:  # noqa: BLE001 — escalation must never crash the loop
+                LOGGER.warning(
+                    "[FEED] stale-feed reconnect escalation failed — type=%s msg=%s",
+                    type(exc).__name__,
+                    exc,
+                )
+            return
+        LOGGER.warning(
+            "[FEED] stale-feed self-heal — resubscribing bar feed (socket healthy, attempt %d/%d)",
+            self._consecutive_feed_heals,
+            _FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS,
+        )
         LOGGER.info("[ALERT] feed_self_heal_resubscribe")
         try:
             await self._start_bar_subscription()
