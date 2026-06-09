@@ -121,6 +121,22 @@ strategy or exit math:
   mocks). Writes a dated report to `/tmp/shadow_<date>.txt`. **OFFLINE research, READ-ONLY,
   drives NO prod path.**
 
+- **Phase 11 — SeanBot shadow-ledger REVIEW** (`python -m tools.eval.shadow_review [--qty 2]
+  [--from-json] [--out PATH]`) — promotes the Phase-10 tally into a **decision instrument**.
+  It reuses `shadow_ledger.scorecard` verbatim (identical $ math) and adds the three things an
+  operator acts on: (1) a **COHORT SPLIT** — `MISS-regime` (a gate/strategy question) vs
+  `MISS-NO-BAR` (a feed question) scored separately, with any `MISS-NO-BAR` dated at/after the
+  feed fix (#127, 2026-06-09 15:27 UTC) flagged LOUD as a **feed regression** (it should trend
+  to ~0); (2) a **per-day + cumulative** WR/PF/net$ curve at TF's live sizing (default `--qty
+  2`); (3) a **pre-committed DECISION BAR** — `INSUFFICIENT` (n_paired < 20), `GATE-TOO-STRICT`
+  (n>=20 and blocked set net-positive → escalate to Phase 12), or `GATE-EARNING-ITS-KEEP`
+  (n>=20 and net-negative), annotated with a NOISE/THIN/EMERGING/FIRM confidence tier. This is
+  the LIVE, accumulating half of the gate question; the 26-month HISTORICAL cohort edge is
+  Phase 12. Invariants (decision rule, confidence tiers, per-day cumulative, feed-regression
+  flag, scorecard-$ parity) pinned in `tests/test_shadow_review.py` on hand-built telemetry (no
+  DB mocks). Writes `/tmp/shadow_review_<date>.txt`. **OFFLINE research, READ-ONLY, drives NO
+  prod path.**
+
 - `fetch_history.py` — read-only (re)fetch of the saved 1-min history (dry-run by default).
 
 ## Fidelity
