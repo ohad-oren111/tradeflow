@@ -176,6 +176,31 @@ strategy or exit math:
   analysis logic pinned in `tests/test_concurrency_replay.py`. Writes
   `/tmp/concurrency_replay_<date>.txt`. **OFFLINE research, READ-ONLY, drives NO prod path.**
 
+- **Phase 14 — SeanBot fill reconciliation** (`python -m tools.eval.phase14_sb_reconciliation
+  [--from-json] [--out PATH]`) — one pre-committed question: **is SB's cumulative lead achievable
+  on the REAL MNQ tape, or does it rest on a divergent feed / a gate that fails open?** Pulls SB's
+  entries/exits (typed PostgREST `seanbot_signals`), FIFO-pairs round-trips, and tests their prints
+  against ground truth — the real MNQ 1-min tape pulled from IBKR (separate clientId 114,
+  historical-data only). Three instruments: **(B) price delta** `SB_posted − real_close` with a
+  timestamp-shift scan; **(C) regime classification** on the REAL 30m-EMA200 (the same window
+  `regime_at` uses) bucketing each entry legit-above / DIVERGENT-FEED / GATE-FAILED-OPEN; **(D)
+  re-price** each clean round-trip on the real tape under SB's posted −75/+150 bracket (driving the
+  REAL `_process_exit_bar` / `should_hard_exit`) + a trailing proxy, friction-charged. Pre-committed
+  verdict bar: FEED-DIVERGENT (median |Δ|>10pt AND >60% divergent-feed) / GATE-INERT (>60%
+  gate-failed-open, small Δ) / LEAD-REAL otherwise. **Verdict (2026-06-09): LEAD-REAL** — SB's
+  prints are NOT phantom (roll-aware median |Δ| ~14pt, UNBIASED once the early-June→Sept contract
+  roll is resolved by attributing each entry to the front month it actually traded; 0% regime-
+  flipping divergence); 81% of entries are above-trend (TF-achievable), 19% are below-trend longs
+  the gate blocks — and those re-price NEGATIVE on the real tape, corroborating Phase-12
+  GATE-CORRECT. **Roll finding:** SB rolls June→Sept ~8d before expiry; an un-attributed June-only
+  fetch shows a spurious +200..+365pt "divergence" that is pure calendar carry (the study fetches
+  BOTH MNQM6+MNQU6 and attributes per entry). **Capture limit (honest):** only 37/70 round-trips
+  have a parsed exit and TF's own losing side is not in `seanbot_signals`, so this is a MECHANISM
+  verdict, not a dollar audit of the operator's $9,935.98 lead. Pure logic (pairing, shift scan,
+  classification, re-pricing, verdict, roll attribution) pinned in
+  `tests/test_phase14_sb_reconciliation.py` on synthetic tapes warmed past the 202-bucket EMA
+  threshold. Writes `/tmp/phase14_<date>.txt`. **OFFLINE research, READ-ONLY, drives NO prod path.**
+
 - `fetch_history.py` — read-only (re)fetch of the saved 1-min history (dry-run by default).
 
 ## Fidelity
