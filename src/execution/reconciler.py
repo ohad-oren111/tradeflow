@@ -33,6 +33,7 @@ from src.execution.bracket import build_bracket, build_protective_stop
 from src.execution.dirty_set import DirtySet
 from src.execution.router import _build_market_exit as build_market_exit
 from src.execution.router import (
+    cancel_prior_protective_stops,
     ensure_protective_stop,
     should_heal_target,
     stop_leg_uses_oca,
@@ -340,6 +341,7 @@ class Reconciler:
         existing_stop_is_live = lifecycle.stop_order_id is not None and _order_in_open_trades(
             open_trades, lifecycle.stop_order_id
         )
+        sibling_stop_ids = await self._sibling_stop_ids(lifecycle.lifecycle_id)
         return await ensure_protective_stop(
             self._ib,
             contract,
@@ -348,7 +350,32 @@ class Reconciler:
             existing_stop_is_live=existing_stop_is_live,
             component="RECON",
             path="recon_force_fill",
+            sibling_stop_ids=sibling_stop_ids,
         )
+
+    async def _sibling_stop_ids(self, current_lifecycle_id: str) -> set[int] | None:
+        """Stop order ids tracked by OTHER non-closed lifecycles — PROTECTED from the
+        cancel-before-arm sweep so an N=2 same-symbol book never cancels the still-open
+        leg's stop (PR-143). Returns ``None`` on a DB error so the caller cancels only
+        the lifecycle's own tracked stop and never an order that might be a sibling's.
+        """
+        try:
+            rows = await self._db.select_lifecycles_non_closed()
+        except Exception as exc:  # noqa: BLE001 — never raise into the reconcile loop
+            LOGGER.warning(
+                "[RECON] sibling_stop_ids_unavailable — %s: %s (cancel own stop only)",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        ids: set[int] = set()
+        for row in rows:
+            if row.get("lifecycle_id") == current_lifecycle_id:
+                continue
+            sid = row.get("stop_order_id")
+            if sid is not None:
+                ids.add(int(sid))
+        return ids
 
     async def _heal_missing_legs(
         self,
@@ -418,6 +445,21 @@ class Reconciler:
                 if heal_oca:
                     stp.ocaGroup = oca_group
                     stp.ocaType = _HEAL_OCA_TYPE
+                # Cancel-before-arm (PR-143): an untracked sibling stop (the 06-10
+                # orphan) may rest for this position even though the tracked leg is
+                # gone — cancel it before re-placing so the heal can't create a second
+                # resting stop. N=2-safe via the protected sibling-id set.
+                heal_sibling_ids = await self._sibling_stop_ids(lifecycle.lifecycle_id)
+                await cancel_prior_protective_stops(
+                    self._ib,
+                    symbol=lifecycle.symbol,
+                    exit_action="SELL" if direction is Direction.LONG else "BUY",
+                    own_stop_id=lifecycle.stop_order_id,
+                    open_trades=open_trades,
+                    sibling_stop_ids=heal_sibling_ids,
+                    component="RECOVER",
+                    path="heal_missing_stop",
+                )
                 trade = await self._ib.place_order(contract, stp)
                 updates["stop_order_id"] = _order_id_of(trade)
                 LOGGER.warning(

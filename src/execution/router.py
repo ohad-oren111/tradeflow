@@ -564,6 +564,13 @@ class OrderRouter:
         #    (lc.stop_order_id set), so ensure_protective_stop is an idempotent no-op
         #    (existing_stop_is_live=True → returns the existing id, no double-place).
         stop_already_resting = lc.stop_order_id is not None
+        # Cancel-before-arm (PR-143): protect OTHER active lifecycles' tracked stops
+        # (N=2 same-symbol safe) from the sweep; from the in-memory registry, no I/O.
+        sibling_stop_ids = {
+            int(other.stop_order_id)
+            for lid, other in self._by_lifecycle_id.items()
+            if lid != lc.lifecycle_id and other.stop_order_id is not None
+        }
         stp_order_id = await ensure_protective_stop(
             self._ib,
             contract,
@@ -572,6 +579,7 @@ class OrderRouter:
             existing_stop_is_live=stop_already_resting,
             component="ROUTER",
             path="parent_fill",
+            sibling_stop_ids=sibling_stop_ids,
         )
 
         # Trailing mode — the entry bracket's fixed STP @ entry-stop_loss_pts IS
@@ -1271,6 +1279,88 @@ class OrderRouter:
         return qty, price, datetime.now(UTC).isoformat()
 
 
+def _is_protective_stop_order(order: Any) -> bool:
+    """A resting protective STOP leg (stop-market or stop-limit). Entries are MKT
+    and the take-profit is LMT, so this filter never matches a working entry."""
+    return str(getattr(order, "orderType", "") or "") in ("STP", "STP LMT")
+
+
+def _trade_symbol(trade: Any) -> str | None:
+    contract = getattr(trade, "contract", None)
+    return getattr(contract, "localSymbol", None) or getattr(contract, "symbol", None)
+
+
+async def cancel_prior_protective_stops(
+    ib: IBClient,
+    *,
+    symbol: str,
+    exit_action: str,
+    own_stop_id: int | None,
+    open_trades: list[Any],
+    sibling_stop_ids: set[int] | None,
+    component: str,
+    path: str,
+) -> int:
+    """Cancel-before-arm (§0.5.207 prevention): cancel every resting protective STP
+    that belongs to THIS lifecycle's position BEFORE a new one is placed, so at most
+    one protective stop ever rests per active lifecycle.
+
+    Cancels, from broker truth (``open_trades``), each protective STP on ``symbol``
+    whose ``action`` matches the lifecycle's exit side and whose id is either:
+      (a) the lifecycle's own tracked ``own_stop_id`` (the stop being replaced), or
+      (b) UNTRACKED — claimed by NO other active lifecycle.
+    ``sibling_stop_ids`` (the stop ids of OTHER active lifecycles) are PROTECTED, so
+    an N=2 same-symbol book never cancels the still-open leg's stop. When the caller
+    cannot resolve the sibling set it passes ``sibling_stop_ids=None`` → conservative:
+    cancel ONLY ``own_stop_id`` and leave any unclaimed order to the #142 broker-truth
+    sweep (never cancel a possibly-sibling stop on incomplete info).
+
+    Best-effort: a cancel failure is logged, never raised — the freshly placed stop
+    plus the reconciler sweep are the backstops. Returns the count cancelled.
+    """
+    cancelled = 0
+    for trade in open_trades:
+        order = getattr(trade, "order", None)
+        if order is None or not _is_protective_stop_order(order):
+            continue
+        if str(getattr(order, "action", "") or "") != exit_action:
+            continue
+        if _trade_symbol(trade) != symbol:
+            continue
+        oid = getattr(order, "orderId", None)
+        if oid is None:
+            continue
+        oid = int(oid)
+        is_own = own_stop_id is not None and oid == int(own_stop_id)
+        # An order that is not our own tracked stop is cancellable ONLY as an
+        # untracked orphan: we must KNOW the sibling set AND it must not be a tracked
+        # sibling — otherwise leave it (never cancel another lifecycle's stop).
+        if not is_own and (sibling_stop_ids is None or oid in sibling_stop_ids):
+            continue
+        try:
+            did_cancel = await ib.cancel_order_by_id(oid)
+        except Exception as exc:  # noqa: BLE001 — never raise into fill/reconcile loops
+            LOGGER.warning(
+                "[ARM] %s: cancel_prior_stop_error — order=%s type=%s msg=%s — %s",
+                symbol,
+                oid,
+                type(exc).__name__,
+                exc,
+                path,
+            )
+            continue
+        if did_cancel:
+            cancelled += 1
+            LOGGER.warning(
+                "[ARM] %s: cancelled prior stop %s before placing new — reason=%s — %s",
+                symbol,
+                oid,
+                "own_tracked" if is_own else "untracked_sibling",
+                path,
+            )
+    return cancelled
+
+
 async def ensure_protective_stop(
     ib: IBClient,
     contract: Contract,
@@ -1280,6 +1370,7 @@ async def ensure_protective_stop(
     existing_stop_is_live: bool,
     component: str,
     path: str,
+    sibling_stop_ids: set[int] | None = None,
 ) -> int | None:
     """Idempotently guarantee a broker-resident protective STP for ``lifecycle``.
 
@@ -1293,6 +1384,16 @@ async def ensure_protective_stop(
     already rests at the broker) it returns the existing id and places nothing,
     so concurrent completion paths never double-place. Returns the stop order id
     (existing or newly placed), or ``None`` when ``stop_price`` is unknown.
+
+    Cancel-before-arm (PR-143 / §0.5.207): when ``sibling_stop_ids`` is provided
+    (a set — possibly empty — of the stop ids of OTHER active lifecycles), the
+    PLACEMENT branch first cancels this lifecycle's own tracked stop AND any
+    untracked resting protective STP for the symbol via
+    :func:`cancel_prior_protective_stops`, so at most one protective stop ever rests
+    per active lifecycle. The idempotent no-op branch above does NOT sweep — a
+    healthy tracked stop is left untouched. ``sibling_stop_ids=None`` (the default,
+    used by callers that don't opt in / can't resolve the sibling set) skips the
+    sweep entirely, preserving the pre-PR-143 behaviour.
     """
     if existing_stop_is_live and lifecycle.stop_order_id is not None:
         LOGGER.info(
@@ -1312,8 +1413,25 @@ async def ensure_protective_stop(
             path,
         )
         return None
+    # Cancel-before-arm (PR-143): guarantee at most one resting protective stop per
+    # lifecycle by cancelling this lifecycle's prior/untracked stop(s) BEFORE placing
+    # the new one. Opt-in via sibling_stop_ids (None → skip, pre-PR-143 behaviour).
+    direction = Direction(lifecycle.direction)
+    if sibling_stop_ids is not None:
+        exit_action = "SELL" if direction is Direction.LONG else "BUY"
+        open_trades = await ib.get_open_trades()
+        await cancel_prior_protective_stops(
+            ib,
+            symbol=lifecycle.symbol,
+            exit_action=exit_action,
+            own_stop_id=lifecycle.stop_order_id,
+            open_trades=open_trades,
+            sibling_stop_ids=sibling_stop_ids,
+            component=component,
+            path=path,
+        )
     stp = build_protective_stop(
-        direction=Direction(lifecycle.direction),
+        direction=direction,
         qty=qty,
         stop_price=float(lifecycle.stop_price),
     )
