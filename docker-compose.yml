@@ -109,6 +109,16 @@ services:
       # Literal (not ${...}) so .env cannot shadow it (§0.5.159). Reversible: delete
       # this line or set "false" + force-recreate.
       REGIME_GATE_ENABLED: "true"
+      # SB-trigger replicate path OFF (operator-approved, Session 26). The PR #107
+      # "_maybe_enter_on_seanbot" path copies a SeanBot LONG into a TF entry and
+      # dispatches straight to _handle_trade_signal — it BYPASSES the regime gate
+      # (strategy._regime_ok), so it entered below-trend −EV trades the gate is
+      # there to block (PART-0: 17/17 SB entries since 06-05 were below-trend) and
+      # tripped the 06-10 multi-lot order bugs. Turning it OFF strictly REMOVES a
+      # trade path (risk-direction safer): TF then trades NOTHING below-trend.
+      # Literal (not ${...}) so .env cannot shadow it (§0.5.159). Reversible: set
+      # "true" or delete this line + force-recreate.
+      SB_TRIGGER_ENABLED: "false"
     depends_on:
       - ib-gateway
     ports:
