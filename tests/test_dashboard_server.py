@@ -381,16 +381,56 @@ def test_scoreboard_read_error_surfaces_not_500(_env):
     assert "Failed to load" in r.text
 
 
-# ------------------------- PR #100: SeanBot exit over-capture dedup (§7.3)
-# A fixed 2-ct book closes at most ONCE at a price; same-price exit rows within
-# the dedup window are the SAME close re-announced (SeanBot's reconciler recomputes
-# P&L on each post, so points drift). Pure-helper tests use explicit args, fresh
-# fixtures per test, and assert on the aggregated number — never call order.
+# ------------------------- PR #100 / PR-4: SeanBot exit dedup (§7.3)
+# SeanBot now runs a CONCURRENT book, so "same price within the window" no longer
+# implies the same close. We collapse only IDENTICAL re-announcements (same price
+# AND same pnl_points); distinct concurrent closes (same price, different pnl) are
+# retained. Pure-helper tests use explicit args, fresh fixtures, assert aggregates.
 
 
-def test_dedup_collapses_reannounced_same_price_exit_keeping_last():
-    # The real 2026-06-01 13:22 cluster: three "2 ct" exits @30365.25 within 35s
-    # (−127 → −101 → −94 as SeanBot recomputed) is ONE close, not three.
+def test_dedup_retains_distinct_pnl_same_price_concurrent_closes():
+    # PR-4: the real 2026-06-10 04:19:11 multi-flatten — three DISTINCT concurrent
+    # positions closed @28954.88 with pnl −357/−341/−334 (each entered at a different
+    # price). These are NOT one re-announced close; all three must be RETAINED.
+    rows = [
+        {
+            "type": "exit",
+            "ts": "2026-06-10T04:19:11+00:00",
+            "message_id": 293,
+            "price": 28954.88,
+            "pnl_points": -357.0,
+            "contracts": 2,
+        },
+        {
+            "type": "exit",
+            "ts": "2026-06-10T04:19:11+00:00",
+            "message_id": 294,
+            "price": 28954.88,
+            "pnl_points": -341.0,
+            "contracts": 2,
+        },
+        {
+            "type": "exit",
+            "ts": "2026-06-10T04:19:11+00:00",
+            "message_id": 295,
+            "price": 28954.88,
+            "pnl_points": -334.0,
+            "contracts": 2,
+        },
+    ]
+    kept = _dedup_seanbot_exits(rows)
+    assert len(kept) == 3  # all three distinct concurrent closes survive
+    assert {r["message_id"] for r in kept} == {293, 294, 295}
+    # all three counted: (−357−341−334) pt × $2 × 2 ct = −$4,128.00 (was −$1,336 collapsed)
+    by_day = _aggregate_seanbot_daily(rows)
+    assert by_day["2026-06-10"] == pytest.approx(-4128.0, abs=0.05)
+
+
+def test_dedup_retains_drifting_pnl_same_price_burst():
+    # The real 2026-06-01 13:22 cluster @30365.25 (−127/−101/−94) drifts in pnl, so
+    # under the concurrent-book policy it is NO LONGER collapsed (a pnl difference is
+    # treated as a distinct close). The stated tradeoff: a recompute-drift
+    # re-announcement is over-counted rather than risk hiding a real concurrent loss.
     rows = [
         {
             "type": "exit",
@@ -417,12 +457,7 @@ def test_dedup_collapses_reannounced_same_price_exit_keeping_last():
             "contracts": 2,
         },
     ]
-    kept = _dedup_seanbot_exits(rows)
-    assert len(kept) == 1
-    assert kept[0]["message_id"] == 154  # the last (settled) recompute wins
-    # Counted exactly once: −94 pt × $2 × 2 ct = −$376.00 (not the −2032 triple-sum).
-    by_day = _aggregate_seanbot_daily(rows)
-    assert by_day["2026-06-01"] == pytest.approx(-376.0, abs=0.05)
+    assert len(_dedup_seanbot_exits(rows)) == 3
 
 
 def test_dedup_exact_duplicate_counted_once():
