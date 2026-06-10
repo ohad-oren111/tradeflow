@@ -83,6 +83,9 @@ class ReconcileAction(StrEnum):
     EXITING_TO_CLOSED = "exiting_to_closed"
     FOREIGN_POSITION = "foreign_position"
     FLATTENED = "flattened"  # STABILIZE-4: auto-flattened a confirmed-foreign position
+    ORPHAN_SWEPT = (
+        "orphan_swept"  # PR-2 §0.5.207: cancelled an untracked resting stop on a flat book
+    )
     HEALED = "healed"  # ACTIVE+position: re-placed a missing bracket leg (stop/target)
     WARNING = "warning"  # logged anomaly, no transition
     RACE = "race"  # state machine guard fired (InvariantViolationError)
@@ -773,6 +776,17 @@ class Reconciler:
         foreign_counts = await self._reconcile_foreign_positions(non_closed, portfolio)
         counts.update(foreign_counts)
 
+        # NEVER-ORPHAN broker-truth backstop (PR-2 / §0.5.207): cancel any resting
+        # protective order on a symbol that is BOTH broker-flat AND un-intended by
+        # any non-CLOSED lifecycle. _cancel_open_legs only cancels the ONE tracked
+        # stop_order_id, so an untracked sibling stop (the 2026-06-10 orphan) survives;
+        # this sweeps it before it can fire into a naked position.
+        positions = await self._ib.get_positions()
+        open_trades = await self._ib.get_open_trades()
+        swept = await self._sweep_orphan_protective_orders(non_closed, open_trades, positions)
+        if swept:
+            counts[ReconcileAction.ORPHAN_SWEPT] += swept
+
         LOGGER.info(
             "[RECON] tick: full_scan_complete — non_closed=%s actions=%s",
             len(non_closed),
@@ -913,6 +927,87 @@ class Reconciler:
             self._foreign_streak.pop(symbol, None)
 
         return counts
+
+    async def _sweep_orphan_protective_orders(
+        self,
+        non_closed: list[Lifecycle],
+        open_trades: list[Any],
+        positions: list[Any],
+    ) -> int:
+        """NEVER-ORPHAN broker-truth backstop (PR-2 / §0.5.207).
+
+        A resting protective order (STP / STP LMT / LMT) on a symbol that is BOTH
+        broker-FLAT and un-intended by any non-CLOSED lifecycle has nothing behind
+        it — a SELL STP that re-opens a short if hit. The 2026-06-10 orphan: a
+        position carried TWO protective stops (one armed by the router parent-fill,
+        one by a reconciler re-arm) but the lifecycle tracks a SINGLE stop_order_id,
+        so the un-tracked sibling was never cancelled — it sat resting 36 min, fired
+        @28988.5, and opened a naked −1 SHORT the bot then had to flatten. The
+        event-driven ``_cancel_sibling_legs`` and the reconciler ``_cancel_open_legs``
+        both cancel only ``lifecycle.stop_order_id`` (+ target), so they CANNOT reach
+        an untracked sibling. This sweep does, from broker truth.
+
+        Concurrency-safe (N=2): gated on the symbol being broker-flat AND
+        ``intended_net_position == 0``, so it never cancels a stop backing a live
+        position (incl. the still-open leg of an N=2 book) or a working entry on an
+        ENTERING lifecycle (which intends a position). Only orders CLAIMED by no
+        non-CLOSED lifecycle are swept; entries are MKT, so the STP/STP LMT/LMT
+        filter never touches a working entry. Cancel via our own clientId (no IB
+        error 10147). Never raises into the scan loop.
+        """
+        claimed: set[int] = set()
+        for lc in non_closed:
+            for oid in (lc.entry_order_id, lc.stop_order_id, lc.target_order_id):
+                if oid is not None:
+                    claimed.add(int(oid))
+
+        broker_net: dict[str, int] = {}
+        for pos in positions:
+            contract = getattr(pos, "contract", None)
+            sym = getattr(contract, "localSymbol", None) or getattr(contract, "symbol", None)
+            if sym is None:
+                continue
+            broker_net[sym] = broker_net.get(sym, 0) + int(getattr(pos, "position", 0) or 0)
+
+        default_qty = int(RISK.contracts_per_trade)
+        swept = 0
+        for trade in open_trades:
+            order = getattr(trade, "order", None)
+            contract = getattr(trade, "contract", None)
+            if order is None or contract is None:
+                continue
+            order_type = str(getattr(order, "orderType", "") or "")
+            if order_type not in ("STP", "STP LMT", "LMT"):
+                continue  # protective/exit legs only — entries are MKT (race-safe)
+            oid = getattr(order, "orderId", None)
+            sym = getattr(contract, "localSymbol", None) or getattr(contract, "symbol", None)
+            if oid is None or sym is None or int(oid) in claimed:
+                continue
+            if broker_net.get(sym, 0) != 0:
+                continue  # a live position may back this leg — leave it
+            if intended_net_position(non_closed, sym, default_qty) != 0:
+                continue  # a non-CLOSED lifecycle intends a position — leave it
+            try:
+                cancelled = await self._ib.cancel_order_by_id(int(oid))
+            except Exception as exc:  # noqa: BLE001 — never raise into the reconcile loop
+                LOGGER.warning(
+                    "[RECON] orphan_sweep_error — order=%s sym=%s type=%s msg=%s",
+                    oid,
+                    sym,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            if cancelled:
+                swept += 1
+                LOGGER.warning(
+                    "[RECON] orphan_sweep: cancelled untracked resting %s order=%s sym=%s — "
+                    "flat book, no non-CLOSED lifecycle claims it (NEVER-ORPHAN §0.5.207)",
+                    order_type,
+                    oid,
+                    sym,
+                )
+        return swept
 
     async def _flatten_foreign(self, symbol: str, foreign_qty: int, contract: Any) -> bool:
         """Flatten a CONFIRMED-foreign delta at market via the shared market-exit

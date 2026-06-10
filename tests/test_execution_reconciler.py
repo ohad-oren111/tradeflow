@@ -1279,6 +1279,113 @@ def test_intended_net_position_is_direction_agnostic():
     assert intended_net_position([long_lc, short_lc], "MNQM6", 2) == 0  # net flat
 
 
+# ---- PR-2: NEVER-ORPHAN sweep (§0.5.207) ----
+# A position can carry two protective stops (router parent-fill + a reconciler
+# re-arm) but the lifecycle tracks ONE stop_order_id, so the untracked sibling is
+# never cancelled (the 2026-06-10 orphan that fired into a naked short). The sweep
+# cancels resting protective orders on a flat, un-intended symbol that no
+# non-CLOSED lifecycle claims.
+
+
+def _make_protective_trade(order_id: int, symbol: str = "MNQM6", order_type: str = "STP"):
+    trade = _make_open_trade(order_id, symbol=symbol)
+    trade.order.orderType = order_type
+    trade.order.action = "SELL"
+    return trade
+
+
+def _ib_with_cancel(open_trades, positions):
+    ib = _make_mock_ib(open_trades=open_trades, positions=positions)
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+    return ib
+
+
+async def test_orphan_sweep_cancels_untracked_stop_on_flat_book():
+    # The 06-10 orphan: an untracked STP @ a flat book, no lifecycle → cancelled.
+    orphan = _make_protective_trade(194)
+    ib = _ib_with_cancel([orphan], positions=[])
+    rec, *_ = _build_reconciler(ib=ib)
+    swept = await rec._sweep_orphan_protective_orders([], [orphan], [])
+    assert swept == 1
+    ib.cancel_order_by_id.assert_awaited_once_with(194)
+
+
+async def test_orphan_sweep_keeps_stop_when_position_live():
+    # broker still HOLDS the position → its protective stop must NOT be swept.
+    stp = _make_protective_trade(195)
+    pos = _make_position(symbol="MNQM6", qty=2)
+    ib = _ib_with_cancel([stp], positions=[pos])
+    rec, *_ = _build_reconciler(ib=ib)
+    swept = await rec._sweep_orphan_protective_orders([], [stp], [pos])
+    assert swept == 0
+    ib.cancel_order_by_id.assert_not_awaited()
+
+
+async def test_orphan_sweep_keeps_stop_when_lifecycle_intends_position():
+    # Race guard: broker momentarily flat but an ACTIVE lifecycle intends +2 → leave it.
+    active = _make_lifecycle(State.ACTIVE, entry_qty=2)
+    stp = _make_protective_trade(195)
+    ib = _ib_with_cancel([stp], positions=[])
+    rec, *_ = _build_reconciler(ib=ib)
+    swept = await rec._sweep_orphan_protective_orders([active], [stp], [])
+    assert swept == 0
+    ib.cancel_order_by_id.assert_not_awaited()
+
+
+async def test_orphan_sweep_keeps_claimed_stop():
+    # A stop CLAIMED by a non-CLOSED lifecycle (its tracked stop_order_id) is never swept.
+    active = _make_lifecycle(State.ACTIVE, entry_qty=2, stop_order_id=195)
+    stp = _make_protective_trade(195)
+    pos = _make_position(symbol="MNQM6", qty=2)
+    ib = _ib_with_cancel([stp], positions=[pos])
+    rec, *_ = _build_reconciler(ib=ib)
+    swept = await rec._sweep_orphan_protective_orders([active], [stp], [pos])
+    assert swept == 0
+
+
+async def test_orphan_sweep_ignores_market_entry_orders():
+    # A working MKT entry (not a protective leg) on a flat book is NOT swept.
+    entry = _make_protective_trade(193, order_type="MKT")
+    entry.order.action = "BUY"
+    ib = _ib_with_cancel([entry], positions=[])
+    rec, *_ = _build_reconciler(ib=ib)
+    swept = await rec._sweep_orphan_protective_orders([], [entry], [])
+    assert swept == 0
+    ib.cancel_order_by_id.assert_not_awaited()
+
+
+async def test_orphan_sweep_n2_leaves_open_leg_then_sweeps_when_flat():
+    # N=2 safety: while broker holds the still-open leg (net 2), an untracked stop is
+    # NOT swept; once the book is fully flat with no intent, it IS swept.
+    stp = _make_protective_trade(194)
+    pos = _make_position(symbol="MNQM6", qty=2)
+    ib = _ib_with_cancel([stp], positions=[pos])
+    rec, *_ = _build_reconciler(ib=ib)
+    assert await rec._sweep_orphan_protective_orders([], [stp], [pos]) == 0
+    ib.cancel_order_by_id.reset_mock()
+    assert await rec._sweep_orphan_protective_orders([], [stp], []) == 1
+    ib.cancel_order_by_id.assert_awaited_once_with(194)
+
+
+async def test_orphan_sweep_swallows_cancel_error():
+    orphan = _make_protective_trade(194)
+    ib = _make_mock_ib(open_trades=[orphan], positions=[])
+    ib.cancel_order_by_id = AsyncMock(side_effect=RuntimeError("boom"))
+    rec, *_ = _build_reconciler(ib=ib)
+    swept = await rec._sweep_orphan_protective_orders([], [orphan], [])
+    assert swept == 0  # error swallowed, never raised
+
+
+async def test_orphan_sweep_cancels_multiple_orphans():
+    o1 = _make_protective_trade(194, order_type="STP")
+    o2 = _make_protective_trade(196, order_type="LMT")
+    ib = _ib_with_cancel([o1, o2], positions=[])
+    rec, *_ = _build_reconciler(ib=ib)
+    swept = await rec._sweep_orphan_protective_orders([], [o1, o2], [])
+    assert swept == 2
+    assert ib.cancel_order_by_id.await_count == 2
+
+
 # ---- PR-3: entry-settle grace (never flatten a just-filled, still-settling entry) ----
 
 
