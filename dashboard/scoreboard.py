@@ -115,13 +115,26 @@ class ScoreboardAggregator:
         return _build_scoreboard(tf_by_day, sb_estimate_by_day)
 
 
-# SeanBot's book is a fixed 2-contract position: it can close at most ONCE at a
-# given price. Multiple ``exit`` rows at the SAME price within this window are the
-# same close re-announced by SeanBot's reconciler (each post recomputes P&L, so
-# the points differ — e.g. the 2026-06-01 13:22:18/13:22:53/13:22:53 @30365.25
-# trio, or the 06-02 19:57:45/19:58:05 @30694.25 exact +49/+49 pair). Summing all
-# of them over-captured realized P&L ~3.3× and produced the bogus "TF leads"
-# headline (§0.5.197 / §7.3). We collapse each same-price burst to one event.
+# SeanBot now runs a CONCURRENT book (proven 2026-06-10: three distinct positions
+# manual-flattened together @28954.88 with pnl −357/−341/−334). So "same price within
+# the window" is NO LONGER sufficient to call two exits the same close — distinct
+# concurrent closes share an exit price but carry DIFFERENT pnl_points (each position
+# entered at a different price). The earlier price-only dedup collapsed those three
+# into one and hid −$2,792 of real loss (showed 06-10 ≈ −$1,456 vs the true −$4,248).
+#
+# A TRUE re-announcement (SeanBot's reconciler re-posting the SAME close) is an
+# IDENTICAL message: same price AND same pnl_points (e.g. the 06-02 19:57:45/19:58:05
+# @30694.25 +49/+49 pair). So we now key the collapse on (price, pnl_points) together:
+# only rows identical on BOTH within the window are merged; any pnl difference at the
+# same price is treated as a DISTINCT concurrent close and retained.
+#
+# TRADEOFF (stated loudly): a re-announcement whose pnl_points DRIFTED between posts
+# (the old reconciler-recompute case, e.g. the 06-01 13:22 −127/−101/−94 trio) is now
+# RETAINED as three rows rather than collapsed. The operator accepts this: over-counting
+# an occasional recompute-drift re-announcement is far safer than the prior failure mode
+# of HIDING real concurrent losses (§7.3 over-capture is the lesser harm vs under-capture
+# of true losses). message_id can't be the key — every post (including re-announcements)
+# gets a fresh message_id, so it never collapses anything.
 _DEDUP_WINDOW_SECONDS = 120.0
 
 
@@ -139,9 +152,11 @@ def _dedup_seanbot_exits(
     rows: list[dict[str, Any]],
     window_seconds: float = _DEDUP_WINDOW_SECONDS,
 ) -> list[dict[str, Any]]:
-    """Collapse same-close re-announcements: ``exit`` rows sharing a price whose
-    timestamps fall within ``window_seconds`` of the prior kept row at that price
-    are the SAME close. Keep the LAST (latest-ts) row — SeanBot's settled recompute.
+    """Collapse only IDENTICAL re-announcements: ``exit`` rows sharing the same
+    ``(price, pnl_points)`` whose timestamps fall within ``window_seconds`` of the
+    prior kept row with that same key are the SAME close re-posted. Keep the LAST
+    (latest-ts) row. Rows that share a price but differ in ``pnl_points`` are
+    DISTINCT concurrent closes and are all retained (the 2026-06-10 multi-flatten).
 
     Rows with no parseable price/ts are passed through unchanged (they can't be
     proven duplicates and the caller's value-guard drops malformed ones anyway).
@@ -151,29 +166,29 @@ def _dedup_seanbot_exits(
     exits.sort(key=lambda r: str(r.get("ts") or ""))  # oldest first
 
     kept: list[dict[str, Any]] = []
-    last_idx_by_price: dict[float, int] = {}
+    last_idx_by_key: dict[tuple[float, float | None], int] = {}
     for row in exits:
         price = _f(row.get("price"))
         ts = _parse_ts(row.get("ts"))
         if price is None or ts is None:
             kept.append(row)
             continue
-        prev_idx = last_idx_by_price.get(price)
+        key = (price, _f(row.get("pnl_points")))  # identical message = same price AND pnl
+        prev_idx = last_idx_by_key.get(key)
         if prev_idx is not None:
             prev_ts = _parse_ts(kept[prev_idx].get("ts"))
             if prev_ts is not None and (ts - prev_ts).total_seconds() <= window_seconds:
                 LOGGER.debug(
                     "[DASH] scoreboard dedup: collapsed re-announced exit — "
-                    "price=%s dropped_msg=%s dropped_pnl_pts=%s kept_msg=%s kept_pnl_pts=%s",
+                    "price=%s pnl_pts=%s dropped_msg=%s kept_msg=%s",
                     price,
-                    kept[prev_idx].get("message_id"),
-                    kept[prev_idx].get("pnl_points"),
-                    row.get("message_id"),
                     row.get("pnl_points"),
+                    kept[prev_idx].get("message_id"),
+                    row.get("message_id"),
                 )
-                kept[prev_idx] = row  # keep the later (settled) recompute
+                kept[prev_idx] = row  # keep the later (settled) re-post
                 continue
-        last_idx_by_price[price] = len(kept)
+        last_idx_by_key[key] = len(kept)
         kept.append(row)
     return kept
 
