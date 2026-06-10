@@ -31,6 +31,7 @@ from src.execution.reconciler import (
     _exit_price_for,
     _fill_price_for_order,
     _filled_order_id_for,
+    _symbol_recently_filled,
     compute_pnl_gross,
     foreign_quantity,
     intended_net_position,
@@ -1383,6 +1384,45 @@ async def test_orphan_sweep_cancels_multiple_orphans():
     swept = await rec._sweep_orphan_protective_orders([], [o1, o2], [])
     assert swept == 2
     assert ib.cancel_order_by_id.await_count == 2
+
+
+# ---- PR-3: entry-settle grace (never flatten a just-filled, still-settling entry) ----
+
+
+def test_symbol_recently_filled_true_within_window():
+    just_now = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
+    lc = _make_lifecycle(State.ACTIVE, entry_filled_at=just_now)
+    assert _symbol_recently_filled([lc], "MNQM6", 90.0) is True
+
+
+def test_symbol_recently_filled_false_after_window():
+    long_ago = (datetime.now(UTC) - timedelta(seconds=300)).isoformat()
+    lc = _make_lifecycle(State.ACTIVE, entry_filled_at=long_ago)
+    assert _symbol_recently_filled([lc], "MNQM6", 90.0) is False
+
+
+def test_symbol_recently_filled_ignores_other_symbol_and_missing_ts():
+    just_now = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()
+    other = _make_lifecycle(State.ACTIVE, symbol="ESZ5", entry_filled_at=just_now)
+    no_ts = _make_lifecycle(State.ACTIVE, entry_filled_at=None)
+    assert _symbol_recently_filled([other, no_ts], "MNQM6", 90.0) is False
+
+
+async def test_guard_skips_flatten_during_entry_settle(caplog):
+    # A 2-lot entry mid-settle: broker shows 2, lifecycle entry_qty still 1 (one
+    # execution recorded so far), but it filled <90s ago → guard must SKIP flatten
+    # (no foreign action) and let the entry settle. Without the grace the reconciler
+    # would self-flatten the real second contract (the 2026-06-10 trap).
+    just_now = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()
+    lc = _make_lifecycle(State.ACTIVE, entry_qty=1, entry_filled_at=just_now)
+    sm = _make_mock_sm(non_closed=[lc])
+    ib = _make_mock_ib(portfolio=[_make_portfolio_item(symbol="MNQM6", qty=2)])
+    orch = _make_mock_orchestrator()
+    rec, _ib, _sm, _ds, _orch = _build_reconciler(ib=ib, sm=sm, orchestrator=orch)
+    counts = await rec._reconcile_foreign_positions([lc], ib.get_portfolio.return_value)
+    assert counts[ReconcileAction.FOREIGN_POSITION] == 0
+    assert counts[ReconcileAction.FLATTENED] == 0
+    orch.raise_halt.assert_not_called()
 
 
 # ---- MUST flatten ----

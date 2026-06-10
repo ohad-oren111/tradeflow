@@ -130,6 +130,14 @@ class RiskParams:
     # "long-only". `enabled=False` disables auto-liquidation (still halts + alerts).
     foreign_flatten_enabled: bool = True
     foreign_flatten_confirm_ticks: int = 2
+    # PR-3 (§0.5.207) — entry-settle grace: skip the foreign-flatten guard for a
+    # symbol whose newest non-CLOSED lifecycle filled within this many seconds. A
+    # multi-lot entry can fill in several partial executions arriving over a short
+    # window, so for that grace period the recorded entry_qty may still trail the
+    # true filled qty (broker_net momentarily > intended_net). Skipping flatten here
+    # (purely additive — never causes a flatten) prevents liquidating a real,
+    # just-filled TF contract while the entry settles. 0 disables the grace.
+    foreign_flatten_entry_settle_sec: float = 90.0
 
     # Strategy parameters (per kickoff §3 — MA50/MA100 bounce, no ADX after PR #33)
     ma_fast: int = 50

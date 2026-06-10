@@ -866,6 +866,26 @@ class Reconciler:
                 self._foreign_streak.pop(symbol, None)
                 continue
 
+            # PR-3 entry-settle grace — a just-filled multi-lot entry can settle across
+            # several partial executions, so broker_net may momentarily exceed the
+            # recorded entry_qty (the 2026-06-10 trap: a 2-lot fill counted as 1 →
+            # the second real contract read as "foreign"). If the newest non-CLOSED
+            # lifecycle for this symbol filled within the settle grace, wait — never
+            # flatten a contract belonging to an actively-settling TF entry (§0.5.207).
+            settle_sec = float(getattr(RISK, "foreign_flatten_entry_settle_sec", 0.0) or 0.0)
+            if settle_sec > 0 and _symbol_recently_filled(non_closed, symbol, settle_sec):
+                LOGGER.info(
+                    "[RECON] foreign_skip_entry_settle: symbol=%s broker_net=%s intended_net=%s "
+                    "foreign_qty=%s (entry filled < %.0fs ago — letting it settle)",
+                    symbol,
+                    b_net,
+                    i_net,
+                    fq,
+                    settle_sec,
+                )
+                self._foreign_streak.pop(symbol, None)
+                continue
+
             # Stable foreign exposure → halt immediately (compounding guard, as before).
             counts[ReconcileAction.FOREIGN_POSITION] += 1
             self._orchestrator.raise_halt(symbol)
@@ -1216,6 +1236,26 @@ def _symbol_in_flight(lifecycles: list[Lifecycle], symbol: str) -> bool:
         lc.symbol == symbol and lc.state in (State.ENTERING.value, State.EXITING.value)
         for lc in lifecycles
     )
+
+
+def _symbol_recently_filled(lifecycles: list[Lifecycle], symbol: str, settle_sec: float) -> bool:
+    """True if any non-CLOSED lifecycle for ``symbol`` filled within ``settle_sec``
+    seconds (PR-3 entry-settle grace — a multi-lot entry may still be settling its
+    partial executions). Unparseable/absent ``entry_filled_at`` is ignored (treated
+    as not-recent — the guard's other layers still apply)."""
+    now = datetime.now(UTC)
+    for lc in lifecycles:
+        if lc.symbol != symbol or not lc.entry_filled_at:
+            continue
+        try:
+            filled = datetime.fromisoformat(str(lc.entry_filled_at))
+        except (TypeError, ValueError):
+            continue
+        if filled.tzinfo is None:
+            filled = filled.replace(tzinfo=UTC)
+        if (now - filled).total_seconds() <= settle_sec:
+            return True
+    return False
 
 
 def _broker_qty_for(positions: list[Any], symbol: str) -> int | None:

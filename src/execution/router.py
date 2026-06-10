@@ -1232,24 +1232,39 @@ class OrderRouter:
 
     @staticmethod
     def _extract_fill(trade: Trade) -> tuple[int, float, str]:
-        """Return ``(qty, avg_price, iso_time)`` from the last fill on the trade.
+        """Return ``(total_filled_qty, vwap_price, iso_time)`` AGGREGATED across
+        ALL executions on the trade.
 
-        Falls back to ``orderStatus`` aggregates and wall-clock when the
-        ``fills`` list is empty (some IB simulators omit it).
+        A multi-contract order can fill in several partial executions, so reading
+        only the LAST execution under-counts the quantity: the 2026-06-10 N=2 bug
+        was a 2-lot entry that filled as two 1-lot executions and recorded
+        ``entry_qty=1`` (``fills[-1].execution.shares``), which the reconciler then
+        read as broker_net=2 vs intended_net=1 and self-flattened a real contract
+        (§0.5.207 / PR-3). We now SUM ``shares`` across every execution and take the
+        share-weighted average price, so the recorded intent equals the true filled
+        quantity. Falls back to ``orderStatus`` aggregates (already cumulative) then
+        wall-clock when the ``fills`` list is empty (some IB simulators omit it).
         """
         fills = getattr(trade, "fills", None) or []
-        if fills:
-            last = fills[-1]
-            execution = getattr(last, "execution", None)
-            if execution is not None:
-                qty = int(getattr(execution, "shares", 0) or 0)
-                price = float(
-                    getattr(execution, "avgPrice", None) or getattr(execution, "price", 0.0)
-                )
-                t = getattr(execution, "time", None)
-                iso = t.isoformat() if hasattr(t, "isoformat") else datetime.now(UTC).isoformat()
-                if qty and price:
-                    return qty, price, iso
+        total_qty = 0
+        notional = 0.0
+        last_iso: str | None = None
+        for fl in fills:
+            execution = getattr(fl, "execution", None)
+            if execution is None:
+                continue
+            shares = int(getattr(execution, "shares", 0) or 0)
+            price = float(getattr(execution, "price", None) or getattr(execution, "avgPrice", 0.0))
+            if shares <= 0 or price <= 0:
+                continue
+            total_qty += shares
+            notional += shares * price
+            t = getattr(execution, "time", None)
+            if hasattr(t, "isoformat"):
+                last_iso = t.isoformat()
+        if total_qty > 0:
+            vwap = notional / total_qty
+            return total_qty, vwap, last_iso or datetime.now(UTC).isoformat()
         status = getattr(trade, "orderStatus", None)
         qty = int(getattr(status, "filled", 0) or 0) if status else 0
         price = float(getattr(status, "avgFillPrice", 0.0) or 0.0) if status else 0.0
