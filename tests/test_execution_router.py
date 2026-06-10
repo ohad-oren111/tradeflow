@@ -101,6 +101,7 @@ def _make_trade_with_fill(order_id: int, qty: int, price: float) -> MagicMock:
     fill = MagicMock(name="Fill")
     fill.execution = MagicMock()
     fill.execution.shares = qty
+    fill.execution.price = price  # per-fill price (real Execution carries this)
     fill.execution.avgPrice = price
     fill.execution.time = datetime(2026, 5, 21, 15, 0, tzinfo=UTC)
     trade.fills = [fill]
@@ -1328,3 +1329,74 @@ async def test_ensure_protective_stop_returns_live_placed_id_for_caller_to_cache
     )
 
     assert stop_id == placed_trade.order.orderId == 207
+
+
+# ----------------- PR-3: _extract_fill aggregates ALL partial executions -------
+# The 2026-06-10 N=2 bug: a 2-lot entry that filled as two 1-lot executions
+# recorded entry_qty=1 (only the LAST execution was read), which the reconciler
+# then saw as broker_net=2 vs intended_net=1 and self-flattened a real contract.
+
+
+def _exec_fill(shares: int, price: float, *, when=None):
+    """A clean (non-MagicMock) fill carrying one Execution, to avoid auto-attrs."""
+    from types import SimpleNamespace
+
+    t = when or datetime(2026, 6, 10, 0, 0, tzinfo=UTC)
+    return SimpleNamespace(execution=SimpleNamespace(shares=shares, price=price, time=t))
+
+
+def test_extract_fill_sums_two_partial_executions():
+    # 2-lot order filled as two 1-lot executions @ different prices → qty=2, VWAP.
+    from types import SimpleNamespace
+
+    trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=193),
+        fills=[
+            _exec_fill(1, 29096.0, when=datetime(2026, 6, 10, 0, 0, 1, tzinfo=UTC)),
+            _exec_fill(1, 29096.5, when=datetime(2026, 6, 10, 0, 0, 2, tzinfo=UTC)),
+        ],
+    )
+    qty, price, iso = OrderRouter._extract_fill(trade)
+    assert qty == 2  # not 1 — the whole fill is counted
+    assert price == pytest.approx((29096.0 + 29096.5) / 2, abs=1e-6)  # share-weighted
+    assert iso == datetime(2026, 6, 10, 0, 0, 2, tzinfo=UTC).isoformat()  # last execution
+
+
+def test_extract_fill_single_execution_unchanged():
+    # Regression: a single 2-lot execution still reads qty=2 at its price.
+    from types import SimpleNamespace
+
+    trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=200),
+        fills=[_exec_fill(2, 17500.5)],
+    )
+    qty, price, _iso = OrderRouter._extract_fill(trade)
+    assert qty == 2
+    assert price == pytest.approx(17500.5, abs=1e-6)
+
+
+def test_extract_fill_weighted_when_unequal_shares():
+    # 3 lots = 2@100 + 1@130 → VWAP 110, qty 3 (share-weighted, not simple mean 115).
+    from types import SimpleNamespace
+
+    trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=201),
+        fills=[_exec_fill(2, 100.0), _exec_fill(1, 130.0)],
+    )
+    qty, price, _iso = OrderRouter._extract_fill(trade)
+    assert qty == 3
+    assert price == pytest.approx(110.0, abs=1e-6)
+
+
+def test_extract_fill_falls_back_to_orderstatus_when_no_fills():
+    # No fills (some sims omit them) → orderStatus aggregates (already cumulative).
+    from types import SimpleNamespace
+
+    trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=202),
+        fills=[],
+        orderStatus=SimpleNamespace(filled=2, avgFillPrice=29100.0),
+    )
+    qty, price, _iso = OrderRouter._extract_fill(trade)
+    assert qty == 2
+    assert price == pytest.approx(29100.0, abs=1e-6)
