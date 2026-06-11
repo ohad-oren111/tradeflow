@@ -148,12 +148,89 @@ Daily log-return correlation, common window **2024-05-02 .. 2026-06-11 (n=537)**
 
 ---
 
+## STAGE 2 — STRATEGY  ·  Session 30 (2026-06-11)  ·  VERDICT: **NONE**
+
+GREENLIT after the Stage-1 review. One Carver EWMAC trend signal, vol-targeted, across the
+9-market basket; anti-overfit (search train only, holdout touched once, deflated over the
+cumulative campaign trials). Code: `tools/eval/phase17/` (`signal.py` `portfolio.py`
+`costs17.py` `gates17.py` `run_strategy.py`); reproduce with
+`python -m tools.eval.phase17.run_strategy --prior-trials 24`.
+
+### Pre-registered gates (committed in `gates17.py` BEFORE results)
+
+- **TRAIN** (~2024-05..2025-08): portfolio **PF ≥ 1.30** net; **profitable each** train year.
+- **HOLDOUT** (~2025-09..2026-06, touched ONCE): **PF ≥ 1.30** net; profitable each holdout
+  year; **PF ≥ 0.75 × train PF** (degradation cap).
+- **DEFLATION** (cumulative trials): net **per-day Sharpe survives the haircut**
+  (SR_hat > SR0 = E[max Sharpe | N trials], Bailey & López de Prado); DSR + Bonferroni reported.
+
+### Method (Carver EWMAC, verbatim — *Systematic Trading* ch.7/App.B, to-verify)
+
+- Signal on the **back-adjusted Panama series** (not the raw front): raw = EWMA(fast) −
+  EWMA(slow); **price vol = EWMA stdev of daily price changes** (span 32, in Carver's 25–36d
+  band — NOT a simple MA); forecast = scalar × raw/price_vol with the scalar fit on TRAIN so
+  mean|forecast| ≈ 10, **capped ±20**.
+- Three **well-separated** speeds only (adjacent are ~0.9 corr, not independent): **16/64,
+  32/128, 64/256**.
+- **Vol-targeted sizing**: position = forecast/10 × (vol_target / instrument $ vol) × bucket
+  weight × IDM. **Risk-parity by bucket** — each of the 6 buckets carries one risk unit, so
+  the **3 FX micros together carry ONE bucket** (1/18 each) and the 2 metals one (1/12 each):
+  the operator's "treat FX as ~1 bucket" with **no contract dropped**. IDM = 1/√(w'Cw),
+  capped 2.5, fit on train. **PF/Sharpe are invariant to vol_target & IDM** (gross and
+  turnover-cost both scale linearly) — the verdict rests on the signal, weights, correlations
+  and the cost/vol friction ratio, not account size.
+- **10Y sign**: priced in YIELD, so the signal/vol/P&L are built on the **negated proxy
+  `price = -yield`** — a falling-yield (rising-bond) trend → positive forecast → long bond.
+  Proven both ways on the champion: most-long-bond date 2025-11-26 (pos +0.955, trailing
+  yield −0.386%); most-short-bond date 2026-06-10 (pos −0.724, trailing yield +0.127%).
+- **MCL vol** is close-to-close only (sidesteps the bad near-expiry intraday H/L).
+- **Costs** (`to-verify` per market): conservative all-in $0.52/side micro commission
+  ($2.50/side MBT) + 1-tick slippage on close-to-close turnover. 0/1/2-tick sensitivity run.
+
+### Result
+
+Common window **2024-05-01..2026-06-11 = 538 bars** (TRAIN 342 / HOLDOUT 196). All three
+speeds are **net-negative on TRAIN** and fail the gate at pass 1:
+
+| speed | train net | train PF | train Sharpe | each-year |
+|-------|----------:|---------:|-------------:|-----------|
+| 16/64  | −$1,601 | 0.891 | −0.67 | −/− |
+| 32/128 | −$1,119 | 0.920 | −0.49 | +/− |
+| **64/256** (champ) | **−$247** | **0.978** | **−0.12** | +/− |
+
+Champion 64/256 holdout (touched once): PF **1.061**, Sharpe 0.36, net +$490, but **2026 is
+negative** and PF is far under 1.30. **Deflation KILLS it**: train SR/day −0.0076 < SR0
+**0.0360** (E[max] over **27 naive** cumulative trials; effective 25.25 at empirical EWMAC
+ρ=0.70) → DSR 0.210, Bonferroni p 1.0.
+
+**Per-market (champion):** only **MGC/gold clears** (PF 1.329, Sharpe 1.49, +$1,753). MCL is
+the worst drag (PF 0.782, Sharpe −1.10 — choppy crude), the FX cluster whipsaws net-negative,
+10Y −$234. Cost-**insensitive** (train PF 0.980→0.976 across 0→2 ticks) — costs are not what
+sank it; the **trend edge simply isn't there** on this basket over this single ~25-month
+regime. Mean |pairwise corr| on the traded window = **0.247** (basket IS genuinely
+diversified — the thesis precondition held; the breadth just had nothing to diversify).
+
+### Honest read
+
+This is **DIRECTIONAL evidence over one ~25-month regime with a low trade count**, not a
+decades-validated edge — and it points the same way as Phase-15/16: **NONE**. Only one of
+nine markets (gold) trended cleanly enough for a slow EWMAC; diversification cannot
+manufacture an edge that the constituents don't carry. **Not tuned to force a pass.** The
+breadth thesis is **not refuted in general** (different/longer regime, more markets, or a
+faster overlay could differ) — but on this basket and window it does not clear the bar.
+
+---
+
 ## Campaign trial ledger (for cumulative deflation, continued from Phase-16)
 
 | Phase | Stage | Trials this stage | Cumulative trials | Verdict |
 |------:|-------|------------------:|------------------:|---------|
 | 16 B1 | strategy | 22 | 22 | NONE |
 | 17 S1 | data     | 0  | 22 | DATA PASS (no strategy run) |
+| 17 S2 | strategy | 3 (naive; 1.43 eff @ρ0.55) | 27 naive / ~25.4 eff | NONE |
 
-Stage 2 must pass `--prior-trials 22` (or higher if Phase-16 Batch-2 runs first) into the
-deflation so a multi-market win clears the bar implied by every prior trial in the campaign.
+Stage-2 used `--prior-trials 24` (Phase-16 = 22 + Phase-15 = 2 dormant candidates), the
+conservative base. Cumulative **naive 27** (deflated against this, the higher count);
+**effective ~25.4** reported as a cross-check (the 3 EWMAC speeds are ~0.55–0.70 correlated,
+so they are *fewer* than 3 independent trials — collapsing them would *understate* the
+correction, hence we deflate against naive). A future batch should pass `--prior-trials 27`.
