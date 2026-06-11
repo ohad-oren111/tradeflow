@@ -15,7 +15,11 @@ from config.instruments import MNQ
 from config.risk_params import RISK
 from src.clients.ib_client import IBClient
 from src.execution.dirty_set import DirtySet
-from src.execution.router import OrderRouter, ensure_protective_stop
+from src.execution.router import (
+    OrderRouter,
+    cancel_prior_protective_stops,
+    ensure_protective_stop,
+)
 from src.state_machine import (
     Direction,
     InvariantViolationError,
@@ -1400,3 +1404,161 @@ def test_extract_fill_falls_back_to_orderstatus_when_no_fills():
     qty, price, _iso = OrderRouter._extract_fill(trade)
     assert qty == 2
     assert price == pytest.approx(29100.0, abs=1e-6)
+
+
+# ----------------- PR-143: cancel-before-arm (one protective stop / lifecycle) ---
+# The 2026-06-10 N=2 orphan: a 2-lot position carried TWO resting protective stops
+# (one armed by the router parent-fill, one re-armed by the reconciler) because the
+# lifecycle tracks a single stop_order_id. The untracked sibling survived the close
+# and opened a naked short. Cancel-before-arm guarantees at most one resting stop
+# per active lifecycle by cancelling the prior/untracked stop(s) BEFORE placing a
+# new one — N=2-safe via the protected sibling-id set.
+
+
+def _make_stop_trade(
+    order_id: int, *, action: str = "SELL", order_type: str = "STP", symbol: str = "MNQM6"
+) -> Any:
+    """A resting protective-stop Trade (broker-truth open order) for the sweep.
+
+    SimpleNamespace, not MagicMock — a MagicMock auto-creates truthy attrs, which
+    would make orderType/action falsely match the STP/SELL filter (guardrail: no
+    fictional-schema / auto-attr mocks)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        order=SimpleNamespace(orderId=order_id, orderType=order_type, action=action),
+        contract=SimpleNamespace(localSymbol=symbol, symbol="MNQ"),
+    )
+
+
+async def test_rearm_cancels_prior_tracked_stop_before_placing_new():
+    # TOCTOU re-arm: the lifecycle still tracks stop 194 but existing_stop_is_live is
+    # False (a stale/dead id on a force-fill re-arm). Cancel-before-arm cancels 194,
+    # then places exactly one new stop — never two live across the re-arm.
+    ib = _make_mock_ib()
+    ib.get_open_trades = AsyncMock(return_value=[_make_stop_trade(194)])
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+    ib.place_order = AsyncMock(return_value=_make_trade(195))
+    contract = _make_contract_with_exchange("CME")
+    lifecycle = _make_lifecycle(State.ACTIVE, stop_order_id=194)
+
+    new_id = await ensure_protective_stop(
+        ib,
+        contract,
+        lifecycle,
+        qty=2,
+        existing_stop_is_live=False,
+        component="ROUTER",
+        path="parent_fill",
+        sibling_stop_ids=set(),
+    )
+
+    cancelled = [c.args[0] for c in ib.cancel_order_by_id.await_args_list]
+    assert cancelled == [194]  # the prior tracked stop, cancelled first
+    ib.place_order.assert_awaited_once()  # exactly one new stop placed
+    assert new_id == 195
+
+
+async def test_rearm_cancels_untracked_sibling_stop():
+    # The 06-10 orphan: an untracked STP (194) rests for this position while the
+    # lifecycle tracks no stop. Cancel-before-arm sweeps it (unclaimed by any active
+    # lifecycle — sibling set empty) before placing the tracked stop.
+    ib = _make_mock_ib()
+    ib.get_open_trades = AsyncMock(return_value=[_make_stop_trade(194)])
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+    ib.place_order = AsyncMock(return_value=_make_trade(195))
+    contract = _make_contract_with_exchange("CME")
+    lifecycle = _make_lifecycle(State.ACTIVE, stop_order_id=None)
+
+    new_id = await ensure_protective_stop(
+        ib,
+        contract,
+        lifecycle,
+        qty=2,
+        existing_stop_is_live=False,
+        component="RECON",
+        path="recon_force_fill",
+        sibling_stop_ids=set(),
+    )
+
+    cancelled = [c.args[0] for c in ib.cancel_order_by_id.await_args_list]
+    assert cancelled == [194]  # untracked orphan swept before the new stop
+    assert new_id == 195
+
+
+async def test_n2_two_legs_each_one_stop_sibling_protected():
+    # N=2 same-symbol book: lifecycle A re-arms (its own orphan 194 rests) while
+    # lifecycle B's tracked stop (210) also rests. The sweep cancels A's orphan but
+    # PROTECTS B's tracked stop — each lifecycle keeps exactly one resting stop.
+    ib = _make_mock_ib()
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+    open_trades = [_make_stop_trade(194), _make_stop_trade(210)]
+
+    n = await cancel_prior_protective_stops(
+        ib,
+        symbol="MNQM6",
+        exit_action="SELL",
+        own_stop_id=None,
+        open_trades=open_trades,
+        sibling_stop_ids={210},
+        component="RECON",
+        path="recon_force_fill",
+    )
+
+    cancelled = [c.args[0] for c in ib.cancel_order_by_id.await_args_list]
+    assert cancelled == [194]  # A's orphan swept
+    assert 210 not in cancelled  # B's tracked sibling untouched
+    assert n == 1
+
+
+async def test_rearm_unknown_siblings_cancels_only_own_not_orphans():
+    # Conservative: when the sibling set can't be resolved (sibling_stop_ids=None,
+    # e.g. a DB error) cancel ONLY the lifecycle's own tracked stop — never an
+    # unclaimed order that might belong to a sibling. The #142 sweep is the backstop.
+    ib = _make_mock_ib()
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+    open_trades = [_make_stop_trade(194), _make_stop_trade(210)]  # 194 own, 210 unknown
+
+    n = await cancel_prior_protective_stops(
+        ib,
+        symbol="MNQM6",
+        exit_action="SELL",
+        own_stop_id=194,
+        open_trades=open_trades,
+        sibling_stop_ids=None,
+        component="RECON",
+        path="recon_force_fill",
+    )
+
+    cancelled = [c.args[0] for c in ib.cancel_order_by_id.await_args_list]
+    assert cancelled == [194]  # own only; 210 left alone on incomplete info
+    assert n == 1
+
+
+async def test_sweep_ignores_other_symbol_target_and_opposite_side_orders():
+    # Scope guard: the sweep cancels ONLY same-symbol, same-side protective STOPs.
+    # A different symbol, the LMT take-profit, and an opposite-side stop are left
+    # untouched — only the matching MNQM6 SELL STP orphan is cancelled.
+    ib = _make_mock_ib()
+    ib.cancel_order_by_id = AsyncMock(return_value=True)
+    open_trades = [
+        _make_stop_trade(300, symbol="MESM6"),  # different symbol
+        _make_stop_trade(301, order_type="LMT"),  # take-profit, not a STOP
+        _make_stop_trade(302, action="BUY"),  # opposite side (a short's stop)
+        _make_stop_trade(303),  # MNQM6 SELL STP orphan — the only target
+    ]
+
+    n = await cancel_prior_protective_stops(
+        ib,
+        symbol="MNQM6",
+        exit_action="SELL",
+        own_stop_id=None,
+        open_trades=open_trades,
+        sibling_stop_ids=set(),
+        component="ROUTER",
+        path="parent_fill",
+    )
+
+    cancelled = [c.args[0] for c in ib.cancel_order_by_id.await_args_list]
+    assert cancelled == [303]  # only the matching same-symbol same-side STP orphan
+    assert n == 1
