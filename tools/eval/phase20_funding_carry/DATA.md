@@ -136,3 +136,105 @@ historical-data files over HTTPS and writes CSVs. The live bot was untouched thr
 - Hit a units trap: Binance moved kline timestamps to microseconds in 2025, so recent
   bars parsed as year ~56000 until I normalised ms-vs-µs (`_to_ms`). Funding `calc_time`
   stayed ms; klines did not — the kind of source drift §0.5.97 exists to catch.
+
+---
+
+# Phase-20b — funding-carry honest eval (the model RAN)
+
+**Status: model RAN through the honest harness. Verdict: NONE.** Research-only / offline
+(`run.py`). No broker, no IB, no DB, no secrets, no `src/**`/`config/**`, halt untouched,
+bot left as the operator had it (running on `6f83c9c`). A PASS would have wired nothing
+live; a NONE wires nothing either. Reproduce:
+
+```
+python -m tools.eval.phase20_funding_carry.run --prior-trials 40
+```
+
+## Verdict: NONE
+
+Funding carry got the **same bar that returned NONE for every Phase-15..19 candidate** —
+no special pleading. The conviction pick fails the same way: its apparent train edge is
+**entirely tail compensation**, and it does not survive out-of-sample.
+
+The champion was selected pre-holdout as the **max train(spike-included) PF** among the
+tradeable pooled scopes (`MAJORS`/`ALL`) × rules `{B,C}` with n≥200 → **`C:MAJORS`**
+(rule C cost-aware threshold on BTC+ETH, train PF **1.417**, n=265). On the
+**spike-stripped holdout** — the verdict-binding surface — it collapses to **PF 0.000**.
+
+### Matrix (train/holdout PF, spike-INCLUDED vs spike-STRIPPED, side by side)
+
+| variant | tr n | tr PF incl | tr PF **strip** | ho n | ho PF incl | ho PF **strip** |
+|---|---|---|---|---|---|---|
+| A:MAJORS (always-on) | 2 | inf | inf | 2 | inf | inf |
+| A:ALL (always-on) | 8 | 29.93 | inf | 8 | 22.33 | 81.92 |
+| B:MAJORS (pos-funding) | 550 | 0.88 | 0.07 | 394 | 0.248 | 0.108 |
+| B:ALL (pos-funding) | 2120 | 0.629 | 0.056 | 2024 | 0.112 | 0.035 |
+| **C:MAJORS (champion)** | **265** | **1.417** | **0.002** | **70** | **0.450** | **0.000** |
+| C:ALL (cost-aware) | 1091 | 0.87 | 0.003 | 302 | 0.273 | 0.004 |
+
+Per-coin rule C (reported, never carries the verdict): the only train PF ≥ 1.30 cells are
+ETH 1.58, XRP 1.255-ish, BTC 1.235 — **every one strips to ≈0.00** and every holdout is
+< 0.51. Rule A (always-on) PFs are degenerate (n=1–8, often inf/0) — diagnostic only,
+excluded from champion selection by the n≥200 floor.
+
+**Two readings, both fatal:**
+1. **Spike-strip guts it.** Stripping the top funding-decile + 5 named deleveraging
+   windows (~11.3% of intervals) drops train PF 1.417 → **0.002**. The "edge" lived almost
+   entirely in the extreme-funding intervals (squeezes / delevers) — tail comp, not carry.
+2. **Churn loses to fees even spike-included.** Rule B (enter on any +funding, exit on
+   flip) churns 8h-fast: episodes are too short to clear the 0.28%-of-notional 4-fill
+   round trip, so PF is 0.6–0.9 *before* stripping. The cost-aware rule C only delays the
+   bleed. This is exactly the §0.5.97 cost tension the brief flagged.
+
+### Kill tests (pre-registered)
+
+| # | test | result | numbers |
+|---|---|---|---|
+| 1 | **Spike-strip (THE test)** | **FAIL** | champion holdout PF incl 0.45 → **strip 0.00** (< 1.30) |
+| 2 | Majors vs alts | **FAIL** | majors strip ho PF 0.00; alts strip ho PF 0.005 — neither durable |
+| 3 | Cost-cliff | broken at floor | stripped-holdout PF < 1.30 already at **0.5× fee** (the lowest k tested); no fee level clears |
+| 4 | Recency (2024→2026) | **FAIL** | post-ETF stripped holdout PF 0.00 (2024 net −$2,613) |
+| 5 | Sign honesty | **PASS** | always-on accrues **10,665** negative (paid) funding intervals signed; champion C exits before flips (2) — no positive-only cherry-pick |
+
+### Integrity (Task C — all hold)
+- **Trade unit = episode, not interval:** 12,389 episodes vs 53,978 funding intervals
+  (ratio 0.230) — n is NOT interval-inflated.
+- **Signed funding:** 10,665 negative intervals accrued inside held (always-on) episodes.
+- **Costs applied:** champion gross train $9,368 ≠ net $1,948 (4-fill round-trip charged).
+- **Holdout sealed:** champion chosen on train PF only; holdout touched once.
+- **Spike-strip wired on the same machinery** (single funding-masking code path).
+
+### Cost model (verified, §0.5.97)
+Binance fee schedule: USDⓈ-M perp taker **0.04%**, spot taker **0.10%** standard
+(0.075% with BNB, lower at VIP). Conservative blended retail **0.05%/fill** used as base
+→ **0.20% round-trip** (4 taker fills: buy spot + sell perp at entry; sell spot + buy perp
+at exit), plus per-fill slippage 2 bp majors / 5 bp alts. Cost-cliff scales this and
+confirms the verdict is not fee-knife-edge (broken even at half cost). Notional $10k/leg
+(PF/Sharpe are scale-invariant).
+
+### Deflation
+`--prior-trials 40` (cumulative after Phase-19) + **30** in-eval variants (3 rules × 10
+scopes) → **n_trials = 70**. Champion DSR **0.000** (train each-year fails: 2023 negative;
+the deflated bar is moot since the model fails the gate outright). **Cumulative
+cross-hypothesis trial count after this eval: 70** (next phase: `--prior-trials 70`).
+
+### Out-of-scope (Task E — documented, NOT solved)
+New ideas surfaced but NOT run (would need a future phase + its own pre-registration):
+funding-carry on a *longer* funding interval venue, a momentum/curve overlay on funding,
+or a delta-neutral basis (not funding) trade. None justified after this NONE.
+
+## Offline / scope guarantee (Phase-20b)
+
+`run.py` does NOT connect to IB/the broker/a DB, read secrets, or modify any
+`src/**`/`config/**`/compose/image/halt — even though the verdict is NONE. It reads the
+phase20 CSVs and computes offline. The live bot was untouched throughout. Task-D grep of
+`run.py` for `connect(` / `docker` / `supabase` / `ib_*` / `secret` / `os.environ` /
+`requests` / `socket` returns ZERO functional hits (one docstring negation).
+
+## What I got wrong (Phase-20b)
+
+- Nothing material. One genuine modelling call to flag for scrutiny: the champion (rule C)
+  exits on a low-funding flip, so it almost never holds through a *negative* interval (2
+  total) — making the per-champion sign-honesty count look thin. I moved the sign-honesty
+  proof onto the always-on rule (10,665 negatives accrued), which is the honest
+  demonstration that paid funding is in the ledger; the champion's design simply avoids it.
