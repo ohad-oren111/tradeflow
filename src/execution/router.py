@@ -515,6 +515,35 @@ class OrderRouter:
             elif order_id in self._manual_orders:
                 await self._handle_exit_fill(lc, trade, ExitReason.MANUAL)
             elif order_id == lc.entry_order_id:
+                # §0.5.227 full-fill gate — a multi-lot MKT entry fills as several
+                # partial executions and execDetailsEvent fires ONCE PER execution.
+                # Arm only on the FINAL (full) fill; ignore (just log) every partial,
+                # so the 2026-06-11 race can't recur (two 1-lot partials → two
+                # concurrent arms → unordered DB PATCH leaves entry_qty=1 → a real
+                # contract is flattened as "foreign"; HANDOFF_v27 §5).
+                is_full, filled, intended = self._entry_fill_progress(trade)
+                intended_str = str(intended) if intended is not None else "?"
+                if not is_full:
+                    LOGGER.info(
+                        "[EXEC] %s: entry_partial_fill_skipped — filled=%s/%s lifecycle=%s "
+                        "order=%s (full-fill gate; arm deferred to full fill / reconciler "
+                        "force-fill backstop) — §0.5.227",
+                        lc.symbol,
+                        filled,
+                        intended_str,
+                        lc.lifecycle_id,
+                        order_id,
+                    )
+                    return
+                LOGGER.info(
+                    "[EXEC] %s: entry_full_fill — filled=%s/%s lifecycle=%s order=%s "
+                    "(arming once)",
+                    lc.symbol,
+                    filled,
+                    intended_str,
+                    lc.lifecycle_id,
+                    order_id,
+                )
                 await self._handle_parent_fill(lc, trade)
             elif order_id == lc.target_order_id:
                 await self._handle_exit_fill(lc, trade, ExitReason.TARGET)
@@ -544,10 +573,28 @@ class OrderRouter:
             )
             return
 
+        # §0.5.227 single-shot guard — the entry arm path must fire EXACTLY ONCE.
+        # on_fill's full-fill gate already drops partial executions; this ALSO drops a
+        # duplicate FULL-fill callback (an IB re-fire) BEFORE any protective-stop
+        # placement or DB write, so no second stop is placed and no second PATCH races
+        # the first. Only an ENTERING lifecycle is armed here — a recovered position is
+        # registered ACTIVE (and never routed through on_fill's entry branch), so this
+        # is the safe single-shot gate that makes the DB position write non-raceable.
+        if State(lc.state) is not State.ENTERING:
+            LOGGER.info(
+                "[EXEC] %s: parent_fill_skip_not_entering — state=%s lifecycle=%s "
+                "(already armed; idempotent no-op)",
+                lc.symbol,
+                lc.state,
+                lc.lifecycle_id,
+            )
+            return
+
         # Recovery guard: trailing-mode high-water seeding fires ONLY on a genuine
         # new entry fill (lifecycle was ENTERING). A recovered/already-bracketed
         # position is registered as ACTIVE (and seeded in register_recovered) and
-        # never routed here, so it keeps its existing stop untouched.
+        # never routed here, so it keeps its existing stop untouched. (Always True
+        # past the single-shot guard above; kept for the seeding call-sites' clarity.)
         was_entering = State(lc.state) is State.ENTERING
 
         fill_qty, fill_price, fill_time = self._extract_fill(trade)
@@ -1237,6 +1284,68 @@ class OrderRouter:
         if order is None:
             return 0
         return int(getattr(order, "orderId", 0) or 0)
+
+    @staticmethod
+    def _entry_fill_progress(trade: Trade) -> tuple[bool, int, int | None]:
+        """Return ``(is_full_fill, filled_so_far, intended)`` for an entry parent order.
+
+        A multi-lot MKT entry fills as several partial executions and ib_async fires
+        ``execDetailsEvent`` ONCE PER execution, so the arm path must act only on the
+        FINAL (full-fill) callback — else the 2026-06-11 race recurs (two 1-lot
+        partials → two concurrent arms → unordered DB PATCH leaves ``entry_qty=1`` and
+        a real contract is flattened as "foreign"; §0.5.227 / HANDOFF_v27 §5).
+
+        Full-fill detection is robust to execDetails/orderStatus event ordering:
+
+        * ``intended`` = the order's ``totalQuantity`` (the size we submitted).
+        * ``filled_so_far`` = cumulative ``shares`` across every execution ib_async has
+          attached to the Trade (``orderStatus.filled`` fallback when a sim omits the
+          ``fills`` list).
+        * Primary (``intended`` known): full ⇔ ``filled_so_far >= intended``. Independent
+          of ``orderStatus.remaining``, which read a stale ``0`` between the two partials
+          in the v27 race — the root cause of acting twice.
+        * Fallbacks (``intended`` unknown): ``orderStatus.remaining <= 0``, then
+          ``status == 'Filled'``; finally FAIL OPEN so a single simulated fill with no
+          qty metadata still arms (minimal unit fixtures / sims). A real broker order
+          always carries ``totalQuantity``, so production always takes the primary path.
+        """
+
+        def _as_number(value: Any) -> float | None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        order = getattr(trade, "order", None)
+        intended_f = _as_number(getattr(order, "totalQuantity", None))
+        intended = int(intended_f) if intended_f is not None else None
+
+        filled = 0
+        for fl in getattr(trade, "fills", None) or []:
+            execution = getattr(fl, "execution", None)
+            if execution is None:
+                continue
+            shares = _as_number(getattr(execution, "shares", None))
+            if shares is not None and shares > 0:
+                filled += int(shares)
+        status_obj = getattr(trade, "orderStatus", None)
+        if filled == 0 and status_obj is not None:
+            status_filled = _as_number(getattr(status_obj, "filled", None))
+            if status_filled is not None and status_filled > 0:
+                filled = int(status_filled)
+        remaining = (
+            _as_number(getattr(status_obj, "remaining", None)) if status_obj is not None else None
+        )
+        status_val = getattr(status_obj, "status", None) if status_obj is not None else None
+        status = status_val if isinstance(status_val, str) else ""
+
+        if intended is not None and intended > 0:
+            return filled >= intended, filled, intended
+        if remaining is not None:
+            return remaining <= 0, filled, intended
+        if status == "Filled":
+            return True, filled, intended
+        return True, filled, intended  # no reliable qty signal → fail open
 
     @staticmethod
     def _extract_fill(trade: Trade) -> tuple[int, float, str]:
