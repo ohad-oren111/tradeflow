@@ -230,7 +230,13 @@ class Reconciler:
         # Position present (any qty) → transition to ACTIVE with broker-sourced fields.
         if has_position:
             avg_cost = _broker_avg_cost_for(positions, lifecycle.symbol)
-            qty = abs(broker_qty) if broker_qty is not None else lifecycle.entry_qty or 0
+            # PR #158 — size from THIS lifecycle's own fill, NEVER the account net
+            # (``broker_qty``). IBKR reports one NET position per contract, so with
+            # ≥2 concurrent same-symbol lifecycles the force-filling leg would claim
+            # the whole book (the 2026-06-12 naked-orphan: net=4 written as one
+            # lifecycle's entry_qty → oversold at EOD → SHORT 2). ``broker_qty`` stays
+            # for presence/direction only (``has_position`` above).
+            qty = await self._force_fill_qty(lifecycle, broker_qty=broker_qty)
             # avgCost is NOTIONAL for futures (price × multiplier). Store the
             # per-contract entry price, mirroring the router fill-price path —
             # otherwise pnl is computed off a 2× price (the b39a4def bug:
@@ -313,6 +319,64 @@ class Reconciler:
         )
         self._log_action(lifecycle, ReconcileAction.ENTERING_TO_CLOSED)
         return ReconcileAction.ENTERING_TO_CLOSED
+
+    async def _force_fill_qty(self, lifecycle: Lifecycle, *, broker_qty: int | None) -> int:
+        """Per-lifecycle fill size for the force-fill path (PR #158).
+
+        The protective-stop size + recorded ``entry_qty`` for a reconciler
+        force-fill MUST equal THIS lifecycle's own filled quantity, never the
+        account NET (``broker_qty``). IBKR reports one NET position per contract,
+        so with ≥2 concurrent same-symbol lifecycles the net spans every open
+        lifecycle — sizing one leg off it claims the whole book (2026-06-12:
+        net=4 stamped as a single lifecycle's entry_qty → oversold at EOD →
+        naked SHORT 2). Same family as #141/#151, now on the force-fill leg.
+
+        Source order:
+          1. this entry order's summed executions (cumQty — robust to partials);
+          2. fallback ``min(|net|, intended)`` — never attribute more than this
+             lifecycle intended. ``entry_qty`` is None during ENTERING (it is
+             stamped only on the fill), so the intended size is the configured
+             per-trade qty.
+
+        ``broker_qty`` is used here ONLY as the fallback cap + the audit log — it
+        never sizes the stop directly.
+        """
+        net = abs(broker_qty) if broker_qty is not None else None
+        # entry_qty is None during ENTERING (stamped only on the fill) → fall back to
+        # the configured per-trade size as the intended cap.
+        intended = (
+            int(lifecycle.entry_qty) if lifecycle.entry_qty else int(RISK.contracts_per_trade)
+        )
+        order_qty: int | None = None
+        if lifecycle.entry_order_id is not None:
+            try:
+                fills = await self._ib.get_fills()
+                order_qty = _filled_qty_for_order(fills, lifecycle.entry_order_id)
+            except Exception as exc:  # noqa: BLE001 — fill lookup is best-effort
+                LOGGER.warning(
+                    "[RECON] %s: force_fill_qty_lookup_error — id=%s type=%s msg=%s "
+                    "(falling back to min(net,intended))",
+                    lifecycle.symbol,
+                    lifecycle.lifecycle_id,
+                    type(exc).__name__,
+                    exc,
+                )
+        if order_qty:
+            qty, source = order_qty, "order_cumqty"
+        elif net is not None:
+            qty, source = min(net, intended), "min(net,intended)"
+        else:
+            qty, source = intended, "intended"
+        LOGGER.info(
+            "[RECON] %s: force_fill_qty — lifecycle=%s qty=%s source=%s "
+            "(net=%s not used for sizing)",
+            lifecycle.symbol,
+            lifecycle.lifecycle_id,
+            qty,
+            source,
+            net,
+        )
+        return qty
 
     async def _ensure_protective_stop_on_force_fill(
         self,
@@ -1465,6 +1529,29 @@ def _fill_price_for_order(fills: list[Any], order_id: int) -> float | None:
             total_notional += shares * price
     if total_qty > 0:
         return total_notional / total_qty
+    return None
+
+
+def _filled_qty_for_order(fills: list[Any], order_id: int) -> int | None:
+    """Total filled quantity (summed execution shares) for ``order_id`` (PR #158).
+
+    This single entry order's cumQty — robust to a multi-lot entry that fills as
+    several partial executions. Returns ``None`` when no execution matches (the
+    caller then uses its ``min(net, intended)`` fallback). Mirror of
+    :func:`_fill_price_for_order`'s per-order execution scan.
+    """
+    total = 0.0
+    for fill in fills:
+        execution = getattr(fill, "execution", None)
+        if execution is None:
+            continue
+        if getattr(execution, "orderId", None) != order_id:
+            continue
+        shares = float(getattr(execution, "shares", 0.0) or 0.0)
+        if shares:
+            total += shares
+    if total > 0:
+        return int(round(total))
     return None
 
 
