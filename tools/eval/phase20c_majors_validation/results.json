@@ -1,0 +1,1163 @@
+{
+  "phase": "20c-majors-validation",
+  "verdict": "NONE-confirmed",
+  "research_only": true,
+  "venue": "Binance USD\u24c8-M (data.binance.vision); funding interval 8h",
+  "scope": {
+    "coins": [
+      "BTC",
+      "ETH"
+    ],
+    "per_coin": true,
+    "pooling": false,
+    "alts": false
+  },
+  "split": {
+    "train": [
+      "2020-01-01",
+      "2023-12-31"
+    ],
+    "holdout": [
+      "2024-01-01",
+      "2026-05-31"
+    ],
+    "episodes_built_within_period": true
+  },
+  "variant_set": {
+    "rules": {
+      "A": "always-on (diagnostic; net-carry curve, not PF)",
+      "B": "positive-funding (hold while funding>0, exit on flip)",
+      "C": "cost-threshold (hold while funding > cost-breakeven rate)",
+      "D": "min-hold-21 (enter funding>0, hold >=21 intervals, exit only on a sustained flip = >=2 consec non-positive)"
+    },
+    "treatments": {
+      "incl": "spike-included (no strip)",
+      "delever": "delever-only \u2014 5 named crisis windows stripped (surgical)",
+      "topdecile": "top-decile |funding| OR delever (20b's blanket strip)"
+    },
+    "min_hold_intervals": 21,
+    "sustained_flip_intervals": 2,
+    "no_hold_length_sweep": true
+  },
+  "costs": {
+    "taker_fee_per_fill": 0.0005,
+    "fills_per_round_trip": 4,
+    "slip_per_fill_major": 0.0002,
+    "notional_usd_per_leg": 10000.0,
+    "imported_from": "tools.eval.phase20_funding_carry.run (\u00a70.5.97; not re-derived)"
+  },
+  "deflator": {
+    "prior_trials": 70,
+    "in_eval_variants": 8,
+    "n_trials": 78,
+    "sr_variance_pool": 0.01233,
+    "sr0_expected_max": 0.27115
+  },
+  "matrix": {
+    "BTC:A": {
+      "incl": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 5892.09,
+          "net_usd": 5892.09,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 5892.09
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1736.06,
+          "net_usd": 1736.06,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1736.06
+          }
+        }
+      },
+      "delever": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 6029.81,
+          "net_usd": 6029.81,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 6029.81
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1732.33,
+          "net_usd": 1732.33,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1732.33
+          }
+        }
+      },
+      "topdecile": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 2358.53,
+          "net_usd": 2358.53,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 2358.53
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1345.31,
+          "net_usd": 1345.31,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1345.31
+          }
+        }
+      }
+    },
+    "BTC:B": {
+      "incl": {
+        "train": {
+          "n": 281,
+          "pf": 0.769,
+          "exp_per_ct": -5.55,
+          "net_usd": -1560.78,
+          "win_rate": 0.0747,
+          "sr_per_trade": -0.03468,
+          "max_dd_usd": -4809.51,
+          "per_year": {
+            "2020": 572.05,
+            "2021": 2247.97,
+            "2022": -3226.2,
+            "2023": -1154.6
+          }
+        },
+        "holdout": {
+          "n": 190,
+          "pf": 0.24,
+          "exp_per_ct": -18.63,
+          "net_usd": -3539.69,
+          "win_rate": 0.0474,
+          "sr_per_trade": -0.35124,
+          "max_dd_usd": -4156.65,
+          "per_year": {
+            "2024": -140.59,
+            "2025": -1852.91,
+            "2026": -1546.19
+          }
+        }
+      },
+      "delever": {
+        "train": {
+          "n": 268,
+          "pf": 0.814,
+          "exp_per_ct": -4.43,
+          "net_usd": -1187.29,
+          "win_rate": 0.0784,
+          "sr_per_trade": -0.02698,
+          "max_dd_usd": -4461.17,
+          "per_year": {
+            "2020": 571.5,
+            "2021": 2368.95,
+            "2022": -2973.15,
+            "2023": -1154.6
+          }
+        },
+        "holdout": {
+          "n": 187,
+          "pf": 0.243,
+          "exp_per_ct": -18.52,
+          "net_usd": -3462.7,
+          "win_rate": 0.0481,
+          "sr_per_trade": -0.34647,
+          "max_dd_usd": -4079.66,
+          "per_year": {
+            "2024": -63.59,
+            "2025": -1852.91,
+            "2026": -1546.19
+          }
+        }
+      },
+      "topdecile": {
+        "train": {
+          "n": 386,
+          "pf": 0.065,
+          "exp_per_ct": -22.12,
+          "net_usd": -8539.26,
+          "win_rate": 0.0596,
+          "sr_per_trade": -1.52031,
+          "max_dd_usd": -8527.61,
+          "per_year": {
+            "2020": -1868.25,
+            "2021": -2236.9,
+            "2022": -2973.15,
+            "2023": -1460.96
+          }
+        },
+        "holdout": {
+          "n": 210,
+          "pf": 0.089,
+          "exp_per_ct": -21.76,
+          "net_usd": -4568.64,
+          "win_rate": 0.0524,
+          "sr_per_trade": -1.15756,
+          "max_dd_usd": -4697.94,
+          "per_year": {
+            "2024": -1169.54,
+            "2025": -1852.91,
+            "2026": -1546.19
+          }
+        }
+      }
+    },
+    "BTC:C": {
+      "incl": {
+        "train": {
+          "n": 125,
+          "pf": 1.235,
+          "exp_per_ct": 4.15,
+          "net_usd": 519.15,
+          "win_rate": 0.192,
+          "sr_per_trade": 0.04792,
+          "max_dd_usd": -938.26,
+          "per_year": {
+            "2020": -48.24,
+            "2021": 982.23,
+            "2023": -414.84
+          }
+        },
+        "holdout": {
+          "n": 35,
+          "pf": 0.397,
+          "exp_per_ct": -12.54,
+          "net_usd": -438.83,
+          "win_rate": 0.0857,
+          "sr_per_trade": -0.27915,
+          "max_dd_usd": -609.59,
+          "per_year": {
+            "2024": -438.83
+          }
+        }
+      },
+      "delever": {
+        "train": {
+          "n": 124,
+          "pf": 1.255,
+          "exp_per_ct": 4.47,
+          "net_usd": 554.06,
+          "win_rate": 0.1935,
+          "sr_per_trade": 0.0514,
+          "max_dd_usd": -902.29,
+          "per_year": {
+            "2020": -49.3,
+            "2021": 1018.2,
+            "2023": -414.84
+          }
+        },
+        "holdout": {
+          "n": 35,
+          "pf": 0.397,
+          "exp_per_ct": -12.54,
+          "net_usd": -438.83,
+          "win_rate": 0.0857,
+          "sr_per_trade": -0.27915,
+          "max_dd_usd": -609.59,
+          "per_year": {
+            "2024": -438.83
+          }
+        }
+      },
+      "topdecile": {
+        "train": {
+          "n": 135,
+          "pf": 0.006,
+          "exp_per_ct": -26.03,
+          "net_usd": -3513.64,
+          "win_rate": 0.0074,
+          "sr_per_trade": -5.01804,
+          "max_dd_usd": -3486.64,
+          "per_year": {
+            "2020": -1200.31,
+            "2021": -1860.06,
+            "2023": -453.27
+          }
+        },
+        "holdout": {
+          "n": 48,
+          "pf": 0.0,
+          "exp_per_ct": -25.65,
+          "net_usd": -1231.29,
+          "win_rate": 0.0,
+          "sr_per_trade": -9.48569,
+          "max_dd_usd": -1206.0,
+          "per_year": {
+            "2024": -1231.29
+          }
+        }
+      }
+    },
+    "BTC:D": {
+      "incl": {
+        "train": {
+          "n": 54,
+          "pf": 7.753,
+          "exp_per_ct": 86.81,
+          "net_usd": 4687.76,
+          "win_rate": 0.3704,
+          "sr_per_trade": 0.22569,
+          "max_dd_usd": -203.92,
+          "per_year": {
+            "2020": 1240.74,
+            "2021": 2740.06,
+            "2022": 323.26,
+            "2023": 383.7
+          }
+        },
+        "holdout": {
+          "n": 32,
+          "pf": 2.575,
+          "exp_per_ct": 27.84,
+          "net_usd": 890.99,
+          "win_rate": 0.3125,
+          "sr_per_trade": 0.19971,
+          "max_dd_usd": -307.87,
+          "per_year": {
+            "2024": 657.44,
+            "2025": 483.16,
+            "2026": -249.61
+          }
+        }
+      },
+      "delever": {
+        "train": {
+          "n": 52,
+          "pf": 8.613,
+          "exp_per_ct": 92.33,
+          "net_usd": 4801.11,
+          "win_rate": 0.3846,
+          "sr_per_trade": 0.23533,
+          "max_dd_usd": -162.71,
+          "per_year": {
+            "2020": 1281.19,
+            "2021": 2738.87,
+            "2022": 397.34,
+            "2023": 383.7
+          }
+        },
+        "holdout": {
+          "n": 31,
+          "pf": 2.688,
+          "exp_per_ct": 29.26,
+          "net_usd": 907.14,
+          "win_rate": 0.3226,
+          "sr_per_trade": 0.20813,
+          "max_dd_usd": -307.87,
+          "per_year": {
+            "2024": 681.74,
+            "2025": 475.01,
+            "2026": -249.61
+          }
+        }
+      },
+      "topdecile": {
+        "train": {
+          "n": 87,
+          "pf": 0.913,
+          "exp_per_ct": -1.03,
+          "net_usd": -89.88,
+          "win_rate": 0.2759,
+          "sr_per_trade": -0.03043,
+          "max_dd_usd": -397.58,
+          "per_year": {
+            "2020": -138.23,
+            "2021": -208.93,
+            "2022": 27.69,
+            "2023": 229.58
+          }
+        },
+        "holdout": {
+          "n": 38,
+          "pf": 1.499,
+          "exp_per_ct": 7.49,
+          "net_usd": 284.64,
+          "win_rate": 0.3684,
+          "sr_per_trade": 0.13403,
+          "max_dd_usd": -307.87,
+          "per_year": {
+            "2024": 307.57,
+            "2025": 226.68,
+            "2026": -249.61
+          }
+        }
+      }
+    },
+    "ETH:A": {
+      "incl": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 7026.43,
+          "net_usd": 7026.43,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 7026.43
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1790.4,
+          "net_usd": 1790.4,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1790.4
+          }
+        }
+      },
+      "delever": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 7084.07,
+          "net_usd": 7084.07,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 7084.07
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1793.93,
+          "net_usd": 1793.93,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1793.93
+          }
+        }
+      },
+      "topdecile": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 2358.42,
+          "net_usd": 2358.42,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 2358.42
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1458.02,
+          "net_usd": 1458.02,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1458.02
+          }
+        }
+      }
+    },
+    "ETH:B": {
+      "incl": {
+        "train": {
+          "n": 269,
+          "pf": 0.995,
+          "exp_per_ct": -0.12,
+          "net_usd": -31.77,
+          "win_rate": 0.0595,
+          "sr_per_trade": -0.00052,
+          "max_dd_usd": -5354.27,
+          "per_year": {
+            "2020": 1360.94,
+            "2021": 3615.64,
+            "2022": -4059.94,
+            "2023": -948.41
+          }
+        },
+        "holdout": {
+          "n": 204,
+          "pf": 0.255,
+          "exp_per_ct": -18.7,
+          "net_usd": -3814.89,
+          "win_rate": 0.0294,
+          "sr_per_trade": -0.32082,
+          "max_dd_usd": -4621.59,
+          "per_year": {
+            "2024": 185.29,
+            "2025": -2456.4,
+            "2026": -1543.78
+          }
+        }
+      },
+      "delever": {
+        "train": {
+          "n": 262,
+          "pf": 1.046,
+          "exp_per_ct": 1.1,
+          "net_usd": 287.14,
+          "win_rate": 0.0573,
+          "sr_per_trade": 0.00472,
+          "max_dd_usd": -5183.34,
+          "per_year": {
+            "2020": 1489.59,
+            "2021": 3634.97,
+            "2022": -3889.02,
+            "2023": -948.41
+          }
+        },
+        "holdout": {
+          "n": 202,
+          "pf": 0.258,
+          "exp_per_ct": -18.61,
+          "net_usd": -3759.71,
+          "win_rate": 0.0297,
+          "sr_per_trade": -0.31776,
+          "max_dd_usd": -4566.58,
+          "per_year": {
+            "2024": 240.47,
+            "2025": -2456.4,
+            "2026": -1543.78
+          }
+        }
+      },
+      "topdecile": {
+        "train": {
+          "n": 398,
+          "pf": 0.074,
+          "exp_per_ct": -21.72,
+          "net_usd": -8646.28,
+          "win_rate": 0.0628,
+          "sr_per_trade": -1.34407,
+          "max_dd_usd": -8639.44,
+          "per_year": {
+            "2020": -1294.85,
+            "2021": -2188.53,
+            "2022": -3885.21,
+            "2023": -1277.68
+          }
+        },
+        "holdout": {
+          "n": 225,
+          "pf": 0.126,
+          "exp_per_ct": -21.52,
+          "net_usd": -4841.16,
+          "win_rate": 0.0444,
+          "sr_per_trade": -0.86228,
+          "max_dd_usd": -4944.02,
+          "per_year": {
+            "2024": -554.63,
+            "2025": -2742.75,
+            "2026": -1543.78
+          }
+        }
+      }
+    },
+    "ETH:C": {
+      "incl": {
+        "train": {
+          "n": 140,
+          "pf": 1.58,
+          "exp_per_ct": 10.21,
+          "net_usd": 1429.21,
+          "win_rate": 0.2143,
+          "sr_per_trade": 0.11012,
+          "max_dd_usd": -987.67,
+          "per_year": {
+            "2020": 435.53,
+            "2021": 1229.11,
+            "2023": -235.42
+          }
+        },
+        "holdout": {
+          "n": 35,
+          "pf": 0.506,
+          "exp_per_ct": -9.83,
+          "net_usd": -343.98,
+          "win_rate": 0.1429,
+          "sr_per_trade": -0.20476,
+          "max_dd_usd": -505.37,
+          "per_year": {
+            "2024": -343.98
+          }
+        }
+      },
+      "delever": {
+        "train": {
+          "n": 139,
+          "pf": 1.617,
+          "exp_per_ct": 10.66,
+          "net_usd": 1481.75,
+          "win_rate": 0.2158,
+          "sr_per_trade": 0.11486,
+          "max_dd_usd": -925.04,
+          "per_year": {
+            "2020": 425.43,
+            "2021": 1291.74,
+            "2023": -235.42
+          }
+        },
+        "holdout": {
+          "n": 35,
+          "pf": 0.506,
+          "exp_per_ct": -9.83,
+          "net_usd": -343.98,
+          "win_rate": 0.1429,
+          "sr_per_trade": -0.20476,
+          "max_dd_usd": -505.37,
+          "per_year": {
+            "2024": -343.98
+          }
+        }
+      },
+      "topdecile": {
+        "train": {
+          "n": 179,
+          "pf": 0.0,
+          "exp_per_ct": -25.43,
+          "net_usd": -4551.95,
+          "win_rate": 0.0,
+          "sr_per_trade": -5.06877,
+          "max_dd_usd": -4531.1,
+          "per_year": {
+            "2020": -1926.85,
+            "2021": -2186.89,
+            "2023": -438.21
+          }
+        },
+        "holdout": {
+          "n": 57,
+          "pf": 0.0,
+          "exp_per_ct": -24.24,
+          "net_usd": -1381.71,
+          "win_rate": 0.0,
+          "sr_per_trade": -4.53129,
+          "max_dd_usd": -1356.82,
+          "per_year": {
+            "2024": -1381.71
+          }
+        }
+      }
+    },
+    "ETH:D": {
+      "incl": {
+        "train": {
+          "n": 49,
+          "pf": 7.609,
+          "exp_per_ct": 124.29,
+          "net_usd": 6090.2,
+          "win_rate": 0.3265,
+          "sr_per_trade": 0.2222,
+          "max_dd_usd": -794.9,
+          "per_year": {
+            "2020": 1873.97,
+            "2021": 3956.1,
+            "2022": -340.31,
+            "2023": 600.45
+          }
+        },
+        "holdout": {
+          "n": 34,
+          "pf": 2.546,
+          "exp_per_ct": 26.36,
+          "net_usd": 896.15,
+          "win_rate": 0.2353,
+          "sr_per_trade": 0.15382,
+          "max_dd_usd": -362.9,
+          "per_year": {
+            "2024": 824.95,
+            "2025": 347.27,
+            "2026": -276.06
+          }
+        }
+      },
+      "delever": {
+        "train": {
+          "n": 49,
+          "pf": 8.121,
+          "exp_per_ct": 124.36,
+          "net_usd": 6093.63,
+          "win_rate": 0.3469,
+          "sr_per_trade": 0.23281,
+          "max_dd_usd": -729.15,
+          "per_year": {
+            "2020": 1973.15,
+            "2021": 3794.59,
+            "2022": -274.56,
+            "2023": 600.45
+          }
+        },
+        "holdout": {
+          "n": 33,
+          "pf": 2.671,
+          "exp_per_ct": 27.98,
+          "net_usd": 923.39,
+          "win_rate": 0.2424,
+          "sr_per_trade": 0.16102,
+          "max_dd_usd": -362.9,
+          "per_year": {
+            "2024": 852.18,
+            "2025": 347.27,
+            "2026": -276.06
+          }
+        }
+      },
+      "topdecile": {
+        "train": {
+          "n": 87,
+          "pf": 1.087,
+          "exp_per_ct": 1.18,
+          "net_usd": 103.04,
+          "win_rate": 0.3563,
+          "sr_per_trade": 0.02305,
+          "max_dd_usd": -636.05,
+          "per_year": {
+            "2020": 265.7,
+            "2021": -182.4,
+            "2022": -435.29,
+            "2023": 455.03
+          }
+        },
+        "holdout": {
+          "n": 37,
+          "pf": 1.769,
+          "exp_per_ct": 11.96,
+          "net_usd": 442.64,
+          "win_rate": 0.2973,
+          "sr_per_trade": 0.15536,
+          "max_dd_usd": -359.25,
+          "per_year": {
+            "2024": 543.51,
+            "2025": 171.54,
+            "2026": -272.41
+          }
+        }
+      }
+    }
+  },
+  "verdict_scan": {
+    "rule": "PASS-for-majors iff some (coin,rule) on a spike-stripped holdout has PF>=1.30 AND n>=200 AND each-year+ AND DSR>0 (post prior+variants)",
+    "clearing_count": 0,
+    "candidates_clearing_pf_bar": [
+      {
+        "coin": "BTC",
+        "rule": "D",
+        "treatment": "delever",
+        "holdout_strip_pf": 2.688,
+        "holdout_strip_n": 31,
+        "holdout_each_year_positive": false,
+        "n_ge_200": false,
+        "dsr": 0.21452,
+        "dsr_gt_0": true,
+        "train_gate": [
+          "PF 7.753 >= 1.3",
+          "exp/ct $86.81 >= $5.0",
+          "n 54 < 200",
+          "each-year OK [2020:+1,241 2021:+2,740 2022:+323 2023:+384]"
+        ],
+        "holdout_gate_strip": [
+          "HO PF 2.688 >= 1.3",
+          "HO exp/ct $29.26 >= $5.0",
+          "HO each-year FAIL [2024:+682 2025:+475 2026:--250]",
+          "HO PF 2.688 < 0.75*train 6.459",
+          "DSR 0.215 < 0.95"
+        ],
+        "clears_verdict_bar": false
+      },
+      {
+        "coin": "BTC",
+        "rule": "D",
+        "treatment": "topdecile",
+        "holdout_strip_pf": 1.499,
+        "holdout_strip_n": 38,
+        "holdout_each_year_positive": false,
+        "n_ge_200": false,
+        "dsr": 0.21452,
+        "dsr_gt_0": true,
+        "train_gate": [
+          "PF 7.753 >= 1.3",
+          "exp/ct $86.81 >= $5.0",
+          "n 54 < 200",
+          "each-year OK [2020:+1,241 2021:+2,740 2022:+323 2023:+384]"
+        ],
+        "holdout_gate_strip": [
+          "HO PF 1.499 >= 1.3",
+          "HO exp/ct $7.49 >= $5.0",
+          "HO each-year FAIL [2024:+308 2025:+227 2026:--250]",
+          "HO PF 1.499 >= 0.75*train 0.685",
+          "DSR 0.215 < 0.95"
+        ],
+        "clears_verdict_bar": false
+      },
+      {
+        "coin": "ETH",
+        "rule": "D",
+        "treatment": "delever",
+        "holdout_strip_pf": 2.671,
+        "holdout_strip_n": 33,
+        "holdout_each_year_positive": false,
+        "n_ge_200": false,
+        "dsr": 0.22248,
+        "dsr_gt_0": true,
+        "train_gate": [
+          "PF 7.609 >= 1.3",
+          "exp/ct $124.29 >= $5.0",
+          "n 49 < 200",
+          "each-year FAIL [2020:+1,874 2021:+3,956 2022:--340 2023:+600]"
+        ],
+        "holdout_gate_strip": [
+          "HO PF 2.671 >= 1.3",
+          "HO exp/ct $27.98 >= $5.0",
+          "HO each-year FAIL [2024:+852 2025:+347 2026:--276]",
+          "HO PF 2.671 < 0.75*train 6.091",
+          "DSR 0.222 < 0.95"
+        ],
+        "clears_verdict_bar": false
+      },
+      {
+        "coin": "ETH",
+        "rule": "D",
+        "treatment": "topdecile",
+        "holdout_strip_pf": 1.769,
+        "holdout_strip_n": 37,
+        "holdout_each_year_positive": false,
+        "n_ge_200": false,
+        "dsr": 0.22248,
+        "dsr_gt_0": true,
+        "train_gate": [
+          "PF 7.609 >= 1.3",
+          "exp/ct $124.29 >= $5.0",
+          "n 49 < 200",
+          "each-year FAIL [2020:+1,874 2021:+3,956 2022:--340 2023:+600]"
+        ],
+        "holdout_gate_strip": [
+          "HO PF 1.769 >= 1.3",
+          "HO exp/ct $11.96 >= $5.0",
+          "HO each-year FAIL [2024:+544 2025:+172 2026:--272]",
+          "HO PF 1.769 >= 0.75*train 0.815",
+          "DSR 0.222 < 0.95"
+        ],
+        "clears_verdict_bar": false
+      }
+    ]
+  },
+  "net_carry_curves": {
+    "BTC": {
+      "round_trip_cost_usd": 28.0,
+      "basis_price_pnl_alwayson_usd": -17.18,
+      "per_year": {
+        "incl": [
+          {
+            "year": 2020,
+            "net_funding_usd": 1723.97,
+            "cumulative_funding_usd": 1723.97
+          },
+          {
+            "year": 2021,
+            "net_funding_usd": 3060.84,
+            "cumulative_funding_usd": 4784.81
+          },
+          {
+            "year": 2022,
+            "net_funding_usd": 416.49,
+            "cumulative_funding_usd": 5201.31
+          },
+          {
+            "year": 2023,
+            "net_funding_usd": 786.57,
+            "cumulative_funding_usd": 5987.88
+          },
+          {
+            "year": 2024,
+            "net_funding_usd": 1195.69,
+            "cumulative_funding_usd": 7183.57
+          },
+          {
+            "year": 2025,
+            "net_funding_usd": 512.64,
+            "cumulative_funding_usd": 7696.21
+          },
+          {
+            "year": 2026,
+            "net_funding_usd": 35.59,
+            "cumulative_funding_usd": 7731.8
+          }
+        ],
+        "delever": [
+          {
+            "year": 2020,
+            "net_funding_usd": 1825.51,
+            "cumulative_funding_usd": 1825.51
+          },
+          {
+            "year": 2021,
+            "net_funding_usd": 3061.79,
+            "cumulative_funding_usd": 4887.31
+          },
+          {
+            "year": 2022,
+            "net_funding_usd": 451.72,
+            "cumulative_funding_usd": 5339.03
+          },
+          {
+            "year": 2023,
+            "net_funding_usd": 786.57,
+            "cumulative_funding_usd": 6125.6
+          },
+          {
+            "year": 2024,
+            "net_funding_usd": 1191.95,
+            "cumulative_funding_usd": 7317.55
+          },
+          {
+            "year": 2025,
+            "net_funding_usd": 512.64,
+            "cumulative_funding_usd": 7830.19
+          },
+          {
+            "year": 2026,
+            "net_funding_usd": 35.59,
+            "cumulative_funding_usd": 7865.78
+          }
+        ],
+        "topdecile": [
+          {
+            "year": 2020,
+            "net_funding_usd": 651.96,
+            "cumulative_funding_usd": 651.96
+          },
+          {
+            "year": 2021,
+            "net_funding_usd": 656.92,
+            "cumulative_funding_usd": 1308.89
+          },
+          {
+            "year": 2022,
+            "net_funding_usd": 455.92,
+            "cumulative_funding_usd": 1764.81
+          },
+          {
+            "year": 2023,
+            "net_funding_usd": 689.51,
+            "cumulative_funding_usd": 2454.31
+          },
+          {
+            "year": 2024,
+            "net_funding_usd": 801.2,
+            "cumulative_funding_usd": 3255.51
+          },
+          {
+            "year": 2025,
+            "net_funding_usd": 512.64,
+            "cumulative_funding_usd": 3768.15
+          },
+          {
+            "year": 2026,
+            "net_funding_usd": 35.59,
+            "cumulative_funding_usd": 3803.74
+          }
+        ]
+      },
+      "holdout_normal_regime_carry_usd": {
+        "delever": 1740.18,
+        "topdecile": 1349.42
+      },
+      "holdout_normal_carry_after_cost_positive": true,
+      "read": "BTC: holdout normal-regime carry after one round-trip cost $28.00 = delever $1740 / topdecile $1349 -> SOME positive net carry survives the strip"
+    },
+    "ETH": {
+      "round_trip_cost_usd": 28.0,
+      "basis_price_pnl_alwayson_usd": -122.66,
+      "per_year": {
+        "incl": [
+          {
+            "year": 2020,
+            "net_funding_usd": 2749.0,
+            "cumulative_funding_usd": 2749.0
+          },
+          {
+            "year": 2021,
+            "net_funding_usd": 3753.73,
+            "cumulative_funding_usd": 6502.72
+          },
+          {
+            "year": 2022,
+            "net_funding_usd": 78.73,
+            "cumulative_funding_usd": 6581.45
+          },
+          {
+            "year": 2023,
+            "net_funding_usd": 825.95,
+            "cumulative_funding_usd": 7407.4
+          },
+          {
+            "year": 2024,
+            "net_funding_usd": 1299.69,
+            "cumulative_funding_usd": 8707.09
+          },
+          {
+            "year": 2025,
+            "net_funding_usd": 492.87,
+            "cumulative_funding_usd": 9199.96
+          },
+          {
+            "year": 2026,
+            "net_funding_usd": 16.3,
+            "cumulative_funding_usd": 9216.26
+          }
+        ],
+        "delever": [
+          {
+            "year": 2020,
+            "net_funding_usd": 2753.17,
+            "cumulative_funding_usd": 2753.17
+          },
+          {
+            "year": 2021,
+            "net_funding_usd": 3766.84,
+            "cumulative_funding_usd": 6520.02
+          },
+          {
+            "year": 2022,
+            "net_funding_usd": 119.07,
+            "cumulative_funding_usd": 6639.09
+          },
+          {
+            "year": 2023,
+            "net_funding_usd": 825.95,
+            "cumulative_funding_usd": 7465.04
+          },
+          {
+            "year": 2024,
+            "net_funding_usd": 1303.22,
+            "cumulative_funding_usd": 8768.26
+          },
+          {
+            "year": 2025,
+            "net_funding_usd": 492.87,
+            "cumulative_funding_usd": 9261.13
+          },
+          {
+            "year": 2026,
+            "net_funding_usd": 16.3,
+            "cumulative_funding_usd": 9277.43
+          }
+        ],
+        "topdecile": [
+          {
+            "year": 2020,
+            "net_funding_usd": 938.93,
+            "cumulative_funding_usd": 938.93
+          },
+          {
+            "year": 2021,
+            "net_funding_usd": 815.38,
+            "cumulative_funding_usd": 1754.31
+          },
+          {
+            "year": 2022,
+            "net_funding_usd": 246.11,
+            "cumulative_funding_usd": 2000.42
+          },
+          {
+            "year": 2023,
+            "net_funding_usd": 738.97,
+            "cumulative_funding_usd": 2739.39
+          },
+          {
+            "year": 2024,
+            "net_funding_usd": 963.66,
+            "cumulative_funding_usd": 3703.05
+          },
+          {
+            "year": 2025,
+            "net_funding_usd": 492.87,
+            "cumulative_funding_usd": 4195.92
+          },
+          {
+            "year": 2026,
+            "net_funding_usd": 19.95,
+            "cumulative_funding_usd": 4215.87
+          }
+        ]
+      },
+      "holdout_normal_regime_carry_usd": {
+        "delever": 1812.39,
+        "topdecile": 1476.48
+      },
+      "holdout_normal_carry_after_cost_positive": true,
+      "read": "ETH: holdout normal-regime carry after one round-trip cost $28.00 = delever $1812 / topdecile $1476 -> SOME positive net carry survives the strip"
+    }
+  },
+  "integrity": {
+    "trade_unit_is_episode_not_interval": true,
+    "timing_rule_episodes_BCD": 1448,
+    "total_funding_intervals": 14058,
+    "episode_to_interval_ratio": 0.103,
+    "negative_funding_included_signed_alwayson": true,
+    "alwayson_negative_intervals_held": 1968,
+    "costs_applied_gross_ne_net": true,
+    "probe_btc_C_gross_train_usd": 4019.15,
+    "probe_btc_C_net_train_usd": 519.15,
+    "holdout_sealed_verdict_on_strip": true,
+    "both_strips_same_masking_path": true,
+    "deflator_prior_trials": 70,
+    "deflator_in_eval_variants": 8,
+    "deflator_total_trials": 78
+  },
+  "baseline_20b_per_coin": {
+    "C:BTC": {
+      "train_pf": 1.235,
+      "stripped": 0.006,
+      "holdout": 0.397,
+      "holdout_strip": 0.0
+    },
+    "C:ETH": {
+      "train_pf": 1.58,
+      "stripped": 0.0,
+      "holdout": 0.506,
+      "holdout_strip": 0.0
+    },
+    "note": "both strip to ~0.00, both holdouts <0.51 \u2014 20b edge was squeeze/delever tail"
+  },
+  "gates": {
+    "PF_MIN": 1.3,
+    "EXP_PER_CT_MIN": 5.0,
+    "N_TRADES_MIN": 200,
+    "DSR_MIN": 0.95,
+    "HOLDOUT_PF_DEGRADE_MAX": 0.25
+  },
+  "cumulative_trials_after_this_eval": 78
+}
