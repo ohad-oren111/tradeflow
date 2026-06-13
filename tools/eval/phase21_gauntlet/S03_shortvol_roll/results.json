@@ -1,0 +1,408 @@
+{
+  "phase": "21-S03-shortvol-roll",
+  "verdict": "NONE",
+  "research_only": true,
+  "data": {
+    "vix_span": [
+      "1990-01-02",
+      "2026-06-12"
+    ],
+    "vix3m_span": [
+      "2006-07-17",
+      "2026-06-12"
+    ],
+    "svxy_span": [
+      "2011-10-04",
+      "2026-06-12"
+    ],
+    "vxx_span": [
+      "2018-01-25",
+      "2026-06-12"
+    ]
+  },
+  "split": {
+    "train": [
+      "2011-10-04",
+      "2020-01-01"
+    ],
+    "holdout": [
+      "2020-01-01",
+      "2026-07-01"
+    ]
+  },
+  "costs": {
+    "notional_usd": 100000.0,
+    "spread_bp_per_side": 5.0,
+    "commission": 0.0,
+    "exp_gate_usd": 10.0,
+    "source": "work-order equity cost tier (large-cap 5bp/side)"
+  },
+  "deflator": {
+    "prior_trials": 84,
+    "in_eval_variants": 4,
+    "n_trials": 88,
+    "sr_variance_pool": 0.000882,
+    "sr0_expected_max": 0.07381,
+    "dsr_champion": 0.98012,
+    "bonferroni_p_champion": 1.0
+  },
+  "champion": {
+    "variant": "contango",
+    "train_gate_pass": false,
+    "train": {
+      "n": 58,
+      "pf": 2.895,
+      "exp_per_episode": 7518.2,
+      "net_usd": 436055.51,
+      "win_rate": 0.3793,
+      "sr_per_trade": 0.24129,
+      "max_dd_usd": -44478.02,
+      "per_year": {
+        "2011": -17537.56,
+        "2012": 188244.97,
+        "2013": 21577.29,
+        "2014": 24482.0,
+        "2015": 30270.08,
+        "2016": 55821.0,
+        "2017": 62216.17,
+        "2018": 50831.42,
+        "2019": -6671.4,
+        "2020": 26821.54
+      }
+    },
+    "holdout": {
+      "n": 34,
+      "pf": 2.937,
+      "exp_per_episode": 4463.94,
+      "net_usd": 151774.08,
+      "win_rate": 0.4118,
+      "sr_per_trade": 0.21463,
+      "max_dd_usd": -22468.64,
+      "per_year": {
+        "2020": -1990.27,
+        "2021": 40222.27,
+        "2022": -14429.91,
+        "2024": 101614.88,
+        "2025": 20015.22,
+        "2026": 6341.89
+      }
+    },
+    "holdout_gate": [
+      "SEALED"
+    ],
+    "holdout_gate_pass": false
+  },
+  "variants": {
+    "contango": {
+      "train": {
+        "n": 58,
+        "pf": 2.895,
+        "exp_per_episode": 7518.2,
+        "net_usd": 436055.51,
+        "win_rate": 0.3793,
+        "sr_per_trade": 0.24129,
+        "max_dd_usd": -44478.02,
+        "per_year": {
+          "2011": -17537.56,
+          "2012": 188244.97,
+          "2013": 21577.29,
+          "2014": 24482.0,
+          "2015": 30270.08,
+          "2016": 55821.0,
+          "2017": 62216.17,
+          "2018": 50831.42,
+          "2019": -6671.4,
+          "2020": 26821.54
+        }
+      },
+      "holdout": {
+        "n": 34,
+        "pf": 2.937,
+        "exp_per_episode": 4463.94,
+        "net_usd": 151774.08,
+        "win_rate": 0.4118,
+        "sr_per_trade": 0.21463,
+        "max_dd_usd": -22468.64,
+        "per_year": {
+          "2020": -1990.27,
+          "2021": 40222.27,
+          "2022": -14429.91,
+          "2024": 101614.88,
+          "2025": 20015.22,
+          "2026": 6341.89
+        }
+      },
+      "train_gate": [
+        "PF 2.895 >= 1.3",
+        "exp $7518.20 >= $10.0",
+        "n 58 < 200",
+        "each-year FAIL [2011:- 2012:+ 2013:+ 2014:+ 2015:+ 2016:+ 2017:+ 2018:+ 2019:- 2020:+]"
+      ],
+      "train_gate_pass": false
+    },
+    "calm": {
+      "train": {
+        "n": 54,
+        "pf": 1.915,
+        "exp_per_episode": 3238.32,
+        "net_usd": 174869.17,
+        "win_rate": 0.3704,
+        "sr_per_trade": 0.17726,
+        "max_dd_usd": -60671.2,
+        "per_year": {
+          "2012": 30806.13,
+          "2013": 28313.02,
+          "2014": 34612.78,
+          "2015": -28564.18,
+          "2016": 17690.76,
+          "2018": 82097.39,
+          "2019": -4264.03,
+          "2020": 14177.31
+        }
+      },
+      "holdout": {
+        "n": 62,
+        "pf": 0.729,
+        "exp_per_episode": -534.62,
+        "net_usd": -33146.51,
+        "win_rate": 0.2742,
+        "sr_per_trade": -0.1105,
+        "max_dd_usd": -46943.34,
+        "per_year": {
+          "2021": -18275.96,
+          "2022": -9836.56,
+          "2023": 12017.12,
+          "2024": -4979.1,
+          "2025": -10722.64,
+          "2026": -1349.37
+        }
+      },
+      "train_gate": [
+        "PF 1.915 >= 1.3",
+        "exp $3238.32 >= $10.0",
+        "n 54 < 200",
+        "each-year FAIL [2012:+ 2013:+ 2014:+ 2015:- 2016:+ 2018:+ 2019:- 2020:+]"
+      ],
+      "train_gate_pass": false
+    },
+    "both": {
+      "train": {
+        "n": 68,
+        "pf": 1.858,
+        "exp_per_episode": 3355.16,
+        "net_usd": 228150.55,
+        "win_rate": 0.3824,
+        "sr_per_trade": 0.18862,
+        "max_dd_usd": -60671.2,
+        "per_year": {
+          "2012": 30806.13,
+          "2013": 19985.22,
+          "2014": 35157.44,
+          "2015": -10841.69,
+          "2016": 25791.14,
+          "2017": 62216.17,
+          "2018": 52953.54,
+          "2019": -12175.11,
+          "2020": 24257.71
+        }
+      },
+      "holdout": {
+        "n": 64,
+        "pf": 0.659,
+        "exp_per_episode": -723.55,
+        "net_usd": -46307.31,
+        "win_rate": 0.2656,
+        "sr_per_trade": -0.14817,
+        "max_dd_usd": -48715.18,
+        "per_year": {
+          "2020": -13160.8,
+          "2021": -18275.96,
+          "2022": -9836.56,
+          "2023": 12017.12,
+          "2024": -4979.1,
+          "2025": -10722.64,
+          "2026": -1349.37
+        }
+      },
+      "train_gate": [
+        "PF 1.858 >= 1.3",
+        "exp $3355.16 >= $10.0",
+        "n 68 < 200",
+        "each-year FAIL [2012:+ 2013:+ 2014:+ 2015:- 2016:+ 2017:+ 2018:+ 2019:- 2020:+]"
+      ],
+      "train_gate_pass": false
+    },
+    "deep_contango": {
+      "train": {
+        "n": 85,
+        "pf": 2.236,
+        "exp_per_episode": 4545.9,
+        "net_usd": 386401.67,
+        "win_rate": 0.4,
+        "sr_per_trade": 0.18201,
+        "max_dd_usd": -44462.91,
+        "per_year": {
+          "2011": -25755.31,
+          "2012": 185907.71,
+          "2013": 42455.67,
+          "2014": 11697.93,
+          "2015": -2029.38,
+          "2016": 64600.7,
+          "2017": 62767.11,
+          "2018": 37364.79,
+          "2019": -12005.92,
+          "2020": 21398.37
+        }
+      },
+      "holdout": {
+        "n": 71,
+        "pf": 1.285,
+        "exp_per_episode": 674.84,
+        "net_usd": 47913.85,
+        "win_rate": 0.3944,
+        "sr_per_trade": 0.07769,
+        "max_dd_usd": -37305.26,
+        "per_year": {
+          "2020": 101.2,
+          "2021": 8132.61,
+          "2022": -11171.46,
+          "2023": 28017.88,
+          "2024": 11065.0,
+          "2025": 9359.23,
+          "2026": 2409.38
+        }
+      },
+      "train_gate": [
+        "PF 2.236 >= 1.3",
+        "exp $4545.90 >= $10.0",
+        "n 85 < 200",
+        "each-year FAIL [2011:- 2012:+ 2013:+ 2014:+ 2015:- 2016:+ 2017:+ 2018:+ 2019:- 2020:+]"
+      ],
+      "train_gate_pass": false
+    }
+  },
+  "kill_tests": {
+    "1_tail_shape_90d": {
+      "pass": true,
+      "worst_90d_window_usd": -36573.72,
+      "lifetime_net_usd": 587829.59,
+      "ratio": 0.062,
+      "crisis_window_pnl": {
+        "volmageddon_feb2018": 62678.89,
+        "covid_mar2020": -7944.38,
+        "aug2024_spike": 107770.08
+      },
+      "reason": "no quarter may destroy >50% of lifetime PnL (Volmageddon shape test)"
+    },
+    "2_recency": {
+      "pass": true,
+      "pf_2015plus": 2.844,
+      "n_2015plus": 73,
+      "pf_2020plus": 2.937,
+      "n_2020plus": 34,
+      "reason": "roll yield must survive the modern vol regime"
+    },
+    "3_monotonicity_contango_depth": {
+      "pass": true,
+      "reason": "top 4596.83 vs bottom 984.6 rho 0.3",
+      "quantile_means": [
+        984.6,
+        9630.03,
+        965.46,
+        16170.2,
+        4596.83
+      ]
+    },
+    "4_cost_cliff": {
+      "cliff_multiple": null,
+      "curve": [
+        {
+          "k": 0.5,
+          "holdout_pf": 2.984
+        },
+        {
+          "k": 1.0,
+          "holdout_pf": 2.937
+        },
+        {
+          "k": 1.5,
+          "holdout_pf": 2.891
+        },
+        {
+          "k": 2.0,
+          "holdout_pf": 2.846
+        },
+        {
+          "k": 2.5,
+          "holdout_pf": 2.803
+        },
+        {
+          "k": 3.0,
+          "holdout_pf": 2.76
+        },
+        {
+          "k": 3.5,
+          "holdout_pf": 2.719
+        },
+        {
+          "k": 4.0,
+          "holdout_pf": 2.678
+        },
+        {
+          "k": 4.5,
+          "holdout_pf": 2.637
+        },
+        {
+          "k": 5.0,
+          "holdout_pf": 2.597
+        },
+        {
+          "k": 5.5,
+          "holdout_pf": 2.557
+        },
+        {
+          "k": 6.0,
+          "holdout_pf": 2.519
+        },
+        {
+          "k": 6.5,
+          "holdout_pf": 2.481
+        },
+        {
+          "k": 7.0,
+          "holdout_pf": 2.445
+        },
+        {
+          "k": 7.5,
+          "holdout_pf": 2.409
+        },
+        {
+          "k": 8.0,
+          "holdout_pf": 2.374
+        }
+      ]
+    },
+    "5_vxx_crosscheck_robustness": {
+      "exp_per_episode": 4024.68,
+      "n": 57,
+      "pf": 2.008,
+      "label": "short-VXX sign check; borrow unmodelled; never verdict-carrying"
+    }
+  },
+  "integrity": {
+    "no_lookahead": "filter uses VIX index closes published at the same close; decision-at-close execution approximation, labeled",
+    "holdout_sealed_until_champion": true,
+    "champion_selected_on": "train_profit_factor (pre-registered)",
+    "costs_applied": true,
+    "gross_total_usd": 597029.59,
+    "net_total_usd": 587829.59,
+    "etp_proxy_label": "SVXY as traded (incl. 2018 -1x -> -0.5x deleverage)"
+  },
+  "gates": {
+    "PF_MIN": 1.3,
+    "EXP_MIN_USD_preregistered": 10.0,
+    "N_TRADES_MIN": 200,
+    "DSR_MIN": 0.95,
+    "HOLDOUT_PF_DEGRADE_MAX": 0.25
+  }
+}
