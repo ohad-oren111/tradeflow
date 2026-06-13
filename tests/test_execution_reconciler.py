@@ -346,6 +346,87 @@ async def test_reconcile_entering_no_order_no_position_transitions_to_closed_man
     assert call.kwargs["entry_qty"] == 0
 
 
+# -------- PR #158: force-fill sizes from the per-lifecycle fill, not account net --------
+
+
+def _placed_stp_orders(ib: AsyncMock) -> list[Any]:
+    """STP orders passed to ``ib.place_order`` (filtered by orderType, not call
+    index) so a qty assertion can't latch onto an unrelated leg."""
+    return [
+        call.args[1]
+        for call in ib.place_order.await_args_list
+        if getattr(call.args[1], "orderType", "") == "STP"
+    ]
+
+
+async def test_force_fill_concurrent_sizes_per_lifecycle():
+    # The 2026-06-12 regression: a sibling lifecycle is ACTIVE holding 2, and THIS
+    # lifecycle force-fills its own 2 — but IBKR reports a single account NET of 4.
+    # The force-filling lifecycle must record entry_qty=2 and size its stop 2 (its
+    # OWN fill), NEVER 4 (the net), else EOD oversells into a naked short.
+    ib = _make_mock_ib(
+        positions=[_make_position(qty=4)],  # account NET = sibling 2 + this 2
+        open_trades=[],
+    )
+    # This entry order (1001) filled exactly 2 lots — the per-lifecycle truth.
+    ib.get_fills = AsyncMock(return_value=[_exec_fill(1001, 2, 17500.0)])
+    sm = _make_mock_sm()
+    sm.transition.return_value = _make_lifecycle(State.ACTIVE)
+    rec, ib_ref, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm)
+    lc = _make_lifecycle(State.ENTERING)  # entry_order_id=1001
+
+    action = await rec.reconcile_one(lc)
+
+    assert action is ReconcileAction.ENTERING_TO_ACTIVE
+    call = sm.transition.await_args
+    assert call.kwargs["entry_qty"] == 2  # this lifecycle's fill, NOT net=4
+    stps = _placed_stp_orders(ib_ref)
+    assert len(stps) == 1
+    assert stps[0].totalQuantity == 2  # protective stop sized 2, NOT 4
+
+
+async def test_force_fill_single_lifecycle_unchanged():
+    # Behaviour preserved for the common case: flat→2, one lifecycle force-fills,
+    # net == this lifecycle's own fill == 2 → records 2 (no regression).
+    ib = _make_mock_ib(positions=[_make_position(qty=2)], open_trades=[])
+    ib.get_fills = AsyncMock(return_value=[_exec_fill(1001, 2, 17500.0)])
+    sm = _make_mock_sm()
+    sm.transition.return_value = _make_lifecycle(State.ACTIVE)
+    rec, ib_ref, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm)
+    lc = _make_lifecycle(State.ENTERING)
+
+    action = await rec.reconcile_one(lc)
+
+    assert action is ReconcileAction.ENTERING_TO_ACTIVE
+    assert sm.transition.await_args.kwargs["entry_qty"] == 2
+    stps = _placed_stp_orders(ib_ref)
+    assert len(stps) == 1
+    assert stps[0].totalQuantity == 2
+
+
+async def test_force_fill_partial_then_full():
+    # A 1-then-2 partial path: the entry order (1001) fills in two executions
+    # (cumQty 1 → 2). The reconciler must size from this order's SUMMED fill (=2),
+    # not the inflated account net (=4) — the #151 full-fill gate semantics carried
+    # onto the force-fill leg.
+    ib = _make_mock_ib(positions=[_make_position(qty=4)], open_trades=[])  # net inflated
+    ib.get_fills = AsyncMock(
+        return_value=[_exec_fill(1001, 1, 17500.0), _exec_fill(1001, 1, 17501.0)]
+    )
+    sm = _make_mock_sm()
+    sm.transition.return_value = _make_lifecycle(State.ACTIVE)
+    rec, ib_ref, _sm, _ds, _halt = _build_reconciler(ib=ib, sm=sm)
+    lc = _make_lifecycle(State.ENTERING)
+
+    action = await rec.reconcile_one(lc)
+
+    assert action is ReconcileAction.ENTERING_TO_ACTIVE
+    assert sm.transition.await_args.kwargs["entry_qty"] == 2  # 1+1 summed, NOT net=4
+    stps = _placed_stp_orders(ib_ref)
+    assert len(stps) == 1
+    assert stps[0].totalQuantity == 2
+
+
 # -------- ACTIVE rows --------
 
 
