@@ -1,0 +1,52 @@
+<div class="card">
+  <div class="card-header py-2"><strong>Open positions</strong></div>
+  <div class="card-body py-2">
+    {% if errors.positions %}
+      <div class="alert alert-warning py-2 mb-2">Panel error: {{ errors.positions }}</div>
+    {% endif %}
+    {% if panel %}
+      {% if panel.positions %}
+        <div class="table-responsive">
+          <table class="table table-sm small mb-1">
+            <thead>
+              <tr>
+                <th>symbol</th>
+                <th>side</th>
+                <th class="text-end">qty</th>
+                <th class="text-end">avg_entry</th>
+                <th class="text-end">mark</th>
+                <th class="text-end">unrealized_pnl</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in panel.positions %}
+                <tr>
+                  <td>{{ row.symbol }}</td>
+                  <td>{{ row.side }}</td>
+                  <td class="text-end">{{ row.qty }}</td>
+                  <td class="text-end">
+                    {% if row.avg_entry_price is not none %}{{ "%.2f"|format(row.avg_entry_price) }}{% else %}-{% endif %}
+                  </td>
+                  <td class="text-end">
+                    {% if row.mark_price is not none %}{{ "%.2f"|format(row.mark_price) }}{% else %}-{% endif %}
+                  </td>
+                  <td class="text-end
+                    {% if row.unrealized_pnl is not none and row.unrealized_pnl > 0 %}pnl-positive
+                    {% elif row.unrealized_pnl is not none and row.unrealized_pnl < 0 %}pnl-negative
+                    {% else %}pnl-zero{% endif %}">
+                    {% if row.unrealized_pnl is not none %}${{ "%.2f"|format(row.unrealized_pnl) }}{% else %}-{% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="text-muted small">fetched_at {{ panel.fetched_at.strftime("%H:%M:%S UTC") }}</div>
+      {% else %}
+        <div class="text-muted small">No open positions</div>
+      {% endif %}
+    {% elif not errors.positions %}
+      <div class="text-muted">no positions data</div>
+    {% endif %}
+  </div>
+</div>

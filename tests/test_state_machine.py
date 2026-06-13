@@ -1,0 +1,721 @@
+"""Tests for src.state_machine — mocked at the SupabaseClient/IBClient boundary."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from typing import Any
+from unittest.mock import AsyncMock
+
+import httpx
+import pytest
+
+from src.clients.ib_client import IBClient
+from src.clients.supabase_client import SupabaseClient
+from src.state_machine import (
+    Direction,
+    InvariantViolationError,
+    Lifecycle,
+    State,
+    StateMachine,
+)
+
+ENTRY_FILLED = "2026-05-21T15:00:00+00:00"
+EXIT_FILLED = "2026-05-21T15:30:00+00:00"
+
+
+def _make_mock_db() -> AsyncMock:
+    """Fresh AsyncMock(spec=SupabaseClient). Per-test return_values must be set."""
+    db = AsyncMock(spec=SupabaseClient)
+    db.insert_lifecycle = AsyncMock(return_value=[{}])
+    db.update_lifecycle = AsyncMock(return_value=[{}])
+    db.select_lifecycles_non_closed = AsyncMock(return_value=[])
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=[])
+    db.insert_lifecycle_event = AsyncMock(return_value=[{}])
+    return db
+
+
+def _make_mock_ib() -> AsyncMock:
+    """Fresh AsyncMock(spec=IBClient). Per-test broker state must be set."""
+    ib = AsyncMock(spec=IBClient)
+    ib.get_positions = AsyncMock(return_value=[])
+    ib.get_open_trades = AsyncMock(return_value=[])
+    return ib
+
+
+def _make_lifecycle(state: State, **overrides: Any) -> Lifecycle:
+    base = Lifecycle(
+        lifecycle_id=str(uuid.uuid4()),
+        symbol="MNQM6",
+        strategy="sma100_bounce",
+        direction=Direction.LONG.value,
+        state=state.value,
+    )
+    if state in (
+        State.ENTERING,
+        State.ACTIVE,
+        State.EXITING,
+        State.CLOSED,
+    ):
+        base.entry_order_id = 10001
+    if state in (State.ACTIVE, State.EXITING, State.CLOSED):
+        base.entry_qty = 2
+        base.entry_price = 17500.25
+        base.entry_filled_at = ENTRY_FILLED
+    if state in (State.EXITING, State.CLOSED):
+        base.exit_order_id = 10002
+    if state is State.CLOSED:
+        base.exit_qty = 2
+        base.exit_price = 17525.00
+        base.exit_filled_at = EXIT_FILLED
+        base.exit_reason = "TARGET"
+        base.commission_total = 2.50
+        base.pnl_gross = 49.50
+        base.pnl_net = 47.00
+    for k, v in overrides.items():
+        setattr(base, k, v)
+    return base
+
+
+# ----------------------------------------------------------------- allowed paths
+
+
+async def test_allowed_transition_idle_to_entering_succeeds():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.IDLE)
+
+    updated = await sm.transition(lc, State.ENTERING, reason="entry_submitted", entry_order_id=42)
+
+    assert updated.state == State.ENTERING.value
+    assert updated.entry_order_id == 42
+    db.update_lifecycle.assert_awaited_once()
+
+
+async def test_allowed_transition_entering_to_active_succeeds():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.ENTERING)
+
+    updated = await sm.transition(
+        lc,
+        State.ACTIVE,
+        reason="entry_filled",
+        entry_qty=2,
+        entry_price=17500.25,
+        entry_filled_at=ENTRY_FILLED,
+    )
+
+    assert updated.state == State.ACTIVE.value
+    assert updated.entry_qty == 2
+
+
+async def test_allowed_transition_active_to_exiting_succeeds():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.ACTIVE)
+
+    updated = await sm.transition(lc, State.EXITING, reason="exit_submitted", exit_order_id=10002)
+
+    assert updated.state == State.EXITING.value
+
+
+async def test_allowed_transition_exiting_to_closed_succeeds():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.EXITING)
+
+    updated = await sm.transition(
+        lc,
+        State.CLOSED,
+        reason="exit_filled",
+        exit_qty=2,
+        exit_price=17525.00,
+        exit_filled_at=EXIT_FILLED,
+        exit_reason="TARGET",
+        commission_total=2.50,
+        pnl_gross=49.50,
+        pnl_net=47.00,
+    )
+
+    assert updated.state == State.CLOSED.value
+    assert updated.pnl_net == 47.00
+
+
+async def test_allowed_transition_idle_to_closed_succeeds():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.IDLE)
+    # IDLE → CLOSED requires all CLOSED-required fields populated.
+    updated = await sm.transition(
+        lc,
+        State.CLOSED,
+        reason="cancelled_pre_entry",
+        entry_order_id=10001,
+        entry_qty=0,
+        entry_price=0.0,
+        entry_filled_at=ENTRY_FILLED,
+        exit_order_id=10001,
+        exit_qty=0,
+        exit_price=0.0,
+        exit_filled_at=EXIT_FILLED,
+        exit_reason="MANUAL",
+        commission_total=0.0,
+        pnl_gross=0.0,
+        pnl_net=0.0,
+    )
+
+    assert updated.state == State.CLOSED.value
+
+
+async def test_allowed_transition_entering_to_closed_succeeds():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.ENTERING)
+    # ENTERING → CLOSED — entry order rejected/cancelled before fill.
+    updated = await sm.transition(
+        lc,
+        State.CLOSED,
+        reason="entry_rejected",
+        entry_qty=0,
+        entry_price=0.0,
+        entry_filled_at=ENTRY_FILLED,
+        exit_order_id=lc.entry_order_id,
+        exit_qty=0,
+        exit_price=0.0,
+        exit_filled_at=EXIT_FILLED,
+        exit_reason="MANUAL",
+        commission_total=0.0,
+        pnl_gross=0.0,
+        pnl_net=0.0,
+    )
+
+    assert updated.state == State.CLOSED.value
+
+
+# ---------------------------------------------------------------- disallowed paths
+
+
+async def test_disallowed_transition_active_to_closed_raises():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.ACTIVE)
+
+    with pytest.raises(InvariantViolationError, match="disallowed transition ACTIVE"):
+        await sm.transition(lc, State.CLOSED, reason="x")
+
+
+async def test_disallowed_transition_exiting_to_active_raises():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.EXITING)
+
+    with pytest.raises(InvariantViolationError, match="disallowed transition EXITING"):
+        await sm.transition(lc, State.ACTIVE, reason="x")
+
+
+async def test_disallowed_transition_closed_to_any_raises():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.CLOSED)
+
+    for target in (State.IDLE, State.ENTERING, State.ACTIVE, State.EXITING):
+        with pytest.raises(InvariantViolationError, match="disallowed transition CLOSED"):
+            await sm.transition(lc, target, reason="x")
+
+
+# ------------------------------------------------------------------- invariants
+
+
+async def test_invariant_active_requires_entry_filled_at():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.ENTERING)
+
+    with pytest.raises(InvariantViolationError, match="entry_filled_at"):
+        # Missing entry_filled_at — ACTIVE requires it
+        await sm.transition(
+            lc,
+            State.ACTIVE,
+            reason="entry_filled",
+            entry_qty=2,
+            entry_price=17500.25,
+        )
+
+
+async def test_invariant_closed_requires_pnl_net():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.EXITING)
+
+    with pytest.raises(InvariantViolationError, match="pnl_net"):
+        await sm.transition(
+            lc,
+            State.CLOSED,
+            reason="exit_filled",
+            exit_qty=2,
+            exit_price=17525.00,
+            exit_filled_at=EXIT_FILLED,
+            exit_reason="TARGET",
+            commission_total=2.50,
+            pnl_gross=49.50,
+            # pnl_net intentionally omitted
+        )
+
+
+async def test_invariant_idle_rejects_entry_fields():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    # Lifecycle in ENTERING with entry_order_id set; cannot demote to IDLE
+    # because IDLE invariants forbid entry_order_id being populated. (Also,
+    # ENTERING → IDLE is not in ALLOWED_TRANSITIONS — that's the first guard.)
+    lc = _make_lifecycle(State.ENTERING)
+
+    with pytest.raises(InvariantViolationError, match="disallowed transition ENTERING"):
+        await sm.transition(lc, State.IDLE, reason="x")
+
+
+# ------------------------------------------------------------- create_lifecycle
+
+
+async def test_create_lifecycle_rejects_when_existing_non_closed():
+    # Regression — at MAX_CONCURRENT=1 (single-open) one existing non-CLOSED row
+    # rejects the second entry, byte-for-byte today's behavior (PR-B default is 3).
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(
+        return_value=[{"lifecycle_id": "abc", "state": "ACTIVE"}]
+    )
+    sm = StateMachine(db=db, ib=ib, max_concurrent=1)
+
+    with pytest.raises(InvariantViolationError, match="non-CLOSED lifecycle already exists"):
+        await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG)
+
+    db.insert_lifecycle.assert_not_awaited()
+
+
+async def test_create_lifecycle_inserts_idle_row():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    new_id = str(uuid.uuid4())
+    db.insert_lifecycle = AsyncMock(
+        return_value=[
+            {
+                "lifecycle_id": new_id,
+                "symbol": "MNQM6",
+                "strategy": "sma100_bounce",
+                "direction": "LONG",
+                "state": "IDLE",
+                "metadata": {},
+            }
+        ]
+    )
+    sm = StateMachine(db=db, ib=ib)
+
+    lc = await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG)
+
+    assert lc.lifecycle_id == new_id
+    assert lc.state == State.IDLE.value
+    db.insert_lifecycle.assert_awaited_once()
+    db.insert_lifecycle_event.assert_awaited_once()
+    event_payload = db.insert_lifecycle_event.await_args.args[0]
+    assert event_payload["to_state"] == "IDLE"
+    assert event_payload["from_state"] is None
+
+
+# ----------------------------------------------- GATE-1 — race-proof single-open
+
+
+def _http_409() -> httpx.HTTPStatusError:
+    """A PostgREST unique-violation: 23505 surfaces as HTTP 409 via raise_for_status."""
+    req = httpx.Request("POST", "https://example.supabase.co/rest/v1/lifecycles")
+    resp = httpx.Response(409, request=req, text='{"code":"23505"}')
+    return httpx.HTTPStatusError("conflict", request=req, response=resp)
+
+
+async def test_create_lifecycle_converts_db_409_to_invariant_violation():
+    """The DB partial-unique-index backstop: a 409 on insert is surfaced as the
+    SAME InvariantViolationError the in-code probe raises, so callers handle one
+    exception type. No lifecycle_event is written for the rejected insert."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    # Probe passes (simulates the racing task that slipped past probe-before-insert);
+    # the DB index then rejects the second insert.
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=[])
+    db.insert_lifecycle = AsyncMock(side_effect=_http_409())
+    sm = StateMachine(db=db, ib=ib)
+
+    with pytest.raises(InvariantViolationError, match="db-unique"):
+        await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG)
+
+    db.insert_lifecycle.assert_awaited_once()
+    db.insert_lifecycle_event.assert_not_awaited()
+
+
+async def test_create_lifecycle_reraises_non_409_http_error():
+    """A non-conflict HTTP error (e.g. 500) is NOT swallowed — it propagates so an
+    outage is never masked as an invariant rejection."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=[])
+    req = httpx.Request("POST", "https://example.supabase.co/rest/v1/lifecycles")
+    resp = httpx.Response(500, request=req)
+    db.insert_lifecycle = AsyncMock(
+        side_effect=httpx.HTTPStatusError("server error", request=req, response=resp)
+    )
+    sm = StateMachine(db=db, ib=ib)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG)
+
+
+async def test_concurrent_create_lifecycle_only_one_wins():
+    """The proven TOCTOU race: two entry tasks for the same (symbol, strategy) both
+    pass the probe, but exactly ONE insert succeeds — the second is rejected. The
+    asyncio.Lock serialises the critical section and the DB 409 is the backstop, so
+    no second bracket can ever be created."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    new_id = str(uuid.uuid4())
+    # Probe ALWAYS returns [] — models both tasks slipping past probe-before-insert
+    # at the await boundary (the exact 2026-06-01 interleave).
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=[])
+    inserted_row = {
+        "lifecycle_id": new_id,
+        "symbol": "MNQM6",
+        "strategy": "sma100_bounce",
+        "direction": "LONG",
+        "state": "IDLE",
+        "metadata": {},
+    }
+    # 2 entries: call 1 inserts (the winner), call 2 hits the unique index (409).
+    db.insert_lifecycle = AsyncMock(side_effect=[[inserted_row], _http_409()])
+    sm = StateMachine(db=db, ib=ib)
+
+    results = await asyncio.gather(
+        sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG),
+        sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG),
+        return_exceptions=True,
+    )
+
+    winners = [r for r in results if isinstance(r, Lifecycle)]
+    losers = [r for r in results if isinstance(r, InvariantViolationError)]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    assert winners[0].lifecycle_id == new_id
+    # Both reached insert (serialised by the lock); only the winner emitted an event.
+    assert db.insert_lifecycle.await_count == 2
+    db.insert_lifecycle_event.assert_awaited_once()
+
+
+# ------------------------------------------- PR-A — count gate vs max_concurrent
+
+
+def _idle_insert_row() -> dict:
+    """A minimal inserted IDLE row for the allow-path tests."""
+    return {
+        "lifecycle_id": str(uuid.uuid4()),
+        "symbol": "MNQM6",
+        "strategy": "sma100_bounce",
+        "direction": "LONG",
+        "state": "IDLE",
+        "metadata": {},
+    }
+
+
+def _non_closed(n: int) -> list[dict]:
+    """``n`` existing non-CLOSED rows as the probe would return them."""
+    return [{"lifecycle_id": str(uuid.uuid4()), "state": "ACTIVE"} for _ in range(n)]
+
+
+async def test_create_lifecycle_noop_at_max_concurrent_one_rejects_second(caplog):
+    """No-op proof: at the default max_concurrent=1, one existing non-CLOSED row
+    rejects the second entry — observably identical to today's existence reject."""
+    caplog.set_level(logging.INFO)
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=_non_closed(1))
+    sm = StateMachine(db=db, ib=ib, max_concurrent=1)  # PR-B default is 3; pin 1 here
+
+    with pytest.raises(InvariantViolationError, match="non-CLOSED lifecycle already exists"):
+        await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG)
+
+    db.insert_lifecycle.assert_not_awaited()
+    assert any("[STATE] MNQM6: entry gated — 1/1 concurrent" in m for m in caplog.messages)
+
+
+async def test_create_lifecycle_allows_up_to_max_concurrent():
+    """At max_concurrent=3, an entry with 2 existing non-CLOSED rows is ALLOWED
+    (2 < 3) — the count gate, not a bare existence check."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=_non_closed(2))
+    db.insert_lifecycle = AsyncMock(return_value=[_idle_insert_row()])
+    sm = StateMachine(db=db, ib=ib, max_concurrent=3)
+
+    lc = await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG)
+
+    assert lc.state == State.IDLE.value
+    db.insert_lifecycle.assert_awaited_once()
+
+
+async def test_create_lifecycle_rejects_the_max_plus_one_th():
+    """At max_concurrent=3, the 4th entry (3 existing) is rejected — no insert."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=_non_closed(3))
+    sm = StateMachine(db=db, ib=ib, max_concurrent=3)
+
+    with pytest.raises(InvariantViolationError, match="count=3/3"):
+        await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG)
+
+    db.insert_lifecycle.assert_not_awaited()
+
+
+# --------------------------------------- PR-B — same-setup dedup + aggregate cap
+
+
+def _open_with_setup(setup_key: str, entry_qty: int = 2) -> dict:
+    """An open (ACTIVE) lifecycle row carrying ``setup_key`` in metadata, as the
+    probe would return it."""
+    return {
+        "lifecycle_id": str(uuid.uuid4()),
+        "state": "ACTIVE",
+        "entry_qty": entry_qty,
+        "metadata": {"setup_key": setup_key},
+    }
+
+
+async def test_create_lifecycle_distinct_setups_stack_to_max_concurrent():
+    """Two DISTINCT setups stack: at max_concurrent=3, a 3rd distinct-setup entry
+    (2 already open, different keys) is ALLOWED and inserts — concurrency is ON."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(
+        return_value=[
+            _open_with_setup("MNQM6:2026-06-01T13:30:00+00:00"),
+            _open_with_setup("MNQM6:2026-06-01T13:45:00+00:00"),
+        ]
+    )
+    db.insert_lifecycle = AsyncMock(return_value=[_idle_insert_row()])
+    sm = StateMachine(db=db, ib=ib, max_concurrent=3)
+
+    lc = await sm.create_lifecycle(
+        "MNQM6",
+        "sma100_bounce",
+        Direction.LONG,
+        setup_key="MNQM6:2026-06-01T14:00:00+00:00",
+        qty=2,
+    )
+
+    assert lc.state == State.IDLE.value
+    db.insert_lifecycle.assert_awaited_once()
+    # The new setup_key is persisted in metadata (the dedup backstop column).
+    payload = db.insert_lifecycle.await_args.args[0]
+    assert payload["metadata"]["setup_key"] == "MNQM6:2026-06-01T14:00:00+00:00"
+
+
+async def test_create_lifecycle_same_setup_deduped_in_lock(caplog):
+    """Same-setup, in-lock probe path: an open lifecycle already carries this
+    setup_key (the sibling entry path took this bar) → reject BEFORE any insert,
+    so no second bracket. Count gate would otherwise pass (1 < 3)."""
+    caplog.set_level(logging.INFO)
+    key = "MNQM6:2026-06-01T13:30:00+00:00"
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=[_open_with_setup(key)])
+    sm = StateMachine(db=db, ib=ib, max_concurrent=3)
+
+    with pytest.raises(InvariantViolationError, match="same-setup"):
+        await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG, setup_key=key, qty=2)
+
+    db.insert_lifecycle.assert_not_awaited()
+    assert any(f"entry deduped — same setup {key} already open" in m for m in caplog.messages)
+
+
+async def test_create_lifecycle_same_setup_deduped_via_db_409():
+    """Same-setup, DB backstop path: the in-lock probe MISSES (the racing sibling
+    has not committed yet, so the probe returns []), but the partial unique index
+    rejects the second insert with 409 → the SAME InvariantViolationError. Models
+    the cross-task race the probe alone cannot catch. No lifecycle_event written."""
+    key = "MNQM6:2026-06-01T13:30:00+00:00"
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(return_value=[])  # probe misses
+    db.insert_lifecycle = AsyncMock(side_effect=_http_409())
+    sm = StateMachine(db=db, ib=ib, max_concurrent=3)
+
+    with pytest.raises(InvariantViolationError, match="db-unique"):
+        await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG, setup_key=key, qty=2)
+
+    db.insert_lifecycle.assert_awaited_once()
+    db.insert_lifecycle_event.assert_not_awaited()
+
+
+async def test_create_lifecycle_max_plus_one_distinct_setup_rejected():
+    """The (max+1)th DISTINCT setup is still count-gated: 3 distinct-setup positions
+    open, max_concurrent=3 → a 4th distinct setup is rejected by the count gate
+    (the dedup only collapses SAME-setup duplicates, never distinct stacking)."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(
+        return_value=[_open_with_setup(f"MNQM6:2026-06-01T13:{m}:00+00:00") for m in (30, 45, 50)]
+    )
+    sm = StateMachine(db=db, ib=ib, max_concurrent=3)
+
+    with pytest.raises(InvariantViolationError, match="count=3/3"):
+        await sm.create_lifecycle(
+            "MNQM6",
+            "sma100_bounce",
+            Direction.LONG,
+            setup_key="MNQM6:2026-06-01T14:00:00+00:00",
+            qty=2,
+        )
+
+    db.insert_lifecycle.assert_not_awaited()
+
+
+async def test_create_lifecycle_aggregate_cap_rejects_even_under_max_concurrent(caplog):
+    """Aggregate cap binds independently of the count gate: max_concurrent=5 leaves
+    room by COUNT, but 7 open contracts + this 2-lot entry = 9 > cap 8 → rejected,
+    no insert. (Source = sum of entry_qty over ALL non-CLOSED lifecycles.)"""
+    caplog.set_level(logging.INFO)
+    db, ib = _make_mock_db(), _make_mock_ib()
+    # Count gate: 2 open for this (symbol, strategy) < max_concurrent 5 → passes.
+    db.select_lifecycles_non_closed_for = AsyncMock(
+        return_value=[
+            _open_with_setup("MNQM6:2026-06-01T13:30:00+00:00", entry_qty=4),
+            _open_with_setup("MNQM6:2026-06-01T13:45:00+00:00", entry_qty=3),
+        ]
+    )
+    # Aggregate source: all non-CLOSED sum entry_qty = 7.
+    db.select_lifecycles_non_closed = AsyncMock(return_value=[{"entry_qty": 4}, {"entry_qty": 3}])
+    sm = StateMachine(db=db, ib=ib, max_concurrent=5, aggregate_contract_cap=8)
+
+    with pytest.raises(InvariantViolationError, match="aggregate contract cap exceeded"):
+        await sm.create_lifecycle(
+            "MNQM6",
+            "sma100_bounce",
+            Direction.LONG,
+            setup_key="MNQM6:2026-06-01T14:00:00+00:00",
+            qty=2,
+        )
+
+    db.insert_lifecycle.assert_not_awaited()
+    assert any("entry gated — aggregate cap 9/8 contracts" in m for m in caplog.messages)
+
+
+async def test_create_lifecycle_under_aggregate_cap_inserts():
+    """Under the cap (4 open + 2 = 6 ≤ 8), the aggregate check passes and inserts —
+    the cap is a backstop, not a brake on normal stacking."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.select_lifecycles_non_closed_for = AsyncMock(
+        return_value=[_open_with_setup("MNQM6:2026-06-01T13:30:00+00:00", entry_qty=4)]
+    )
+    db.select_lifecycles_non_closed = AsyncMock(return_value=[{"entry_qty": 4}])
+    db.insert_lifecycle = AsyncMock(return_value=[_idle_insert_row()])
+    sm = StateMachine(db=db, ib=ib, max_concurrent=5, aggregate_contract_cap=8)
+
+    lc = await sm.create_lifecycle(
+        "MNQM6",
+        "sma100_bounce",
+        Direction.LONG,
+        setup_key="MNQM6:2026-06-01T14:00:00+00:00",
+        qty=2,
+    )
+
+    assert lc.state == State.IDLE.value
+    db.insert_lifecycle.assert_awaited_once()
+
+
+async def test_create_lifecycle_aggregate_cap_disabled_when_zero():
+    """aggregate_contract_cap=0 disables the check (and skips the all-open query)
+    entirely — the PR-A inert sentinel still works."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    db.insert_lifecycle = AsyncMock(return_value=[_idle_insert_row()])
+    sm = StateMachine(db=db, ib=ib, max_concurrent=3, aggregate_contract_cap=0)
+
+    await sm.create_lifecycle("MNQM6", "sma100_bounce", Direction.LONG, setup_key="k", qty=999)
+
+    db.insert_lifecycle.assert_awaited_once()
+    db.select_lifecycles_non_closed.assert_not_awaited()
+
+
+# ---------------------------------------------------------------- event + identity
+
+
+async def test_transition_inserts_lifecycle_event_row():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.IDLE)
+
+    await sm.transition(lc, State.ENTERING, reason="entry_submitted", entry_order_id=42)
+
+    db.insert_lifecycle_event.assert_awaited_once()
+    event_payload = db.insert_lifecycle_event.await_args.args[0]
+    assert event_payload["lifecycle_id"] == lc.lifecycle_id
+    assert event_payload["from_state"] == "IDLE"
+    assert event_payload["to_state"] == "ENTERING"
+    assert event_payload["reason"] == "entry_submitted"
+
+
+async def test_transition_preserves_lifecycle_id_across_states():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.IDLE)
+    original_id = lc.lifecycle_id
+
+    lc = await sm.transition(lc, State.ENTERING, reason="entry_submitted", entry_order_id=42)
+    lc = await sm.transition(
+        lc,
+        State.ACTIVE,
+        reason="entry_filled",
+        entry_qty=2,
+        entry_price=17500.25,
+        entry_filled_at=ENTRY_FILLED,
+    )
+    lc = await sm.transition(lc, State.EXITING, reason="exit_submitted", exit_order_id=10002)
+
+    assert lc.lifecycle_id == original_id
+    # update_lifecycle called once per transition with the stable id.
+    for call in db.update_lifecycle.await_args_list:
+        assert call.args[0] == original_id
+
+
+async def test_transition_update_payload_only_contains_state_and_field_updates():
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.IDLE)
+
+    await sm.transition(lc, State.ENTERING, reason="entry_submitted", entry_order_id=42)
+
+    update_call = db.update_lifecycle.await_args
+    assert update_call.args[0] == lc.lifecycle_id
+    assert update_call.args[1] == {"state": "ENTERING", "entry_order_id": 42}
+
+
+# ------------------------------------------------- PR-2 — persist_highest (durable)
+
+
+async def test_persist_highest_merges_into_metadata_without_clobbering():
+    """persist_highest PATCHes metadata.highest_price (not a state transition) and
+    preserves any other metadata keys; the in-memory lifecycle is updated too."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.ACTIVE, metadata={"foo": "bar"})
+
+    await sm.persist_highest(lc, 20120.5)
+
+    db.update_lifecycle.assert_awaited_once()
+    lifecycle_id_arg, updates = db.update_lifecycle.await_args.args
+    assert lifecycle_id_arg == lc.lifecycle_id
+    assert updates == {"metadata": {"foo": "bar", "highest_price": 20120.5}}
+    assert lc.metadata["highest_price"] == 20120.5  # in-memory cache updated
+
+
+# ---------------------------------------------- STABILIZE-3 — persist_stop_price
+
+
+async def test_persist_stop_price_patches_stop_column_and_updates_cache():
+    """persist_stop_price PATCHes the stop_price column (not a state transition) so the
+    reconciler's leg-heal reads the ratcheted level; the in-memory lifecycle updates too."""
+    db, ib = _make_mock_db(), _make_mock_ib()
+    sm = StateMachine(db=db, ib=ib)
+    lc = _make_lifecycle(State.ACTIVE, stop_price=19925.0)
+
+    await sm.persist_stop_price(lc, 20050.0)
+
+    db.update_lifecycle.assert_awaited_once()
+    lifecycle_id_arg, updates = db.update_lifecycle.await_args.args
+    assert lifecycle_id_arg == lc.lifecycle_id
+    assert updates == {"stop_price": 20050.0}
+    assert lc.stop_price == 20050.0  # in-memory cache updated

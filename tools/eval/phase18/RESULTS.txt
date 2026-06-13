@@ -1,0 +1,76 @@
+============================================================================================
+PHASE-18 — TF FOUNDATIONAL EDGE AUDIT (real gated strategy vs the pre-registered bar)
+============================================================================================
+
+WHAT RAN: the LIVE prod entry+exit code (src.strategy.evaluate_gates / _regime_ok +
+  src.execution.trail_manager), driven bar-by-bar over the saved tape. NOT a re-impl.
+  Live config (verified vs container 2026-06-11): exit_mode=trailing, regime gate ON,
+  stop 75 / lock-in 50 / trail 150 / hard-ceiling 1000 / cooldown 10. 1 contract.
+
+PRE-REGISTERED BAR (identical to Phase-16/17 — gates.py, committed before results):
+  TRAIN   : PF >= 1.3, exp/ct >= $5, n >= 200, profitable EACH train year
+  HOLDOUT : PF >= 1.3, exp/ct >= $5, each holdout year +, PF >= 0.75 x train PF
+  DEFLATE : Bonferroni haircut over CUMULATIVE 28 trials (prior 27 + this 1); DSR target >= 0.95
+
+TAPE    : 2024-03-13 00:01:00+00:00 -> 2026-06-02 23:43:00+00:00  (786,236 1-min NQ bars, point-identical to MNQ)
+SPLIT   : TRAIN [2024-03-01 .. 2025-09-01) | HOLDOUT [2025-09-01 .. 2026-07-01)
+          (split-once, by ENTRY time; same boundary as Phase-16/17)
+ROLL    : 8 Panama quarterly boundaries back-adjusted
+COSTS   : $0.62/side commission + 1-tick adverse slippage on entry & every exit fill
+          (pessimistic); engine fills entry at signal-bar close, stop AT stop intrabar.
+
+--------------------------------------------------------------------------------------------
+CLAIM (a) — DOES THE GATED STRATEGY CLEAR THE BAR?
+--------------------------------------------------------------------------------------------
+  GATED full tape        n=1486  PF=1.176  exp/ct=$9.79     net=$14,549      win=62.8% maxDD=$-2,175    
+      per-year: 2024:+2,202(445) 2025:+7,623(650) 2026:+4,724(391)
+  GATED train            n=894   PF=1.126  exp/ct=$7.33     net=$6,549       win=61.2% maxDD=$-2,175    
+      per-year: 2024:+2,202(445) 2025:+4,348(449)
+  GATED holdout          n=592   PF=1.258  exp/ct=$13.51    net=$7,999       win=65.2% maxDD=$-1,623    
+      per-year: 2025:+3,275(201) 2026:+4,724(391)
+
+  TRAIN GATE checks:
+     - PF 1.126 < 1.3
+     - exp/ct $7.33 >= $5.0
+     - n 894 >= 200
+     - each-year OK [2024:+2,202 2025:+4,348]
+  >>> TRAIN GATE: FAIL
+  HOLDOUT: NOT touched — train gate failed, holdout preserved (protocol step 2).
+  DEFLATION cross-check anyway: Bonferroni haircut p = 1 over 28 cumulative trials
+  (Note: the full Deflated Sharpe needs a within-batch Sharpe-variance pool; TF's
+   live config is a SINGLE pre-registered strategy, not a grid winner, so the
+   Bonferroni haircut is the appropriate standalone multiple-testing deflator here.)
+
+  ==> CLAIM (a) VERDICT: GATED strategy DOES NOT CLEAR the pre-registered bar.
+
+--------------------------------------------------------------------------------------------
+CLAIM (b) — WHAT DOES THE GATE ADD? (gated vs ungated, same entry+exit)
+--------------------------------------------------------------------------------------------
+  b1) Full-system P&L with the gate ON vs OFF (the gate's net effect on the live bot):
+  GATED (gate ON)        n=1486  PF=1.176  exp/ct=$9.79     net=$14,549      win=62.8% maxDD=$-2,175    
+      per-year: 2024:+2,202(445) 2025:+7,623(650) 2026:+4,724(391)
+  UNGATED (gate OFF)     n=2723  PF=1.121  exp/ct=$7.08     net=$19,289      win=61.0% maxDD=$-3,847    
+      per-year: 2024:+6,652(824) 2025:+8,025(1239) 2026:+4,612(660)
+      delta(net) gated-ungated = $-4,740  (positive => the gate REMOVED net-losing trades)
+
+  b2) UNGATED trades partitioned by the REAL regime state at entry (the live
+      _regime_ok on the same 7000-bar tail) — isolates entry-edge from gate-edge:
+  above-trend entries    n=1399  PF=1.204  exp/ct=$11.22    net=$15,703      win=63.3% maxDD=$-2,012    
+      per-year: 2024:+3,366(417) 2025:+6,622(609) 2026:+5,714(373)
+  below-trend entries    n=1324  PF=1.044  exp/ct=$2.71     net=$3,586       win=58.6% maxDD=$-4,712    
+      per-year: 2024:+3,286(407) 2025:+1,403(630) 2026:--1,102(287)
+
+  ==> CLAIM (b) READ: THE ENTRY (partly): above-trend entries carry the P&L; the gate's removed cohort isn't strongly negative, so the gate trims variance more than loss.
+
+============================================================================================
+BLUNT VERDICT
+============================================================================================
+TF's gated strategy DOES NOT clear the pre-registered bar (PF>=1.30 / exp>=$5 / n>=200
+/ each-year+ / holdout-degradation / deflation) — the SAME bar that returned NONE for
+every Phase-15/16/17 candidate. By its own honest protocol, TF's foundational strategy
+has NO demonstrated edge over the 27-month tape. That is the finding, however
+uncomfortable: the gate correctly removes below-trend losers, but the surviving
+above-trend entry does not, on this evidence, pay enough to clear the bar after real
+costs. (Forward edge in the live regime is the one thing no backtest can settle — but
+nothing here earns the benefit of the doubt that everything else was denied.)
+============================================================================================

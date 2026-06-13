@@ -1,0 +1,171 @@
+# TradeFlow Phase 1 — IB Gateway paper-mode container.
+#
+# Image: gnzsnz/ib-gateway (community, env-driven config, runs IBC under the hood).
+# Pinned to ":stable" channel — IB Gateway 10.45.1f / IBC 3.23.0 as of 2026-05-20.
+# Bump intentionally. Do NOT use ":latest" — it tracks the IB Gateway latest channel
+# which can ship breaking changes from IBKR mid-week.
+#
+# Loopback bind on 127.0.0.1:4002 — the gateway must not be reachable from outside
+# the VPS. Future orchestrator containers connect through the docker network at
+# host `ib-gateway:4002`, not via the published port.
+#
+# Internal port mapping per the gnzsnz README:
+#   container 4004 (paper via socat) -> host 4002
+#   container 4003 (live   via socat) -> host 4001  (not exposed in paper-only PR 2)
+
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: tradeflow-ib-gateway
+    restart: unless-stopped
+    env_file:
+      - ${TRADEFLOW_SECRETS_DIR:-/home/tradeflow/.tradeflow-secrets}/.env
+    environment:
+      # Map TradeFlow IBKR_* secrets to the gnzsnz image's canonical TWS_* names.
+      TWS_USERID: ${IBKR_USERNAME}
+      TWS_PASSWORD: ${IBKR_PASSWORD}
+      TRADING_MODE: paper
+      TWOFA_TIMEOUT_ACTION: ${TWOFA_TIMEOUT_ACTION:-exit}
+      RELOGIN_AFTER_TWOFA_TIMEOUT: ${RELOGIN_AFTER_TWOFA_TIMEOUT:-yes}
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:30 PM}
+      TIME_ZONE: ${TIME_ZONE:-Etc/UTC}
+      READ_ONLY_API: ${READ_ONLY_API:-no}
+      BYPASS_WARNING: ${BYPASS_WARNING:-yes}
+      EXISTING_SESSION_DETECTED_ACTION: primary
+    ports:
+      - "127.0.0.1:4002:4004"
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/4004' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    # W-S14.2 Track 6a — cap container log growth (preventive disk hygiene).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - tradeflow-net
+
+  tradeflow-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # W-S15.3 Track E — pass the deployed commit through to the image so the
+      # readiness block reports what's actually running. Set at build time:
+      # `GIT_COMMIT=$(git rev-parse HEAD) docker compose build tradeflow-app`.
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    container_name: tradeflow-app
+    restart: unless-stopped
+    env_file:
+      - ${TRADEFLOW_SECRETS_DIR:-/home/tradeflow/.tradeflow-secrets}/.env
+    environment:
+      # Container-routing constants — must NOT be interpolated from .env. The
+      # host-side .env carries IBKR_HOST=127.0.0.1 / IBKR_PORT=4002 for HOST
+      # scripts (probes, smoke tests run on the VPS itself); inside the docker
+      # network the orchestrator must dial the service name `ib-gateway` on the
+      # container-internal port 4004 (the host-mapped 4002 is not visible here).
+      # `${IBKR_HOST:-ib-gateway}` was a trap — the `:-default` never fires
+      # because the variable IS set in .env, just to the host-side value.
+      IBKR_HOST: ib-gateway
+      IBKR_PORT: "4004"
+      ORCH_HEALTHCHECK_INTERVAL_SEC: ${ORCH_HEALTHCHECK_INTERVAL_SEC:-60}
+      ORCH_LOG_LEVEL: ${ORCH_LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      # Exit mode for new entries. "trailing" = standalone post-fill native TRAIL
+      # that ratchets behind the high-water mark (the SeanBot V3 edge); "fixed" =
+      # legacy {STP -75, LMT +150} OCA bracket. Declared here (a non-secret,
+      # repo-tracked injection point) so it overrides the env_file and is NOT in
+      # the secrets file. Recovered/already-bracketed positions keep their existing
+      # bracket — the trailing handoff fires only on a NEW entry fill.
+      EXIT_MODE: ${EXIT_MODE:-trailing}
+      # Parity override — TF's W-S14.2 live calibration matched SeanBot's actual
+      # entries at 2.0pt (8/12) vs strict close>open (2/12). risk_params default
+      # stays 0.0 (source-faithful); 2.0 is the live-parity value. Tune via
+      # /divergence agreement.
+      BULLISH_TOLERANCE: ${BULLISH_TOLERANCE:-2.0}
+      # Concurrency ON (operator-approved, N=2) — PR-B merged the max_concurrent
+      # default of 3 into config; pin to 2 here (repo-tracked injection point,
+      # overrides env_file + the config default) so up to 2 distinct-setup
+      # positions stack. The setup-key dedup Supabase index
+      # (lifecycles_one_open_per_setup) is the DB backstop — it allows distinct
+      # setups to stack while collapsing two entry paths on the same bar to one
+      # bracket (migration 20260605000000 dropped the prior ≤1 index).
+      # Literal (not ${...:-1}) so it cannot be silently shadowed by .env (§0.5.159).
+      MAX_CONCURRENT: "2"
+      # Kill-switch cluster mode ON — N correlated stop-outs whose entries fall in
+      # one cluster window count as ONE loss event before warn@6 / halt@10, so a
+      # concurrent book's correlated cluster does not trip the single-position-tuned
+      # halt (the §4 kill-switch trap). MUST be ON whenever N>1. Plumbed by
+      # PR #126 (accounting) + PR #130 (real entry-bar timestamps). Literal so .env
+      # cannot shadow it (§0.5.159).
+      KILL_SWITCH_CLUSTER_MODE: "true"
+      # Regime gate ON — block LONG entries when price <= 30-min EMA200 (SeanBot C1,
+      # strategy._regime_ok). Sim on 27 live lifecycles: cuts net loss ~50% by
+      # screening the sustained down-leg; SB shows no profitable below-EMA200 cohort.
+      # Literal (not ${...}) so .env cannot shadow it (§0.5.159). Reversible: delete
+      # this line or set "false" + force-recreate.
+      REGIME_GATE_ENABLED: "true"
+      # SB-trigger replicate path OFF (operator-approved, Session 26). The PR #107
+      # "_maybe_enter_on_seanbot" path copies a SeanBot LONG into a TF entry and
+      # dispatches straight to _handle_trade_signal — it BYPASSES the regime gate
+      # (strategy._regime_ok), so it entered below-trend −EV trades the gate is
+      # there to block (PART-0: 17/17 SB entries since 06-05 were below-trend) and
+      # tripped the 06-10 multi-lot order bugs. Turning it OFF strictly REMOVES a
+      # trade path (risk-direction safer): TF then trades NOTHING below-trend.
+      # Literal (not ${...}) so .env cannot shadow it (§0.5.159). Reversible: set
+      # "true" or delete this line + force-recreate.
+      SB_TRIGGER_ENABLED: "false"
+    depends_on:
+      - ib-gateway
+    ports:
+      - "127.0.0.1:8080:8080"
+    # W-S14.2 Track 6a — cap container log growth (preventive disk hygiene).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - tradeflow-net
+
+  # PR-D3b — SeanBot Telegram signal capture. Separate service so a listener
+  # crash never impacts the trading orchestrator. Reuses the tradeflow-app
+  # image (same Dockerfile/context) so telethon installs once; `build:` lets
+  # `docker compose build telegram-listener` work as documented in Task F.
+  telegram-listener:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    image: tradeflow-tradeflow-app:latest
+    container_name: tradeflow-telegram-listener
+    command: python -m src.listeners.telegram_listener
+    restart: unless-stopped
+    env_file:
+      - ${TRADEFLOW_SECRETS_DIR:-/home/tradeflow/.tradeflow-secrets}/.env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      ORCH_LOG_LEVEL: ${ORCH_LOG_LEVEL:-INFO}
+    # W-S14.2 Track 6d — the listener runs a different entrypoint than main.py,
+    # so it permanently inherits the app's `main.py in /proc/1/cmdline` HEALTHCHECK
+    # as `unhealthy` (cosmetic; RestartCount=0 confirms it's not a real fault).
+    # Disable it so `docker ps` reflects true state.
+    healthcheck:
+      disable: true
+    # W-S14.2 Track 6a — cap container log growth (preventive disk hygiene).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - tradeflow-net
+
+networks:
+  tradeflow-net:
+    driver: bridge

@@ -1,0 +1,2019 @@
+{
+  "phase": "20b-funding-carry",
+  "verdict": "NONE",
+  "research_only": true,
+  "venue": "Binance USD\u24c8-M (data.binance.vision); funding interval 8h",
+  "universe": {
+    "coins": [
+      "BTC",
+      "ETH",
+      "SOL",
+      "XRP",
+      "BNB",
+      "DOGE",
+      "AVAX",
+      "LINK"
+    ],
+    "majors": [
+      "BTC",
+      "ETH"
+    ],
+    "alts": [
+      "SOL",
+      "XRP",
+      "BNB",
+      "DOGE",
+      "AVAX",
+      "LINK"
+    ]
+  },
+  "split": {
+    "train": [
+      "2020-01-01",
+      "2023-12-31"
+    ],
+    "holdout": [
+      "2024-01-01",
+      "2026-05-31"
+    ],
+    "episodes_built_within_period": true
+  },
+  "costs": {
+    "taker_fee_per_fill": 0.0005,
+    "fills_per_round_trip": 4,
+    "round_trip_taker_frac": 0.002,
+    "slip_per_fill_major": 0.0002,
+    "slip_per_fill_alt": 0.0005,
+    "notional_usd_per_leg": 10000.0,
+    "rule_C_breakeven_horizon_intervals": 21,
+    "source": "Binance fee schedule: USD\u24c8-M taker 0.04% / spot taker 0.10% std (0.075% BNB; lower VIP) -> 0.05% conservative blended retail; cost-cliff bounds it"
+  },
+  "deflator": {
+    "prior_trials": 40,
+    "in_eval_variants": 30,
+    "n_trials": 70,
+    "sr_variance_pool": 0.096767,
+    "sr0_expected_max": 0.74734,
+    "dsr_champion": 0.0,
+    "bonferroni_p_champion": 1.0
+  },
+  "champion": {
+    "variant": "C:MAJORS",
+    "rule": "C",
+    "scope": "MAJORS",
+    "selected_on": "max train(spike-included) PF among MAJORS/ALL x {B,C}, n>=200",
+    "train_incl": {
+      "n": 265,
+      "pf": 1.417,
+      "exp_per_ct": 7.35,
+      "net_usd": 1948.36,
+      "win_rate": 0.2038,
+      "sr_per_trade": 0.08188,
+      "max_dd_usd": -995.28,
+      "per_year": {
+        "2020": 387.28,
+        "2021": 2211.34,
+        "2023": -650.26
+      }
+    },
+    "train_strip": {
+      "n": 314,
+      "pf": 0.002,
+      "exp_per_ct": -25.69,
+      "net_usd": -8065.59,
+      "win_rate": 0.0032,
+      "sr_per_trade": -5.04546,
+      "max_dd_usd": -8038.59,
+      "per_year": {
+        "2020": -3127.16,
+        "2021": -4046.95,
+        "2023": -891.48
+      }
+    },
+    "holdout_incl": {
+      "n": 70,
+      "pf": 0.45,
+      "exp_per_ct": -11.18,
+      "net_usd": -782.81,
+      "win_rate": 0.1143,
+      "sr_per_trade": -0.24224,
+      "max_dd_usd": -966.02,
+      "per_year": {
+        "2024": -782.81
+      }
+    },
+    "holdout_strip": {
+      "n": 105,
+      "pf": 0.0,
+      "exp_per_ct": -24.89,
+      "net_usd": -2613.0,
+      "win_rate": 0.0,
+      "sr_per_trade": -5.67733,
+      "max_dd_usd": -2587.71,
+      "per_year": {
+        "2024": -2613.0
+      }
+    },
+    "train_gate": [
+      "PF 1.417 >= 1.3",
+      "exp/ct $7.35 >= $5.0",
+      "n 265 >= 200",
+      "each-year FAIL [2020:+387 2021:+2,211 2023:--650]"
+    ],
+    "train_gate_pass": false,
+    "holdout_gate_strip": "SEALED (train failed)",
+    "holdout_gate_strip_pass": false,
+    "holdout_strip_each_year_positive": false
+  },
+  "matrix": {
+    "A:BTC": {
+      "incl": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 5892.09,
+          "net_usd": 5892.09,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 5892.09
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1736.06,
+          "net_usd": 1736.06,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1736.06
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 2358.53,
+          "net_usd": 2358.53,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 2358.53
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1345.31,
+          "net_usd": 1345.31,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1345.31
+          }
+        }
+      }
+    },
+    "A:ETH": {
+      "incl": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 7026.43,
+          "net_usd": 7026.43,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 7026.43
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1790.4,
+          "net_usd": 1790.4,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1790.4
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 2358.42,
+          "net_usd": 2358.42,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 2358.42
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1458.02,
+          "net_usd": 1458.02,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1458.02
+          }
+        }
+      }
+    },
+    "A:SOL": {
+      "incl": {
+        "train": {
+          "n": 1,
+          "pf": 0.0,
+          "exp_per_ct": -1214.38,
+          "net_usd": -1214.38,
+          "win_rate": 0.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": -1214.38
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1240.82,
+          "net_usd": 1240.82,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1240.82
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1684.04,
+          "net_usd": 1684.04,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 1684.04
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 944.23,
+          "net_usd": 944.23,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 944.23
+          }
+        }
+      }
+    },
+    "A:XRP": {
+      "incl": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 7957.34,
+          "net_usd": 7957.34,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 7957.34
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1696.02,
+          "net_usd": 1696.02,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1696.02
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 2558.26,
+          "net_usd": 2558.26,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 2558.26
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1267.53,
+          "net_usd": 1267.53,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1267.53
+          }
+        }
+      }
+    },
+    "A:BNB": {
+      "incl": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 656.25,
+          "net_usd": 656.25,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 656.25
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": 0.0,
+          "exp_per_ct": -506.53,
+          "net_usd": -506.53,
+          "win_rate": 0.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": -506.53
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 215.11,
+          "net_usd": 215.11,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 215.11
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": 0.0,
+          "exp_per_ct": -103.84,
+          "net_usd": -103.84,
+          "win_rate": 0.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": -103.84
+          }
+        }
+      }
+    },
+    "A:DOGE": {
+      "incl": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 5812.99,
+          "net_usd": 5812.99,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 5812.99
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1854.65,
+          "net_usd": 1854.65,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1854.65
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 2431.58,
+          "net_usd": 2431.58,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 2431.58
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1292.41,
+          "net_usd": 1292.41,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1292.41
+          }
+        }
+      }
+    },
+    "A:AVAX": {
+      "incl": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 2166.7,
+          "net_usd": 2166.7,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 2166.7
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1016.2,
+          "net_usd": 1016.2,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1016.2
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 713.3,
+          "net_usd": 713.3,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 713.3
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 624.39,
+          "net_usd": 624.39,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 624.39
+          }
+        }
+      }
+    },
+    "A:LINK": {
+      "incl": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 6838.69,
+          "net_usd": 6838.69,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 6838.69
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1976.88,
+          "net_usd": 1976.88,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1976.88
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 2616.33,
+          "net_usd": 2616.33,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 2616.33
+          }
+        },
+        "holdout": {
+          "n": 1,
+          "pf": Infinity,
+          "exp_per_ct": 1574.84,
+          "net_usd": 1574.84,
+          "win_rate": 1.0,
+          "sr_per_trade": 0.0,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 1574.84
+          }
+        }
+      }
+    },
+    "A:MAJORS": {
+      "incl": {
+        "train": {
+          "n": 2,
+          "pf": Infinity,
+          "exp_per_ct": 6459.26,
+          "net_usd": 12918.52,
+          "win_rate": 1.0,
+          "sr_per_trade": 8.05295,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 12918.52
+          }
+        },
+        "holdout": {
+          "n": 2,
+          "pf": Infinity,
+          "exp_per_ct": 1763.23,
+          "net_usd": 3526.46,
+          "win_rate": 1.0,
+          "sr_per_trade": 45.89291,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 3526.46
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 2,
+          "pf": Infinity,
+          "exp_per_ct": 2358.47,
+          "net_usd": 4716.94,
+          "win_rate": 1.0,
+          "sr_per_trade": 30906.55684,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 4716.94
+          }
+        },
+        "holdout": {
+          "n": 2,
+          "pf": Infinity,
+          "exp_per_ct": 1401.67,
+          "net_usd": 2803.33,
+          "win_rate": 1.0,
+          "sr_per_trade": 17.58752,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2026": 2803.33
+          }
+        }
+      }
+    },
+    "A:ALL": {
+      "incl": {
+        "train": {
+          "n": 8,
+          "pf": 29.933,
+          "exp_per_ct": 4392.01,
+          "net_usd": 35136.12,
+          "win_rate": 0.875,
+          "sr_per_trade": 1.29718,
+          "max_dd_usd": -1214.38,
+          "per_year": {
+            "2023": 35136.12
+          }
+        },
+        "holdout": {
+          "n": 8,
+          "pf": 22.33,
+          "exp_per_ct": 1350.56,
+          "net_usd": 10804.51,
+          "win_rate": 0.875,
+          "sr_per_trade": 1.65166,
+          "max_dd_usd": -506.53,
+          "per_year": {
+            "2026": 10804.51
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 8,
+          "pf": Infinity,
+          "exp_per_ct": 1866.95,
+          "net_usd": 14935.56,
+          "win_rate": 1.0,
+          "sr_per_trade": 2.02764,
+          "max_dd_usd": 0.0,
+          "per_year": {
+            "2023": 14935.56
+          }
+        },
+        "holdout": {
+          "n": 8,
+          "pf": 81.919,
+          "exp_per_ct": 1050.36,
+          "net_usd": 8402.9,
+          "win_rate": 0.875,
+          "sr_per_trade": 1.89134,
+          "max_dd_usd": -103.84,
+          "per_year": {
+            "2026": 8402.9
+          }
+        }
+      }
+    },
+    "B:BTC": {
+      "incl": {
+        "train": {
+          "n": 281,
+          "pf": 0.769,
+          "exp_per_ct": -5.55,
+          "net_usd": -1560.78,
+          "win_rate": 0.0747,
+          "sr_per_trade": -0.03468,
+          "max_dd_usd": -4809.51,
+          "per_year": {
+            "2020": 572.05,
+            "2021": 2247.97,
+            "2022": -3226.2,
+            "2023": -1154.6
+          }
+        },
+        "holdout": {
+          "n": 190,
+          "pf": 0.24,
+          "exp_per_ct": -18.63,
+          "net_usd": -3539.69,
+          "win_rate": 0.0474,
+          "sr_per_trade": -0.35124,
+          "max_dd_usd": -4156.65,
+          "per_year": {
+            "2024": -140.59,
+            "2025": -1852.91,
+            "2026": -1546.19
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 386,
+          "pf": 0.065,
+          "exp_per_ct": -22.12,
+          "net_usd": -8539.26,
+          "win_rate": 0.0596,
+          "sr_per_trade": -1.52031,
+          "max_dd_usd": -8527.61,
+          "per_year": {
+            "2020": -1868.25,
+            "2021": -2236.9,
+            "2022": -2973.15,
+            "2023": -1460.96
+          }
+        },
+        "holdout": {
+          "n": 210,
+          "pf": 0.089,
+          "exp_per_ct": -21.76,
+          "net_usd": -4568.64,
+          "win_rate": 0.0524,
+          "sr_per_trade": -1.15756,
+          "max_dd_usd": -4697.94,
+          "per_year": {
+            "2024": -1169.54,
+            "2025": -1852.91,
+            "2026": -1546.19
+          }
+        }
+      }
+    },
+    "B:ETH": {
+      "incl": {
+        "train": {
+          "n": 269,
+          "pf": 0.995,
+          "exp_per_ct": -0.12,
+          "net_usd": -31.77,
+          "win_rate": 0.0595,
+          "sr_per_trade": -0.00052,
+          "max_dd_usd": -5354.27,
+          "per_year": {
+            "2020": 1360.94,
+            "2021": 3615.64,
+            "2022": -4059.94,
+            "2023": -948.41
+          }
+        },
+        "holdout": {
+          "n": 204,
+          "pf": 0.255,
+          "exp_per_ct": -18.7,
+          "net_usd": -3814.89,
+          "win_rate": 0.0294,
+          "sr_per_trade": -0.32082,
+          "max_dd_usd": -4621.59,
+          "per_year": {
+            "2024": 185.29,
+            "2025": -2456.4,
+            "2026": -1543.78
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 398,
+          "pf": 0.074,
+          "exp_per_ct": -21.72,
+          "net_usd": -8646.28,
+          "win_rate": 0.0628,
+          "sr_per_trade": -1.34407,
+          "max_dd_usd": -8639.44,
+          "per_year": {
+            "2020": -1294.85,
+            "2021": -2188.53,
+            "2022": -3885.21,
+            "2023": -1277.68
+          }
+        },
+        "holdout": {
+          "n": 225,
+          "pf": 0.126,
+          "exp_per_ct": -21.52,
+          "net_usd": -4841.16,
+          "win_rate": 0.0444,
+          "sr_per_trade": -0.86228,
+          "max_dd_usd": -4944.02,
+          "per_year": {
+            "2024": -554.63,
+            "2025": -2742.75,
+            "2026": -1543.78
+          }
+        }
+      }
+    },
+    "B:SOL": {
+      "incl": {
+        "train": {
+          "n": 266,
+          "pf": 0.519,
+          "exp_per_ct": -18.72,
+          "net_usd": -4980.44,
+          "win_rate": 0.0865,
+          "sr_per_trade": -0.13286,
+          "max_dd_usd": -8017.89,
+          "per_year": {
+            "2020": -397.62,
+            "2021": 2463.27,
+            "2022": -3908.21,
+            "2023": -3137.88
+          }
+        },
+        "holdout": {
+          "n": 319,
+          "pf": 0.086,
+          "exp_per_ct": -34.85,
+          "net_usd": -11117.19,
+          "win_rate": 0.0157,
+          "sr_per_trade": -0.72896,
+          "max_dd_usd": -11886.54,
+          "per_year": {
+            "2024": -1551.39,
+            "2025": -6857.16,
+            "2026": -2708.64
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 339,
+          "pf": 0.158,
+          "exp_per_ct": -32.23,
+          "net_usd": -10925.7,
+          "win_rate": 0.056,
+          "sr_per_trade": -0.3237,
+          "max_dd_usd": -10941.07,
+          "per_year": {
+            "2020": -813.48,
+            "2021": -2940.67,
+            "2022": -3518.41,
+            "2023": -3653.14
+          }
+        },
+        "holdout": {
+          "n": 333,
+          "pf": 0.021,
+          "exp_per_ct": -36.58,
+          "net_usd": -12182.21,
+          "win_rate": 0.024,
+          "sr_per_trade": -2.81625,
+          "max_dd_usd": -12235.35,
+          "per_year": {
+            "2024": -2653.8,
+            "2025": -6819.76,
+            "2026": -2708.64
+          }
+        }
+      }
+    },
+    "B:XRP": {
+      "incl": {
+        "train": {
+          "n": 332,
+          "pf": 0.632,
+          "exp_per_ct": -13.29,
+          "net_usd": -4410.82,
+          "win_rate": 0.0482,
+          "sr_per_trade": -0.05979,
+          "max_dd_usd": -10111.01,
+          "per_year": {
+            "2020": 1602.11,
+            "2021": 3651.59,
+            "2022": -6153.74,
+            "2023": -3510.78
+          }
+        },
+        "holdout": {
+          "n": 294,
+          "pf": 0.097,
+          "exp_per_ct": -33.61,
+          "net_usd": -9881.67,
+          "win_rate": 0.017,
+          "sr_per_trade": -0.69118,
+          "max_dd_usd": -10618.03,
+          "per_year": {
+            "2024": -1054.13,
+            "2025": -5580.09,
+            "2026": -3247.45
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 446,
+          "pf": 0.04,
+          "exp_per_ct": -34.55,
+          "net_usd": -15410.14,
+          "win_rate": 0.0404,
+          "sr_per_trade": -1.74772,
+          "max_dd_usd": -15370.14,
+          "per_year": {
+            "2020": -2216.79,
+            "2021": -3245.58,
+            "2022": -5912.24,
+            "2023": -4035.52
+          }
+        },
+        "holdout": {
+          "n": 304,
+          "pf": 0.026,
+          "exp_per_ct": -35.52,
+          "net_usd": -10796.84,
+          "win_rate": 0.023,
+          "sr_per_trade": -2.43197,
+          "max_dd_usd": -10824.22,
+          "per_year": {
+            "2024": -1966.05,
+            "2025": -5583.34,
+            "2026": -3247.45
+          }
+        }
+      }
+    },
+    "B:BNB": {
+      "incl": {
+        "train": {
+          "n": 199,
+          "pf": 0.553,
+          "exp_per_ct": -13.61,
+          "net_usd": -2708.24,
+          "win_rate": 0.1407,
+          "sr_per_trade": -0.18942,
+          "max_dd_usd": -3377.55,
+          "per_year": {
+            "2020": -1069.05,
+            "2021": 524.17,
+            "2022": -154.72,
+            "2023": -2008.64
+          }
+        },
+        "holdout": {
+          "n": 173,
+          "pf": 0.032,
+          "exp_per_ct": -35.24,
+          "net_usd": -6096.83,
+          "win_rate": 0.0289,
+          "sr_per_trade": -2.23602,
+          "max_dd_usd": -6059.43,
+          "per_year": {
+            "2024": -1281.74,
+            "2025": -2957.15,
+            "2026": -1857.94
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 290,
+          "pf": 0.006,
+          "exp_per_ct": -35.56,
+          "net_usd": -10311.31,
+          "win_rate": 0.0103,
+          "sr_per_trade": -3.1932,
+          "max_dd_usd": -10277.15,
+          "per_year": {
+            "2020": -3768.38,
+            "2021": -4327.78,
+            "2022": -154.72,
+            "2023": -2060.44
+          }
+        },
+        "holdout": {
+          "n": 179,
+          "pf": 0.023,
+          "exp_per_ct": -35.99,
+          "net_usd": -6442.93,
+          "win_rate": 0.0223,
+          "sr_per_trade": -2.58333,
+          "max_dd_usd": -6405.53,
+          "per_year": {
+            "2024": -1627.84,
+            "2025": -2957.15,
+            "2026": -1857.94
+          }
+        }
+      }
+    },
+    "B:DOGE": {
+      "incl": {
+        "train": {
+          "n": 278,
+          "pf": 0.528,
+          "exp_per_ct": -16.17,
+          "net_usd": -4495.53,
+          "win_rate": 0.0755,
+          "sr_per_trade": -0.14309,
+          "max_dd_usd": -6699.64,
+          "per_year": {
+            "2020": -997.05,
+            "2021": 2664.52,
+            "2022": -4196.68,
+            "2023": -1966.32
+          }
+        },
+        "holdout": {
+          "n": 291,
+          "pf": 0.104,
+          "exp_per_ct": -33.3,
+          "net_usd": -9689.05,
+          "win_rate": 0.0172,
+          "sr_per_trade": -0.66367,
+          "max_dd_usd": -10430.44,
+          "per_year": {
+            "2024": -1478.91,
+            "2025": -5300.01,
+            "2026": -2910.13
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 370,
+          "pf": 0.045,
+          "exp_per_ct": -33.28,
+          "net_usd": -12312.2,
+          "win_rate": 0.0405,
+          "sr_per_trade": -1.47573,
+          "max_dd_usd": -12272.2,
+          "per_year": {
+            "2020": -2289.41,
+            "2021": -3027.83,
+            "2022": -4008.39,
+            "2023": -2986.58
+          }
+        },
+        "holdout": {
+          "n": 310,
+          "pf": 0.018,
+          "exp_per_ct": -35.88,
+          "net_usd": -11123.38,
+          "win_rate": 0.0226,
+          "sr_per_trade": -2.95568,
+          "max_dd_usd": -11157.52,
+          "per_year": {
+            "2024": -2911.08,
+            "2025": -5302.17,
+            "2026": -2910.13
+          }
+        }
+      }
+    },
+    "B:AVAX": {
+      "incl": {
+        "train": {
+          "n": 293,
+          "pf": 0.374,
+          "exp_per_ct": -23.48,
+          "net_usd": -6879.0,
+          "win_rate": 0.0478,
+          "sr_per_trade": -0.19757,
+          "max_dd_usd": -8453.0,
+          "per_year": {
+            "2020": -643.06,
+            "2021": 1935.33,
+            "2022": -5744.9,
+            "2023": -2426.37
+          }
+        },
+        "holdout": {
+          "n": 289,
+          "pf": 0.096,
+          "exp_per_ct": -33.87,
+          "net_usd": -9788.08,
+          "win_rate": 0.0138,
+          "sr_per_trade": -0.68179,
+          "max_dd_usd": -10547.42,
+          "per_year": {
+            "2024": -1469.54,
+            "2025": -5571.54,
+            "2026": -2746.99
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 367,
+          "pf": 0.011,
+          "exp_per_ct": -35.39,
+          "net_usd": -12988.15,
+          "win_rate": 0.0218,
+          "sr_per_trade": -2.36797,
+          "max_dd_usd": -12948.15,
+          "per_year": {
+            "2020": -913.31,
+            "2021": -3305.11,
+            "2022": -5596.33,
+            "2023": -3173.41
+          }
+        },
+        "holdout": {
+          "n": 309,
+          "pf": 0.02,
+          "exp_per_ct": -36.17,
+          "net_usd": -11176.87,
+          "win_rate": 0.0162,
+          "sr_per_trade": -2.63015,
+          "max_dd_usd": -11238.36,
+          "per_year": {
+            "2024": -2880.58,
+            "2025": -5553.21,
+            "2026": -2743.08
+          }
+        }
+      }
+    },
+    "B:LINK": {
+      "incl": {
+        "train": {
+          "n": 202,
+          "pf": 0.96,
+          "exp_per_ct": -1.2,
+          "net_usd": -241.92,
+          "win_rate": 0.1238,
+          "sr_per_trade": -0.00502,
+          "max_dd_usd": -4155.56,
+          "per_year": {
+            "2020": -472.35,
+            "2021": 3525.87,
+            "2022": -2366.09,
+            "2023": -929.35
+          }
+        },
+        "holdout": {
+          "n": 264,
+          "pf": 0.104,
+          "exp_per_ct": -32.27,
+          "net_usd": -8518.88,
+          "win_rate": 0.0227,
+          "sr_per_trade": -0.69271,
+          "max_dd_usd": -9176.82,
+          "per_year": {
+            "2024": -1077.39,
+            "2025": -4812.53,
+            "2026": -2628.96
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 299,
+          "pf": 0.05,
+          "exp_per_ct": -31.73,
+          "net_usd": -9486.2,
+          "win_rate": 0.0535,
+          "sr_per_trade": -1.66661,
+          "max_dd_usd": -9446.2,
+          "per_year": {
+            "2020": -3250.67,
+            "2021": -2161.9,
+            "2022": -2586.41,
+            "2023": -1487.22
+          }
+        },
+        "holdout": {
+          "n": 279,
+          "pf": 0.029,
+          "exp_per_ct": -34.51,
+          "net_usd": -9627.13,
+          "win_rate": 0.0323,
+          "sr_per_trade": -2.22896,
+          "max_dd_usd": -9699.88,
+          "per_year": {
+            "2024": -2185.64,
+            "2025": -4812.53,
+            "2026": -2628.96
+          }
+        }
+      }
+    },
+    "B:MAJORS": {
+      "incl": {
+        "train": {
+          "n": 550,
+          "pf": 0.88,
+          "exp_per_ct": -2.9,
+          "net_usd": -1592.55,
+          "win_rate": 0.0673,
+          "sr_per_trade": -0.01485,
+          "max_dd_usd": -5354.27,
+          "per_year": {
+            "2020": 1932.99,
+            "2021": 5863.61,
+            "2022": -7286.14,
+            "2023": -2103.01
+          }
+        },
+        "holdout": {
+          "n": 394,
+          "pf": 0.248,
+          "exp_per_ct": -18.67,
+          "net_usd": -7354.58,
+          "win_rate": 0.0381,
+          "sr_per_trade": -0.33483,
+          "max_dd_usd": -7971.54,
+          "per_year": {
+            "2024": 44.7,
+            "2025": -4309.31,
+            "2026": -3089.97
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 784,
+          "pf": 0.07,
+          "exp_per_ct": -21.92,
+          "net_usd": -17185.54,
+          "win_rate": 0.0612,
+          "sr_per_trade": -1.42505,
+          "max_dd_usd": -17179.51,
+          "per_year": {
+            "2020": -3163.1,
+            "2021": -4425.43,
+            "2022": -6858.36,
+            "2023": -2738.64
+          }
+        },
+        "holdout": {
+          "n": 435,
+          "pf": 0.108,
+          "exp_per_ct": -21.63,
+          "net_usd": -9409.8,
+          "win_rate": 0.0483,
+          "sr_per_trade": -0.97575,
+          "max_dd_usd": -9539.1,
+          "per_year": {
+            "2024": -1724.17,
+            "2025": -4595.66,
+            "2026": -3089.97
+          }
+        }
+      }
+    },
+    "B:ALL": {
+      "incl": {
+        "train": {
+          "n": 2120,
+          "pf": 0.629,
+          "exp_per_ct": -11.94,
+          "net_usd": -25308.5,
+          "win_rate": 0.0774,
+          "sr_per_trade": -0.06939,
+          "max_dd_usd": -29304.58,
+          "per_year": {
+            "2020": -44.04,
+            "2021": 20628.36,
+            "2022": -29810.48,
+            "2023": -16082.35
+          }
+        },
+        "holdout": {
+          "n": 2024,
+          "pf": 0.112,
+          "exp_per_ct": -30.85,
+          "net_usd": -62446.27,
+          "win_rate": 0.0222,
+          "sr_per_trade": -0.63543,
+          "max_dd_usd": -63063.23,
+          "per_year": {
+            "2024": -7868.39,
+            "2025": -35387.79,
+            "2026": -19190.09
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 2895,
+          "pf": 0.056,
+          "exp_per_ct": -30.61,
+          "net_usd": -88619.24,
+          "win_rate": 0.0439,
+          "sr_per_trade": -0.80273,
+          "max_dd_usd": -88591.18,
+          "per_year": {
+            "2020": -16415.13,
+            "2021": -23434.31,
+            "2022": -28634.85,
+            "2023": -20134.95
+          }
+        },
+        "holdout": {
+          "n": 2149,
+          "pf": 0.035,
+          "exp_per_ct": -32.93,
+          "net_usd": -70759.15,
+          "win_rate": 0.0284,
+          "sr_per_trade": -1.9551,
+          "max_dd_usd": -70888.45,
+          "per_year": {
+            "2024": -15949.15,
+            "2025": -35623.81,
+            "2026": -19186.19
+          }
+        }
+      }
+    },
+    "C:BTC": {
+      "incl": {
+        "train": {
+          "n": 125,
+          "pf": 1.235,
+          "exp_per_ct": 4.15,
+          "net_usd": 519.15,
+          "win_rate": 0.192,
+          "sr_per_trade": 0.04792,
+          "max_dd_usd": -938.26,
+          "per_year": {
+            "2020": -48.24,
+            "2021": 982.23,
+            "2023": -414.84
+          }
+        },
+        "holdout": {
+          "n": 35,
+          "pf": 0.397,
+          "exp_per_ct": -12.54,
+          "net_usd": -438.83,
+          "win_rate": 0.0857,
+          "sr_per_trade": -0.27915,
+          "max_dd_usd": -609.59,
+          "per_year": {
+            "2024": -438.83
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 135,
+          "pf": 0.006,
+          "exp_per_ct": -26.03,
+          "net_usd": -3513.64,
+          "win_rate": 0.0074,
+          "sr_per_trade": -5.01804,
+          "max_dd_usd": -3486.64,
+          "per_year": {
+            "2020": -1200.31,
+            "2021": -1860.06,
+            "2023": -453.27
+          }
+        },
+        "holdout": {
+          "n": 48,
+          "pf": 0.0,
+          "exp_per_ct": -25.65,
+          "net_usd": -1231.29,
+          "win_rate": 0.0,
+          "sr_per_trade": -9.48569,
+          "max_dd_usd": -1206.0,
+          "per_year": {
+            "2024": -1231.29
+          }
+        }
+      }
+    },
+    "C:ETH": {
+      "incl": {
+        "train": {
+          "n": 140,
+          "pf": 1.58,
+          "exp_per_ct": 10.21,
+          "net_usd": 1429.21,
+          "win_rate": 0.2143,
+          "sr_per_trade": 0.11012,
+          "max_dd_usd": -987.67,
+          "per_year": {
+            "2020": 435.53,
+            "2021": 1229.11,
+            "2023": -235.42
+          }
+        },
+        "holdout": {
+          "n": 35,
+          "pf": 0.506,
+          "exp_per_ct": -9.83,
+          "net_usd": -343.98,
+          "win_rate": 0.1429,
+          "sr_per_trade": -0.20476,
+          "max_dd_usd": -505.37,
+          "per_year": {
+            "2024": -343.98
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 179,
+          "pf": 0.0,
+          "exp_per_ct": -25.43,
+          "net_usd": -4551.95,
+          "win_rate": 0.0,
+          "sr_per_trade": -5.06877,
+          "max_dd_usd": -4531.1,
+          "per_year": {
+            "2020": -1926.85,
+            "2021": -2186.89,
+            "2023": -438.21
+          }
+        },
+        "holdout": {
+          "n": 57,
+          "pf": 0.0,
+          "exp_per_ct": -24.24,
+          "net_usd": -1381.71,
+          "win_rate": 0.0,
+          "sr_per_trade": -4.53129,
+          "max_dd_usd": -1356.82,
+          "per_year": {
+            "2024": -1381.71
+          }
+        }
+      }
+    },
+    "C:SOL": {
+      "incl": {
+        "train": {
+          "n": 132,
+          "pf": 0.523,
+          "exp_per_ct": -14.49,
+          "net_usd": -1912.55,
+          "win_rate": 0.1439,
+          "sr_per_trade": -0.20399,
+          "max_dd_usd": -2549.16,
+          "per_year": {
+            "2020": -521.51,
+            "2021": -277.48,
+            "2023": -1113.55
+          }
+        },
+        "holdout": {
+          "n": 33,
+          "pf": 0.369,
+          "exp_per_ct": -17.83,
+          "net_usd": -588.41,
+          "win_rate": 0.1515,
+          "sr_per_trade": -0.39543,
+          "max_dd_usd": -678.48,
+          "per_year": {
+            "2024": -549.41,
+            "2025": -39.0
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 133,
+          "pf": 0.006,
+          "exp_per_ct": -38.08,
+          "net_usd": -5063.99,
+          "win_rate": 0.0075,
+          "sr_per_trade": -3.2421,
+          "max_dd_usd": -5043.21,
+          "per_year": {
+            "2020": -614.33,
+            "2021": -3314.03,
+            "2023": -1135.63
+          }
+        },
+        "holdout": {
+          "n": 47,
+          "pf": 0.0,
+          "exp_per_ct": -35.23,
+          "net_usd": -1655.68,
+          "win_rate": 0.0,
+          "sr_per_trade": -5.63486,
+          "max_dd_usd": -1618.98,
+          "per_year": {
+            "2024": -1616.68,
+            "2025": -39.0
+          }
+        }
+      }
+    },
+    "C:XRP": {
+      "incl": {
+        "train": {
+          "n": 141,
+          "pf": 1.255,
+          "exp_per_ct": 6.39,
+          "net_usd": 901.01,
+          "win_rate": 0.234,
+          "sr_per_trade": 0.05189,
+          "max_dd_usd": -1287.29,
+          "per_year": {
+            "2020": -454.66,
+            "2021": 1867.02,
+            "2023": -511.36
+          }
+        },
+        "holdout": {
+          "n": 50,
+          "pf": 0.183,
+          "exp_per_ct": -26.71,
+          "net_usd": -1335.43,
+          "win_rate": 0.08,
+          "sr_per_trade": -0.77345,
+          "max_dd_usd": -1391.44,
+          "per_year": {
+            "2024": -1219.38,
+            "2025": -116.05
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 173,
+          "pf": 0.003,
+          "exp_per_ct": -37.56,
+          "net_usd": -6498.22,
+          "win_rate": 0.0116,
+          "sr_per_trade": -4.42231,
+          "max_dd_usd": -6465.66,
+          "per_year": {
+            "2020": -2277.78,
+            "2021": -3386.48,
+            "2023": -833.97
+          }
+        },
+        "holdout": {
+          "n": 57,
+          "pf": 0.0,
+          "exp_per_ct": -37.03,
+          "net_usd": -2110.76,
+          "win_rate": 0.0,
+          "sr_per_trade": -9.03341,
+          "max_dd_usd": -2071.76,
+          "per_year": {
+            "2024": -2035.83,
+            "2025": -74.93
+          }
+        }
+      }
+    },
+    "C:BNB": {
+      "incl": {
+        "train": {
+          "n": 183,
+          "pf": 0.477,
+          "exp_per_ct": -14.83,
+          "net_usd": -2714.69,
+          "win_rate": 0.1694,
+          "sr_per_trade": -0.22841,
+          "max_dd_usd": -2865.7,
+          "per_year": {
+            "2020": -1538.31,
+            "2021": 57.89,
+            "2023": -1234.28
+          }
+        },
+        "holdout": {
+          "n": 39,
+          "pf": 0.081,
+          "exp_per_ct": -28.45,
+          "net_usd": -1109.6,
+          "win_rate": 0.0769,
+          "sr_per_trade": -1.41093,
+          "max_dd_usd": -1128.02,
+          "per_year": {
+            "2024": -915.12,
+            "2025": -194.48
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 221,
+          "pf": 0.005,
+          "exp_per_ct": -36.36,
+          "net_usd": -8036.21,
+          "win_rate": 0.0136,
+          "sr_per_trade": -3.68808,
+          "max_dd_usd": -7983.93,
+          "per_year": {
+            "2020": -3368.75,
+            "2021": -3382.95,
+            "2023": -1284.51
+          }
+        },
+        "holdout": {
+          "n": 43,
+          "pf": 0.034,
+          "exp_per_ct": -31.99,
+          "net_usd": -1375.62,
+          "win_rate": 0.0465,
+          "sr_per_trade": -2.18045,
+          "max_dd_usd": -1344.52,
+          "per_year": {
+            "2024": -1181.14,
+            "2025": -194.48
+          }
+        }
+      }
+    },
+    "C:DOGE": {
+      "incl": {
+        "train": {
+          "n": 122,
+          "pf": 0.772,
+          "exp_per_ct": -6.72,
+          "net_usd": -820.26,
+          "win_rate": 0.1721,
+          "sr_per_trade": -0.07407,
+          "max_dd_usd": -1382.06,
+          "per_year": {
+            "2020": -1036.58,
+            "2021": 1411.34,
+            "2023": -1195.03
+          }
+        },
+        "holdout": {
+          "n": 43,
+          "pf": 0.209,
+          "exp_per_ct": -23.76,
+          "net_usd": -1021.76,
+          "win_rate": 0.093,
+          "sr_per_trade": -0.71139,
+          "max_dd_usd": -983.88,
+          "per_year": {
+            "2024": -979.39,
+            "2025": -42.37
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 109,
+          "pf": 0.0,
+          "exp_per_ct": -39.42,
+          "net_usd": -4296.7,
+          "win_rate": 0.0,
+          "sr_per_trade": -7.63709,
+          "max_dd_usd": -4257.7,
+          "per_year": {
+            "2020": -870.67,
+            "2021": -1896.89,
+            "2023": -1529.13
+          }
+        },
+        "holdout": {
+          "n": 44,
+          "pf": 0.0,
+          "exp_per_ct": -37.55,
+          "net_usd": -1652.31,
+          "win_rate": 0.0,
+          "sr_per_trade": -11.44146,
+          "max_dd_usd": -1614.21,
+          "per_year": {
+            "2024": -1652.31
+          }
+        }
+      }
+    },
+    "C:AVAX": {
+      "incl": {
+        "train": {
+          "n": 117,
+          "pf": 0.679,
+          "exp_per_ct": -9.78,
+          "net_usd": -1144.04,
+          "win_rate": 0.1197,
+          "sr_per_trade": -0.07914,
+          "max_dd_usd": -2511.83,
+          "per_year": {
+            "2020": -260.88,
+            "2021": 152.26,
+            "2023": -1035.42
+          }
+        },
+        "holdout": {
+          "n": 36,
+          "pf": 0.323,
+          "exp_per_ct": -21.34,
+          "net_usd": -768.08,
+          "win_rate": 0.1111,
+          "sr_per_trade": -0.46671,
+          "max_dd_usd": -904.44,
+          "per_year": {
+            "2024": -768.08
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 90,
+          "pf": 0.0,
+          "exp_per_ct": -37.35,
+          "net_usd": -3361.95,
+          "win_rate": 0.0,
+          "sr_per_trade": -4.46772,
+          "max_dd_usd": -3324.36,
+          "per_year": {
+            "2020": -134.43,
+            "2021": -2148.48,
+            "2023": -1079.04
+          }
+        },
+        "holdout": {
+          "n": 41,
+          "pf": 0.0,
+          "exp_per_ct": -37.29,
+          "net_usd": -1528.79,
+          "win_rate": 0.0,
+          "sr_per_trade": -7.98455,
+          "max_dd_usd": -1492.22,
+          "per_year": {
+            "2024": -1528.79
+          }
+        }
+      }
+    },
+    "C:LINK": {
+      "incl": {
+        "train": {
+          "n": 131,
+          "pf": 1.041,
+          "exp_per_ct": 0.99,
+          "net_usd": 129.25,
+          "win_rate": 0.2137,
+          "sr_per_trade": 0.00909,
+          "max_dd_usd": -1199.05,
+          "per_year": {
+            "2020": -720.99,
+            "2021": 1290.4,
+            "2023": -440.16
+          }
+        },
+        "holdout": {
+          "n": 31,
+          "pf": 0.342,
+          "exp_per_ct": -19.76,
+          "net_usd": -612.7,
+          "win_rate": 0.129,
+          "sr_per_trade": -0.4738,
+          "max_dd_usd": -646.89,
+          "per_year": {
+            "2024": -612.7
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 142,
+          "pf": 0.0,
+          "exp_per_ct": -37.69,
+          "net_usd": -5351.43,
+          "win_rate": 0.0,
+          "sr_per_trade": -5.95088,
+          "max_dd_usd": -5292.78,
+          "per_year": {
+            "2020": -1639.1,
+            "2021": -2927.86,
+            "2023": -784.47
+          }
+        },
+        "holdout": {
+          "n": 44,
+          "pf": 0.0,
+          "exp_per_ct": -36.78,
+          "net_usd": -1618.12,
+          "win_rate": 0.0,
+          "sr_per_trade": -8.38427,
+          "max_dd_usd": -1580.28,
+          "per_year": {
+            "2024": -1618.12
+          }
+        }
+      }
+    },
+    "C:MAJORS": {
+      "incl": {
+        "train": {
+          "n": 265,
+          "pf": 1.417,
+          "exp_per_ct": 7.35,
+          "net_usd": 1948.36,
+          "win_rate": 0.2038,
+          "sr_per_trade": 0.08188,
+          "max_dd_usd": -995.28,
+          "per_year": {
+            "2020": 387.28,
+            "2021": 2211.34,
+            "2023": -650.26
+          }
+        },
+        "holdout": {
+          "n": 70,
+          "pf": 0.45,
+          "exp_per_ct": -11.18,
+          "net_usd": -782.81,
+          "win_rate": 0.1143,
+          "sr_per_trade": -0.24224,
+          "max_dd_usd": -966.02,
+          "per_year": {
+            "2024": -782.81
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 314,
+          "pf": 0.002,
+          "exp_per_ct": -25.69,
+          "net_usd": -8065.59,
+          "win_rate": 0.0032,
+          "sr_per_trade": -5.04546,
+          "max_dd_usd": -8038.59,
+          "per_year": {
+            "2020": -3127.16,
+            "2021": -4046.95,
+            "2023": -891.48
+          }
+        },
+        "holdout": {
+          "n": 105,
+          "pf": 0.0,
+          "exp_per_ct": -24.89,
+          "net_usd": -2613.0,
+          "win_rate": 0.0,
+          "sr_per_trade": -5.67733,
+          "max_dd_usd": -2587.71,
+          "per_year": {
+            "2024": -2613.0
+          }
+        }
+      }
+    },
+    "C:ALL": {
+      "incl": {
+        "train": {
+          "n": 1091,
+          "pf": 0.87,
+          "exp_per_ct": -3.31,
+          "net_usd": -3612.92,
+          "win_rate": 0.1833,
+          "sr_per_trade": -0.03445,
+          "max_dd_usd": -7396.28,
+          "per_year": {
+            "2020": -4145.65,
+            "2021": 6712.78,
+            "2023": -6180.05
+          }
+        },
+        "holdout": {
+          "n": 302,
+          "pf": 0.273,
+          "exp_per_ct": -20.59,
+          "net_usd": -6218.8,
+          "win_rate": 0.106,
+          "sr_per_trade": -0.52144,
+          "max_dd_usd": -6446.19,
+          "per_year": {
+            "2024": -5826.9,
+            "2025": -391.89
+          }
+        }
+      },
+      "stripped": {
+        "train": {
+          "n": 1182,
+          "pf": 0.003,
+          "exp_per_ct": -34.41,
+          "net_usd": -40674.09,
+          "win_rate": 0.0059,
+          "sr_per_trade": -3.59594,
+          "max_dd_usd": -40647.09,
+          "per_year": {
+            "2020": -12032.21,
+            "2021": -21103.64,
+            "2023": -7538.24
+          }
+        },
+        "holdout": {
+          "n": 381,
+          "pf": 0.004,
+          "exp_per_ct": -32.95,
+          "net_usd": -12554.29,
+          "win_rate": 0.0052,
+          "sr_per_trade": -3.95707,
+          "max_dd_usd": -12529.0,
+          "per_year": {
+            "2024": -12245.88,
+            "2025": -308.42
+          }
+        }
+      }
+    }
+  },
+  "kill_tests": {
+    "1_spike_strip": {
+      "pass": false,
+      "holdout_pf_spike_included": 0.45,
+      "holdout_pf_spike_stripped": 0.0,
+      "reason": "spike-stripped HOLDOUT PF must clear 1.30 (else tail comp, not carry)"
+    },
+    "2_majors_vs_alts": {
+      "pass": false,
+      "majors_holdout_pf_incl": 0.45,
+      "majors_holdout_pf_strip": 0.0,
+      "alts_holdout_pf_incl": 0.238,
+      "alts_holdout_pf_strip": 0.005,
+      "reason": "majors (deep-book) must carry stripped; alts-only-via-spikes is not durable"
+    },
+    "3_cost_cliff": {
+      "cliff_multiple": 0.5,
+      "curve": [
+        {
+          "k": 0.5,
+          "holdout_pf_strip": 0.016
+        },
+        {
+          "k": 1.0,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 1.5,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 2.0,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 2.5,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 3.0,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 3.5,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 4.0,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 4.5,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 5.0,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 5.5,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 6.0,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 6.5,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 7.0,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 7.5,
+          "holdout_pf_strip": 0.0
+        },
+        {
+          "k": 8.0,
+          "holdout_pf_strip": 0.0
+        }
+      ]
+    },
+    "4_recency_2024plus": {
+      "pass": false,
+      "holdout_2024_2026_pf_strip": 0.0,
+      "per_year_strip": {
+        "2024": -2613.0
+      },
+      "reason": "stripped holdout (2024-2026, post-ETF) PF must clear 1.30"
+    },
+    "5_sign_honesty": {
+      "pass": true,
+      "alwayson_neg_funding_intervals_held": 10665,
+      "champion_neg_funding_intervals_held": 2,
+      "champion_total_funding_pnl_usd_signed": 10214.64,
+      "reason": "always-on holds through every negative (paid) funding interval \u2014 signed accrual, no positive-only cherry-pick (champion C exits before flips)"
+    }
+  },
+  "integrity": {
+    "trade_unit_is_episode_not_interval": true,
+    "total_episodes_incl": 12389,
+    "total_funding_intervals": 53978,
+    "episode_to_interval_ratio": 0.22952,
+    "negative_funding_included_signed": true,
+    "costs_applied_gross_ne_net": true,
+    "champion_gross_train_usd": 9368.36,
+    "champion_net_train_usd": 1948.36,
+    "holdout_sealed_champion_on_train_pf": true,
+    "spike_strip_same_machinery": true
+  },
+  "gates": {
+    "PF_MIN": 1.3,
+    "EXP_PER_CT_MIN": 5.0,
+    "N_TRADES_MIN": 200,
+    "DSR_MIN": 0.95,
+    "HOLDOUT_PF_DEGRADE_MAX": 0.25
+  },
+  "cumulative_trials_after_this_eval": 70
+}

@@ -1,0 +1,51 @@
+<div class="card">
+  <div class="card-header py-2"><strong>Working orders</strong></div>
+  <div class="card-body py-2">
+    {% if errors.working_orders %}
+      <div class="alert alert-warning py-2 mb-2">Panel error: {{ errors.working_orders }}</div>
+    {% endif %}
+    {% if panel %}
+      {% if panel.orders %}
+        <div class="table-responsive">
+          <table class="table table-sm small mb-1">
+            <thead>
+              <tr>
+                <th>order_id</th>
+                <th>symbol</th>
+                <th>action</th>
+                <th class="text-end">qty</th>
+                <th>order_type</th>
+                <th class="text-end">limit</th>
+                <th class="text-end">stop</th>
+                <th>status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in panel.orders %}
+                <tr>
+                  <td>{{ row.order_id }}</td>
+                  <td>{{ row.symbol }}</td>
+                  <td>{{ row.action }}</td>
+                  <td class="text-end">{{ row.qty }}</td>
+                  <td>{{ row.order_type }}</td>
+                  <td class="text-end">
+                    {% if row.limit_price is not none %}{{ "%.2f"|format(row.limit_price) }}{% else %}-{% endif %}
+                  </td>
+                  <td class="text-end">
+                    {% if row.stop_price is not none %}{{ "%.2f"|format(row.stop_price) }}{% else %}-{% endif %}
+                  </td>
+                  <td>{{ row.status }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="text-muted small">fetched_at {{ panel.fetched_at.strftime("%H:%M:%S UTC") }}</div>
+      {% else %}
+        <div class="text-muted small">No working orders</div>
+      {% endif %}
+    {% elif not errors.working_orders %}
+      <div class="text-muted">no working orders data</div>
+    {% endif %}
+  </div>
+</div>

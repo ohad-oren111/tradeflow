@@ -1,0 +1,57 @@
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span class="fw-bold">Recent trades <span class="text-muted small">(last {{ log.rows|length }})</span></span>
+    <span class="badge bg-warning text-dark">{{ log.caveat }}</span>
+  </div>
+  <div class="card-body p-0">
+    {% if daily.days and not daily.error %}
+    <div class="px-3 pt-2 small">
+      Latest realized P&amp;L ({{ daily.days[0].day }}):
+      <span class="fw-bold {% if daily.days[0].pnl_net < 0 %}text-danger{% elif daily.days[0].pnl_net > 0 %}text-success{% endif %}">{{ "%.2f"|format(daily.days[0].pnl_net) }}</span>
+      <span class="text-muted">({{ daily.days[0].closed_count }} closed · {{ daily.days[0].wins }}W/{{ daily.days[0].losses }}L)</span>
+    </div>
+    {% endif %}
+    {% if log.error %}
+    <div class="alert alert-danger m-3 mb-0">Failed to load trades: {{ log.error }}</div>
+    {% elif not log.rows %}
+    <div class="p-3 text-muted">No trades yet. <a href="/trades">Full log →</a></div>
+    {% else %}
+    <div class="table-responsive">
+    <table class="table table-sm table-striped mb-0 align-middle">
+      <thead>
+        <tr>
+          <th>Entry (UTC)</th>
+          <th>Exit (UTC)</th>
+          <th>Dir</th>
+          <th class="text-end">Entry</th>
+          <th class="text-end">Exit</th>
+          <th class="text-end">Qty</th>
+          <th class="text-end">P&amp;L net</th>
+          <th>Reason</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for t in log.rows %}
+        <tr>
+          <td class="small">{{ t.entry_time or "—" }}</td>
+          <td class="small">
+            {% if t.is_open %}<span class="badge bg-info text-dark">OPEN</span>
+            {% else %}{{ t.exit_time or "—" }}{% endif %}
+          </td>
+          <td>{{ t.direction }}</td>
+          <td class="text-end">{% if t.entry_price is not none %}{{ "%.2f"|format(t.entry_price) }}{% else %}—{% endif %}</td>
+          <td class="text-end">{% if t.exit_price is not none %}{{ "%.2f"|format(t.exit_price) }}{% else %}—{% endif %}</td>
+          <td class="text-end">{{ t.qty if t.qty is not none else "—" }}</td>
+          <td class="text-end {% if t.pnl_net is not none and t.pnl_net < 0 %}text-danger{% elif t.pnl_net is not none and t.pnl_net > 0 %}text-success{% endif %}">
+            {% if t.pnl_net is not none %}{{ "%.2f"|format(t.pnl_net) }}{% else %}—{% endif %}
+          </td>
+          <td>{{ t.exit_reason or "—" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <div class="px-3 py-2 small"><a href="/trades">Full trade log →</a> · <a href="/pnl">Daily P&amp;L →</a></div>
+    {% endif %}
+  </div>
+</div>

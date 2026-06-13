@@ -1,0 +1,28 @@
+.pnl-positive {
+  color: #198754;
+  font-weight: 600;
+}
+
+.pnl-negative {
+  color: #dc3545;
+  font-weight: 600;
+}
+
+.pnl-zero {
+  color: #6c757d;
+}
+
+.card-header strong {
+  font-size: 0.95rem;
+}
+
+@media (max-width: 576px) {
+  .container-fluid {
+    padding-left: 0.5rem;
+    padding-right: 0.5rem;
+  }
+  dl.row dt,
+  dl.row dd {
+    margin-bottom: 0.15rem;
+  }
+}

@@ -28,6 +28,38 @@ Write the symptom verbatim before doing anything else. Do not rephrase in a way 
 
 Why this matters: 2026-04-19, `docker logs | grep` showed doubled lines suggesting two loops running. Raw file showed one. Doubling was a streaming artifact. Same session nearly escalated "SOL is churning real capital through fees" — `fetch_open_orders` confirmed 0 open orders, zero capital impact.
 
+### Step 2.5 — Instrument at every component boundary in multi-layer systems
+
+When the system has more than one process / container / API / library between the user-visible symptom and the source of truth, do not guess which layer is failing. Instrument each boundary and run once to see which layer breaks.
+
+TradeFlow has at least 4 layers between "trade should fire" and "fill confirmed at broker": Python orchestrator → `ib_async` client → IB Gateway container → IBKR API. A failure at any one of them surfaces as the same symptom: "no fill." Same pattern in Botty: orchestrator → ccxt client → Binance API.
+
+Add one probe per boundary before proposing any fix:
+
+```bash
+# Layer 1: orchestrator process — did the strategy decide to trade?
+docker logs tradeflow-bot --since 10m > /tmp/orch.log
+grep -E 'decision|signal|action' /tmp/orch.log | tail -20
+
+# Layer 2: client library — did ib_async accept and send the order?
+# (Look for the order ack line, not just the placeOrder call)
+grep -E 'orderStatus|placeOrder|reqId' /tmp/orch.log | tail -20
+
+# Layer 3: IB Gateway container — was the gateway logged in and connected?
+docker logs ibgateway --since 10m | grep -iE 'connected|disconnected|authenticated|error' | tail -20
+
+# Layer 4: IBKR API — did the broker see the order at all?
+python3 -c "from ib_async import IB; ib=IB(); ib.connect('127.0.0.1',7497,clientId=99); print('Trades:', ib.trades()); print('Fills:', ib.fills()); ib.disconnect()"
+```
+
+The earliest layer where evidence disagrees with the next is where the bug lives. Fix at that layer, not at the symptom layer.
+
+Common multi-layer traps in this codebase:
+
+- **TradeFlow**: IBC Read-Only API was ON in the gateway (operational debt from Session 4). Orchestrator placed orders, ib_async returned no error, gateway silently dropped them. Symptom: "no fill." Real layer: Layer 3.
+- **TradeFlow**: `.env` line 17 trips `bash source` but `python-dotenv` handles it. Symptom in shell scripts: env var missing. In Python: fine. Layer mismatch.
+- **Botty**: ccxt rate limit auto-throttled silently; orchestrator thought order was placed. Symptom: "deploy succeeded, no fill." Real layer: Layer 2 (silent throttle).
+
 ### Step 3 — Read raw logs end-to-end, not greps
 
 Read:
@@ -167,6 +199,22 @@ Actual observation: [Y]
 Therefore: previous diagnosis is wrong. Re-reading from scratch. Not retrofitting.
 ```
 
+## Rationalization rejection table
+
+If you catch yourself thinking the excuse, run the reality instead. These are the failure modes that have actually shipped wrong fixes:
+
+| Excuse | Reality |
+|---|---|
+| "Issue is simple, no need to probe" | Simple-looking issues have non-simple causes (the 59s audio bug, the doubled grep lines, the silent throttle). Probe is fast anyway. |
+| "Emergency, no time for the loop" | The loop IS the fast path. Thrashing takes longer. |
+| "Just try this fix and see" | First fix sets the diagnostic frame. Get it right at step 1. |
+| "I'll write the probe after I see if the fix works" | Then you can't distinguish "fix worked" from "symptom moved." Probe first. |
+| "I see the problem already" | Seeing a symptom is not naming a cause. Put it in HYPOTHESIZED until probed. |
+| "Reference docs are long, I'll skim" | The bug is usually in the part you skipped. Read the relevant section completely. |
+| "One more try, I think I see it now" (after 2 fails) | Twice-wrong rule. Stop. Hand off. (Three-times-wrong → use `architecture-question-gate`.) |
+| "Pattern matches the last bug, same fix" | Verify the pattern actually matches at the source of truth. Copy-paste diagnoses ship copy-paste bugs. |
+| "Aggregated logs are good enough" | They never are. Raw file or it didn't happen. |
+
 ## Examples
 
 **Audio truncation**: User says "audio cuts at 59s." → Don't search code near 59. Probe `ffprobe` on the broken file, get music track duration (likely culprit), trace the duration-probe log trail forward through pipeline stages. Only after KNOWN facts on the table, propose root cause.
@@ -174,3 +222,19 @@ Therefore: previous diagnosis is wrong. Re-reading from scratch. Not retrofittin
 **Trading bot loop**: User says "Botty stuck in place/cancel loop on SOL every 90s." → Don't grep for "cancel". Probe `fetch_open_orders('SOL/USDT')` and `fetch_my_trades` for actual capital impact. Dump full logs, read last 3 cycles end-to-end. Look for `syncing deployment_id X -> Y` smoking-gun line. Only after KNOWN facts, propose root cause.
 
 **Bad — jumping to fix**: User says "orders aren't placing." Wrong response: "Let me add a retry loop." Right response: "Three probes first — `fetch_balance` (funds?), `fetch_open_orders` (already open we don't know about?), raw logs last 100 lines (suppressed try/except?). Diagnose from output, not priors."
+
+## Accelerated-test playbook — never default to "we wait" (§0.5.220)
+
+A diagnosis or a fix is not confirmed until you have *evidence*. When the only evidence is a LIVE test paced by the market regime — "wait for ~20–30 above-trend qualifying trades", "wait for the next natural feed gap", "wait for a winner to prove the profit-walk", "let it run clean for a few weeks" — that wait can be weeks-to-months. **Do not present "wait and watch" as the only option.** Flag the long wait UPFRONT and, in the same breath, propose the accelerated alternatives below. Idle nights, weekends, and closed-market windows are BUILD time for these harnesses, not dead time.
+
+The four tiers, cheapest → most faithful (TradeFlow tooling lives in `tools/eval/`, Session 24):
+
+1. **Backtest the real code over saved history.** Drive the *actual* strategy + exit functions (`strategy.evaluate_gates` / `_regime_ok`, `trail_manager.compute_ratcheted_stop` / `should_hard_exit`, `kill_switch.evaluate_triggers`) over the longest clean saved 1-min series — never a re-implementation, or you prove the wrong code. Net real friction (§0.5.97), model the intrabar stop at the stop price (§0.5.206), ratchet on bar close. Segment the report (per-month, flag n<10 as noise). State the caveats explicitly: modeled fills, assumes the exit *mechanically* works, own-entry-path only. A backtest measures the *entry+exit logic's* expectancy; it does NOT prove the live order plumbing.
+
+2. **Synthetic-scenario harness.** Hand-built bar sequences that *force* each regime/path the live tape rarely serves on demand: below-trend block, above-trend pullback → ratchet walk → profit-lock, reverse-to-base-stop, V-reversal give-back, chop/whipsaw, feed-gap reseed, kill-switch warn→halt streak, hard-ceiling cap. Run each scenario **K≥5 with randomized timing / vol / slope** and assert determinism. Real strategy + real exit; execution STUBBED (scratch persistence, never prod lifecycles, never the live gateway). This proves the *logic* of paths a backtest may never hit in-sample.
+
+3. **Live paper round-trips off real signals.** A coordinated window on the paper gateway: verify prod FLAT (broker truth), halt prod, use a SEPARATE clientId, place a small (1–2 lot) order at real price, walk the stop in small increments staying safely below bid, assert each modify lands + the ratchet adopts the new id, then **guaranteed flatten + cancel-all on finish OR any error/abort**, verify FLAT from broker truth, un-halt. Never write prod lifecycles (tagged/scratch). This is the only tier that exercises the real order plumbing on real prices.
+
+4. **Fault injection on a throwaway instance + its OWN gateway** (never prod's). Induce socket-drop / wedged-subscription / gateway-restart; verify the resting GTC stop survives and boot-recovery re-adopts it (§0.5.211); reproduce a self-heal gap deterministically so a queued fix becomes verifiable.
+
+**The one thing none of these can shortcut:** the forward edge in the *real* regime — does this strategy make money on tape it has never seen, after costs. Say that explicitly. Use tiers 1–4 to retire *everything else* that can be proven sooner (does the exit walk? does the gate block? does the stop survive a disconnect?) so the only thing left genuinely waiting is the unshortcuttable. "We have to wait for the market" is true for the edge and almost nothing else — prove the rest now.
