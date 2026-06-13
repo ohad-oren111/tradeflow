@@ -1,0 +1,342 @@
+{
+  "phase": "21-S05-cash-and-carry",
+  "verdict": "NONE",
+  "research_only": true,
+  "data": {
+    "contracts": 50,
+    "rows": 8590,
+    "span": [
+      "2020-06-11",
+      "2026-05-31"
+    ]
+  },
+  "split": {
+    "train_expiry": [
+      "<",
+      "2024-01-01"
+    ],
+    "holdout_expiry": [
+      ">=",
+      "2024-01-01"
+    ]
+  },
+  "costs": {
+    "notional_usd": 100000.0,
+    "taker_fee_per_fill": 0.0005,
+    "slip_per_fill": 0.0002,
+    "n_fills": 4.0,
+    "rt_cost_usd": 280.0,
+    "source": "phase20b constants verbatim (work-order requirement)"
+  },
+  "deflator": {
+    "prior_trials": 92,
+    "in_eval_variants": 4,
+    "n_trials": 96,
+    "sr_variance_pool": 0.451175,
+    "sr0_expected_max": 1.69013,
+    "dsr_champion": 0.0,
+    "bonferroni_p_champion": 0.00014119301052062383
+  },
+  "champion": {
+    "variant": "roll60",
+    "train_gate_pass": false,
+    "train": {
+      "n": 26,
+      "pf": 163.249,
+      "exp_per_episode": 1191.87,
+      "net_usd": 30988.57,
+      "win_rate": 0.9231,
+      "sr_per_trade": 0.94433,
+      "per_year": {
+        "2020": 8154.14,
+        "2021": 17831.85,
+        "2022": 979.23,
+        "2023": 4023.35
+      }
+    },
+    "holdout": {
+      "n": 20,
+      "pf": 34.178,
+      "exp_per_episode": 928.98,
+      "net_usd": 18579.53,
+      "win_rate": 0.9,
+      "sr_per_trade": 1.62431,
+      "per_year": {
+        "2024": 10557.05,
+        "2025": 7821.24,
+        "2026": 201.24
+      }
+    },
+    "holdout_gate": "SEALED (train failed)",
+    "holdout_gate_pass": false
+  },
+  "variants": {
+    "thr5": {
+      "train": {
+        "n": 26,
+        "pf": Infinity,
+        "exp_per_episode": 3118.89,
+        "net_usd": 81091.1,
+        "win_rate": 1.0,
+        "sr_per_trade": 1.25758,
+        "per_year": {
+          "2020": 9392.99,
+          "2021": 40112.22,
+          "2022": 20253.62,
+          "2023": 11332.27
+        }
+      },
+      "holdout": {
+        "n": 19,
+        "pf": Infinity,
+        "exp_per_episode": 4846.8,
+        "net_usd": 92089.12,
+        "win_rate": 1.0,
+        "sr_per_trade": 1.60672,
+        "per_year": {
+          "2024": 53313.34,
+          "2025": 30193.32,
+          "2026": 8582.46
+        }
+      },
+      "train_gate": [
+        "PF inf >= 1.3",
+        "exp/ct $3118.89 >= $5.0",
+        "n 26 < 200",
+        "each-year OK [2020:+9,393 2021:+40,112 2022:+20,254 2023:+11,332]"
+      ],
+      "train_gate_pass": false,
+      "median_ann_net_carry_train": 0.0514,
+      "median_ann_net_carry_holdout": 0.0754
+    },
+    "thr10": {
+      "train": {
+        "n": 18,
+        "pf": Infinity,
+        "exp_per_episode": 3951.78,
+        "net_usd": 71132.1,
+        "win_rate": 1.0,
+        "sr_per_trade": 1.35976,
+        "per_year": {
+          "2020": 13050.98,
+          "2021": 47211.05,
+          "2022": 9534.81,
+          "2023": 1335.26
+        }
+      },
+      "holdout": {
+        "n": 14,
+        "pf": Infinity,
+        "exp_per_episode": 5775.4,
+        "net_usd": 80855.61,
+        "win_rate": 1.0,
+        "sr_per_trade": 1.89251,
+        "per_year": {
+          "2024": 55607.63,
+          "2025": 25247.98
+        }
+      },
+      "train_gate": [
+        "PF inf >= 1.3",
+        "exp/ct $3951.78 >= $5.0",
+        "n 18 < 200",
+        "each-year OK [2020:+13,051 2021:+47,211 2022:+9,535 2023:+1,335]"
+      ],
+      "train_gate_pass": false,
+      "median_ann_net_carry_train": 0.0986,
+      "median_ann_net_carry_holdout": 0.1121
+    },
+    "thr15": {
+      "train": {
+        "n": 14,
+        "pf": Infinity,
+        "exp_per_episode": 5574.82,
+        "net_usd": 78047.43,
+        "win_rate": 1.0,
+        "sr_per_trade": 2.48328,
+        "per_year": {
+          "2020": 16225.65,
+          "2021": 48959.68,
+          "2022": 12862.1
+        }
+      },
+      "holdout": {
+        "n": 10,
+        "pf": Infinity,
+        "exp_per_episode": 5963.06,
+        "net_usd": 59630.62,
+        "win_rate": 1.0,
+        "sr_per_trade": 1.62567,
+        "per_year": {
+          "2024": 49760.43,
+          "2025": 9870.18
+        }
+      },
+      "train_gate": [
+        "PF inf >= 1.3",
+        "exp/ct $5574.82 >= $5.0",
+        "n 14 < 200",
+        "each-year OK [2020:+16,226 2021:+48,960 2022:+12,862]"
+      ],
+      "train_gate_pass": false,
+      "median_ann_net_carry_train": 0.1462,
+      "median_ann_net_carry_holdout": 0.1479
+    },
+    "roll60": {
+      "train": {
+        "n": 26,
+        "pf": 163.249,
+        "exp_per_episode": 1191.87,
+        "net_usd": 30988.57,
+        "win_rate": 0.9231,
+        "sr_per_trade": 0.94433,
+        "per_year": {
+          "2020": 8154.14,
+          "2021": 17831.85,
+          "2022": 979.23,
+          "2023": 4023.35
+        }
+      },
+      "holdout": {
+        "n": 20,
+        "pf": 34.178,
+        "exp_per_episode": 928.98,
+        "net_usd": 18579.53,
+        "win_rate": 0.9,
+        "sr_per_trade": 1.62431,
+        "per_year": {
+          "2024": 10557.05,
+          "2025": 7821.24,
+          "2026": 201.24
+        }
+      },
+      "train_gate": [
+        "PF 163.249 >= 1.3",
+        "exp/ct $1191.87 >= $5.0",
+        "n 26 < 200",
+        "each-year OK [2020:+8,154 2021:+17,832 2022:+979 2023:+4,023]"
+      ],
+      "train_gate_pass": false,
+      "median_ann_net_carry_train": 0.0316,
+      "median_ann_net_carry_holdout": 0.0669
+    }
+  },
+  "kill_tests": {
+    "1_post_etf_holdout": {
+      "pass": true,
+      "holdout_pf": 34.178,
+      "holdout_n": 20,
+      "median_ann_net_carry_holdout": 0.0669,
+      "reason": "post-ETF era must still pay (Phase-20c compression lesson)"
+    },
+    "2_crisis_strip": {
+      "pass": true,
+      "n_stripped": 3,
+      "stripped_full_pf": 69.883,
+      "stripped_exp": 968.16,
+      "reason": "normal-regime carry must clear costs without crisis blowout entries"
+    },
+    "3_monotonicity_entry_basis": {
+      "pass": true,
+      "reason": "top 2712.85 vs bottom 52.44 rho 1.0",
+      "quantile_means": [
+        52.44,
+        463.16,
+        935.13,
+        1338.15,
+        2712.85
+      ]
+    },
+    "4_cost_cliff": {
+      "cliff_multiple": 7.0,
+      "curve": [
+        {
+          "k": 0.5,
+          "holdout_pf": 77.355
+        },
+        {
+          "k": 1.0,
+          "holdout_pf": 34.178
+        },
+        {
+          "k": 1.5,
+          "holdout_pf": 19.785
+        },
+        {
+          "k": 2.0,
+          "holdout_pf": 12.629
+        },
+        {
+          "k": 2.5,
+          "holdout_pf": 16.807
+        },
+        {
+          "k": 3.0,
+          "holdout_pf": Infinity
+        },
+        {
+          "k": 3.5,
+          "holdout_pf": 110.702
+        },
+        {
+          "k": 4.0,
+          "holdout_pf": Infinity
+        },
+        {
+          "k": 4.5,
+          "holdout_pf": Infinity
+        },
+        {
+          "k": 5.0,
+          "holdout_pf": 63.987
+        },
+        {
+          "k": 5.5,
+          "holdout_pf": 8.588
+        },
+        {
+          "k": 6.0,
+          "holdout_pf": Infinity
+        },
+        {
+          "k": 6.5,
+          "holdout_pf": Infinity
+        },
+        {
+          "k": 7.0,
+          "holdout_pf": 0.0
+        },
+        {
+          "k": 7.5,
+          "holdout_pf": 0
+        },
+        {
+          "k": 8.0,
+          "holdout_pf": 0
+        }
+      ]
+    },
+    "5_convergence_integrity": {
+      "pass": true,
+      "max_convergence_error": 0.00746,
+      "reason": "futures must converge to spot at expiry (data integrity)"
+    }
+  },
+  "integrity": {
+    "no_lookahead": "entry uses same-day basis (decision-at-close); expiry mechanical",
+    "holdout_sealed_until_champion": true,
+    "champion_selected_on": "train_profit_factor (degenerate inf deprioritised)",
+    "costs_applied": true,
+    "gross_total_usd": 62476.4,
+    "net_total_usd": 49568.1,
+    "n_structural_flag": "episodes per contract capped at 1; ~2 coins x ~21 expired quarterlies -> n<200 by construction (Stage-0 flag; NEAR-MISS ceiling)",
+    "linear_payoff_label": "inverse-futures convexity ignored (labeled)"
+  },
+  "gates": {
+    "PF_MIN": 1.3,
+    "EXP_PER_CT_MIN": 5.0,
+    "N_TRADES_MIN": 200,
+    "DSR_MIN": 0.95,
+    "HOLDOUT_PF_DEGRADE_MAX": 0.25
+  }
+}

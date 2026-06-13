@@ -6,7 +6,7 @@ A fresh session resumes with ONLY this file + the standing work order: take the 
 rules, set it `DONE: <verdict>`, update `CUMULATIVE_TRIALS`, ship the PR, repeat.
 
 ```
-CUMULATIVE_TRIALS: 92
+CUMULATIVE_TRIALS: 96
 ```
 
 (Starts at 78 after Phase-20c. Every eval passes the CURRENT value as `--prior-trials`,
@@ -28,7 +28,7 @@ were closed at Stage-0 as UNTESTABLE-HERE (see table + STOP.md files).
 | S02 | Dealer gamma/OPEX flows (calendar form) | TESTABLE — deterministic 3rd-Friday dates + SPX on disk | DONE | NONE | champ long_opex_week train PF 1.182<1.30 / HO 1.104; placebo Fridays BEAT it (1.405); recency 0.89-1.02; regime: pure above-trend beta; short_post_week HO 0.577 | S02 PR | Decisive NONE on the calendar form; gamma MECHANISM untested (unlock: options OI history); +3 trials (81→84) |
 | S03 | VIX short-vol roll-yield | TESTABLE-PROXY — Yahoo ^VIX (1990→), ^VIX3M (Jul-2006→), SVXY (Oct-2011→, incl Feb-2018); VXX only 2018-series | DONE | NONE | champ contango (VIX<VIX3M): train PF 2.895/HO 2.937, DSR 0.98, ALL 5 kills pass (dodged Volmageddon +$63k AND COVID −$8k; no cost cliff @8×) — but n 58/34≪200 (structural) + 4 neg years | S03 PR | **Strongest raw result of P15–21.** n<200 STOP rule applied — not forced. Unlock noted: VIX futures curve history 2004→ would triple the era (different, heavier study). +4 trials (84→88) |
 | S04 | Treasury auction concession/reversal | TESTABLE — fiscaldata auctions_query full history 1979→ (11,006 auctions, tenors/bid-to-cover/yields); phase19 UST10Y on disk; Yahoo ^FVX/^TYX OK | DONE | NONE | champ reversal_T3: train PF 1.451 (n717, real in-era) → HO 0.756 (SIGN FLIP); DSR 0.037; 2022+ QT era 0.584 (thesis REFUTED); 30Y leg neg; all 5 kills fail | S04 PR | 1,208 nominal 5/10/30Y auctions landed (2Y/3Y/7Y excluded, no free proxy); published-then-arbitraged shape; +4 trials (88→92) |
-| S05 | Crypto cash-and-carry basis | TESTABLE, n-risk — data.binance.vision CM delivery quarterlies confirmed (BTCUSD_200925→260925, 25 symbols ≈21 expired; ETH expected same); spot on disk | PENDING | — | — | — | Episodes ≈40–90 << 200 structurally → NEAR-MISS ceiling; report honestly, don't inflate |
+| S05 | Crypto cash-and-carry basis | TESTABLE, n-risk — data.binance.vision CM delivery quarterlies confirmed (BTCUSD_200925→260925, 25 symbols ≈21 expired; ETH expected same); spot on disk | DONE | NONE | champ roll60 train PF 163 (n26) / HO PF 34 (n20); thr5/10/15 are inf-PF (0 losers in 6yr, 100% win); ALL 5 kills PASS (post-ETF +6.7% med ann carry, crisis-strip PF 70, monotonic rho 1.0, cost-cliff 7×, conv 0.7%); but n 14–26≪200 AND DSR 0.0 → real+mechanical but structurally uncertifiable | S05 PR | 50 contracts (23 BTC+23 ETH expired, 2020-06→2026-05). Carry SURVIVED the post-ETF compression (unlike Phase-20c funding). Data fix: dropped frozen post-expiry tail + 08:00-UTC settlement partial bar → exit expiry-eve, 46/46 converge <0.6%. +4 trials (92→96) |
 | S06 | Crypto liquidation/OI snapback | TESTABLE-PROXY — futures/um/daily/metrics zips confirmed (probed 2021-06-01 + 2026-06-10, both 200); funding+prices on disk | PENDING | — | — | — | No true liquidation feed; OI-drop+funding<0 signature proxy (label it); pin earliest metrics date during eval |
 | S07 | Commodity carry/dynamic roll (COT) | UNTESTABLE-HERE — COT zips fine (200, 2.3MB) but NO free curve history: Yahoo delists expired contract months (CLZ20.NYM = "No data found"); Stooq is JS-challenge-walled | DONE | UNTESTABLE-HERE | curve-data gate | Stage-0 | Unlock: paid historical futures curves (Norgate/CSI/databento). See S07_commodity_carry/STOP.md |
 | S08 | Commodity index-roll spread | UNTESTABLE-HERE — same curve dependency as S07 | DONE | UNTESTABLE-HERE | curve-data gate | Stage-0 | Falls with S07. See S08_index_roll_spread/STOP.md |
@@ -60,4 +60,4 @@ were closed at Stage-0 as UNTESTABLE-HERE (see table + STOP.md files).
 carry + month-end ES/ZN), ranked tiers, cumulative honest accounting, single best next
 action. Then mark this file `GAUNTLET COMPLETE`.
 
-## Gauntlet status: IN PROGRESS — 12/18 DONE, next up S05
+## Gauntlet status: IN PROGRESS — 13/18 DONE, next up S06
