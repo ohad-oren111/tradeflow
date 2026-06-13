@@ -6,7 +6,7 @@ A fresh session resumes with ONLY this file + the standing work order: take the 
 rules, set it `DONE: <verdict>`, update `CUMULATIVE_TRIALS`, ship the PR, repeat.
 
 ```
-CUMULATIVE_TRIALS: 78
+CUMULATIVE_TRIALS: 81
 ```
 
 (Starts at 78 after Phase-20c. Every eval passes the CURRENT value as `--prior-trials`,
@@ -24,7 +24,7 @@ were closed at Stage-0 as UNTESTABLE-HERE (see table + STOP.md files).
 
 | ID | Name | Feasibility (Stage-0) | Status | Verdict | Headline | PR | Notes |
 |----|------|----------------------|--------|---------|----------|----|-------|
-| S01 | Pre-FOMC announcement drift | TESTABLE — Fed site 200 OK; SPX_daily.csv on disk (1970→) | PENDING | — | — | — | FOMC dates 1994→now hardcoded-from-source into dated CSV; variants T-1→T, T-2→T, scheduled-only |
+| S01 | Pre-FOMC announcement drift | TESTABLE — Fed site 200 OK; SPX_daily.csv on disk (1970→) | DONE | NONE | champ T2_sched train PF 1.905 (n209) / HO PF 1.305 (n50); DSR 0.836<0.95; 4 fails: each-year (7/26 neg), DSR, placebo margin 0.085<0.10, crisis-strip HO 1.257; cost-cliff 1.5×; recency PASSED (decayed not dead) | S01 PR | 296 announcements 1994→2026 landed in research/data/phase21/fomc_dates.csv (259 sched/37 unsched); effect real in-era, uncertifiable today; +3 trials (78→81) |
 | S02 | Dealer gamma/OPEX flows (calendar form) | TESTABLE — deterministic 3rd-Friday dates + SPX on disk | PENDING | — | — | — | HONEST LABEL: tests the calendar pattern, NOT the gamma mechanism (options OI unobtainable) |
 | S03 | VIX short-vol roll-yield | TESTABLE-PROXY — Yahoo ^VIX (1990→), ^VIX3M (Jul-2006→), SVXY (Oct-2011→, incl Feb-2018); VXX only 2018-series | PENDING | — | — | — | ETP does the rolling (label it); crisis-strip is THE kill test |
 | S04 | Treasury auction concession/reversal | TESTABLE — fiscaldata auctions_query full history 1979→ (11,006 auctions, tenors/bid-to-cover/yields); phase19 UST10Y on disk; Yahoo ^FVX/^TYX OK | PENDING | — | — | — | TreasuryDirect TA_WS ignores year filters — use api.fiscaldata.treasury.gov auctions_query instead |
@@ -60,4 +60,4 @@ were closed at Stage-0 as UNTESTABLE-HERE (see table + STOP.md files).
 carry + month-end ES/ZN), ranked tiers, cumulative honest accounting, single best next
 action. Then mark this file `GAUNTLET COMPLETE`.
 
-## Gauntlet status: IN PROGRESS — 8/18 DONE (all UNTESTABLE-HERE), next up S01
+## Gauntlet status: IN PROGRESS — 9/18 DONE, next up S02
