@@ -6,7 +6,7 @@ A fresh session resumes with ONLY this file + the standing work order: take the 
 rules, set it `DONE: <verdict>`, update `CUMULATIVE_TRIALS`, ship the PR, repeat.
 
 ```
-CUMULATIVE_TRIALS: 81
+CUMULATIVE_TRIALS: 84
 ```
 
 (Starts at 78 after Phase-20c. Every eval passes the CURRENT value as `--prior-trials`,
@@ -25,7 +25,7 @@ were closed at Stage-0 as UNTESTABLE-HERE (see table + STOP.md files).
 | ID | Name | Feasibility (Stage-0) | Status | Verdict | Headline | PR | Notes |
 |----|------|----------------------|--------|---------|----------|----|-------|
 | S01 | Pre-FOMC announcement drift | TESTABLE — Fed site 200 OK; SPX_daily.csv on disk (1970→) | DONE | NONE | champ T2_sched train PF 1.905 (n209) / HO PF 1.305 (n50); DSR 0.836<0.95; 4 fails: each-year (7/26 neg), DSR, placebo margin 0.085<0.10, crisis-strip HO 1.257; cost-cliff 1.5×; recency PASSED (decayed not dead) | S01 PR | 296 announcements 1994→2026 landed in research/data/phase21/fomc_dates.csv (259 sched/37 unsched); effect real in-era, uncertifiable today; +3 trials (78→81) |
-| S02 | Dealer gamma/OPEX flows (calendar form) | TESTABLE — deterministic 3rd-Friday dates + SPX on disk | PENDING | — | — | — | HONEST LABEL: tests the calendar pattern, NOT the gamma mechanism (options OI unobtainable) |
+| S02 | Dealer gamma/OPEX flows (calendar form) | TESTABLE — deterministic 3rd-Friday dates + SPX on disk | DONE | NONE | champ long_opex_week train PF 1.182<1.30 / HO 1.104; placebo Fridays BEAT it (1.405); recency 0.89-1.02; regime: pure above-trend beta; short_post_week HO 0.577 | S02 PR | Decisive NONE on the calendar form; gamma MECHANISM untested (unlock: options OI history); +3 trials (81→84) |
 | S03 | VIX short-vol roll-yield | TESTABLE-PROXY — Yahoo ^VIX (1990→), ^VIX3M (Jul-2006→), SVXY (Oct-2011→, incl Feb-2018); VXX only 2018-series | PENDING | — | — | — | ETP does the rolling (label it); crisis-strip is THE kill test |
 | S04 | Treasury auction concession/reversal | TESTABLE — fiscaldata auctions_query full history 1979→ (11,006 auctions, tenors/bid-to-cover/yields); phase19 UST10Y on disk; Yahoo ^FVX/^TYX OK | PENDING | — | — | — | TreasuryDirect TA_WS ignores year filters — use api.fiscaldata.treasury.gov auctions_query instead |
 | S05 | Crypto cash-and-carry basis | TESTABLE, n-risk — data.binance.vision CM delivery quarterlies confirmed (BTCUSD_200925→260925, 25 symbols ≈21 expired; ETH expected same); spot on disk | PENDING | — | — | — | Episodes ≈40–90 << 200 structurally → NEAR-MISS ceiling; report honestly, don't inflate |
@@ -60,4 +60,4 @@ were closed at Stage-0 as UNTESTABLE-HERE (see table + STOP.md files).
 carry + month-end ES/ZN), ranked tiers, cumulative honest accounting, single best next
 action. Then mark this file `GAUNTLET COMPLETE`.
 
-## Gauntlet status: IN PROGRESS — 9/18 DONE, next up S02
+## Gauntlet status: IN PROGRESS — 10/18 DONE, next up S03
