@@ -113,7 +113,8 @@ def main() -> int:
         for key in keys:
             cache_path = os.path.join(CACHE, os.path.basename(key))
             if os.path.exists(cache_path):
-                raw = open(cache_path, "rb").read()
+                with open(cache_path, "rb") as fh:
+                    raw = fh.read()
             else:
                 raw = _get(_DL.format(key=key))
                 with open(cache_path, "wb") as fh:
@@ -145,9 +146,8 @@ def main() -> int:
             continue
         df["symbol"], df["coin"], df["expiry"] = sym, coin, exp_ts
         all_rows.append(df)
-        print(
-            f"[DATA] {sym}: {len(df)} days {df['date'].iloc[0].date()}..{df['date'].iloc[-1].date()}"
-        )
+        d0, d1 = df["date"].iloc[0].date(), df["date"].iloc[-1].date()
+        print(f"[DATA] {sym}: {len(df)} days {d0}..{d1}")
 
     full = pd.concat(all_rows, ignore_index=True)
     if (full["close"] <= 0).any():
@@ -163,7 +163,7 @@ def main() -> int:
         spot[coin] = s.set_index("time")["close"].astype(float)
     expired, ok = 0, 0
     per_coin: dict[str, int] = {}
-    for sym, g in full.groupby("symbol"):
+    for _sym, g in full.groupby("symbol"):
         exp = g["expiry"].iloc[0]
         if exp.date() > TODAY:
             continue
