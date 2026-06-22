@@ -106,7 +106,14 @@ def _db(rows: list[dict]) -> MagicMock:
     return db
 
 
-def _build(*, db: MagicMock | None = None, halted: bool = False, params=RISK):
+def _build(
+    *,
+    db: MagicMock | None = None,
+    halted: bool = False,
+    params=RISK,
+    net_liq: float = 1_000_000.0,
+    net_liq_exc: Exception | None = None,
+):
     raised: list[str] = []
     flattened: list[bool] = []
 
@@ -114,7 +121,9 @@ def _build(*, db: MagicMock | None = None, halted: bool = False, params=RISK):
         flattened.append(True)
 
     async def equity_base():
-        return 1_000_000.0
+        if net_liq_exc is not None:
+            raise net_liq_exc
+        return net_liq
 
     ks = KillSwitch(
         db=db if db is not None else _db([]),
@@ -207,10 +216,64 @@ async def test_poll_drawdown_pauses_with_allocation_set():
     assert flat == [True]
 
 
-async def test_poll_drawdown_inert_when_allocation_unset():
-    # Default RISK has allocation unset → a huge loss does NOT pause via drawdown.
+async def test_poll_drawdown_arms_and_trips_with_allocation_25000(caplog):
+    # PR #169 case (a): ALLOCATION_USD=25000 → brake arms, trips at >33% (=$8250).
+    import logging
+
+    epoch = datetime.now(UTC) - timedelta(hours=1)
+    params = replace(
+        RISK,
+        kill_switch_allocation_usd=25_000.0,
+        kill_switch_max_drawdown_pct=33.0,
+        kill_switch_pnl_epoch=epoch.isoformat(),
+    )
+    rows = [{"pnl_net": -9_000.0, "exit_filled_at": datetime.now(UTC).isoformat()}]
+    ks, raised, flat = _build(db=_db(rows), params=params)
+    with caplog.at_level(logging.INFO):
+        v = await ks.poll_once()
+    assert v.action == "pause" and v.reason == "drawdown"
+    assert raised == ["kill_switch:drawdown"]
+    assert flat == [True]
+    # Configured allocation → NO net_liq fallback line.
+    assert not any("allocation: fallback" in r.getMessage() for r in caplog.records)
+
+
+async def test_poll_drawdown_armed_via_net_liq_fallback_when_unset(caplog):
+    # PR #169 case (b): allocation UNSET → falls back to live net_liq ($1M here),
+    # arms (NOT inert), and trips when realized loss exceeds 33% of net_liq ($330k).
+    import logging
+
+    epoch = datetime.now(UTC) - timedelta(hours=1)
+    params = replace(RISK, kill_switch_pnl_epoch=epoch.isoformat())  # allocation stays None
+    assert params.kill_switch_allocation_usd is None
+    rows = [{"pnl_net": -400_000.0, "exit_filled_at": datetime.now(UTC).isoformat()}]
+    ks, raised, flat = _build(db=_db(rows), params=params, net_liq=1_000_000.0)
+    with caplog.at_level(logging.INFO):
+        v = await ks.poll_once()
+    # NOT inert — the brake tripped via the net_liq fallback base.
+    assert v.action == "pause" and v.reason == "drawdown"
+    assert raised == ["kill_switch:drawdown"]
+    assert flat == [True]
+    assert any("allocation: fallback" in r.getMessage() for r in caplog.records)
+
+
+async def test_poll_consec_loss_halt_unaffected_by_drawdown_fallback():
+    # PR #169 case (c): the consecutive-loss halt fires independently at 10 even
+    # with the new net_liq fallback in play, and the trip reason is the loss streak
+    # (tiny pnls nowhere near 33% of net_liq), proving the DD change didn't touch it.
+    rows = _losses(10)  # ten -$1 losses → streak halt; realized = -$10 ≪ $330k DD trip
+    ks, raised, flat = _build(db=_db(rows), net_liq=1_000_000.0)
+    v = await ks.poll_once()
+    assert v.action == "pause" and v.reason == "consecutive_losses"
+    assert raised == ["kill_switch:consecutive_losses"]
+    assert flat == [True]
+
+
+async def test_poll_drawdown_skipped_when_net_liq_unavailable_no_halt():
+    # PR #169 robustness: allocation unset AND net_liq fetch fails → drawdown is
+    # skipped for this poll (no crash into the fail-safe halt); consec-loss intact.
     rows = [{"pnl_net": -500_000.0, "exit_filled_at": datetime.now(UTC).isoformat()}]
-    ks, raised, flat = _build(db=_db(rows))
+    ks, raised, flat = _build(db=_db(rows), net_liq_exc=RuntimeError("net-liq blip"))
     v = await ks.poll_once()
     assert v.action == "ok"
     assert raised == [] and flat == []

@@ -119,6 +119,14 @@ services:
       # Literal (not ${...}) so .env cannot shadow it (§0.5.159). Reversible: set
       # "true" or delete this line + force-recreate.
       SB_TRIGGER_ENABLED: "false"
+      # Drawdown-brake risk budget (PR #169). The % drawdown kill-switch measures
+      # MAX_DRAWDOWN_PCT (33%) against this base. 33% of full ~$994k NAV ($328k)
+      # would never trip a 2-4-lot MNQ eval, so the brake was effectively dead; a
+      # $25k budget trips at ~$8.25k realized drawdown — sane for this account.
+      # If UNSET the code falls back to live net_liq (brake still armed, never
+      # inert), but this literal is the explicit, retunable risk budget. The one
+      # knob the owner may change. Literal so .env cannot shadow it (§0.5.159).
+      KILL_SWITCH_ALLOCATION_USD: "25000"
       # Front-month MNQ contract. There is NO auto-roll (orchestrator
       # _build_contract: "PR #11 will add contract-roll awareness" — never
       # built), so the traded contract must be rolled here every quarter ~a few

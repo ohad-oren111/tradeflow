@@ -5,7 +5,10 @@ without pausing; only a hard threshold PAUSES — ``KILL_SWITCH_HALT_CONSEC_LOSS
 (default 10) consecutive losses, or a realized drawdown reaching
 ``KILL_SWITCH_MAX_DRAWDOWN_PCT`` (default 33) % of ``KILL_SWITCH_ALLOCATION_USD``
 measured from ``KILL_SWITCH_PNL_EPOCH`` (default = deploy time, so pre-deploy
-losses don't count). The drawdown brake is INERT while allocation is unset.
+losses don't count). PR #169 — the drawdown brake is ALWAYS ARMED: when
+``KILL_SWITCH_ALLOCATION_USD`` is unset it falls back to live broker net-liq as
+the denominator, so it can never be silently inert again (the only skip is a
+single poll where net-liq is momentarily unavailable).
 
 A PAUSE raises the existing global halt (blocks new entries) + flattens any open
 position via the existing safe cancel+market-exit path. It stays halted until a
@@ -289,8 +292,9 @@ class KillSwitch:
       * ``is_halted()`` — skip if already halted (don't re-flatten / double-act);
       * ``raise_halt(reason)`` — the ONLY state change this class makes;
       * ``flatten()`` — the existing safe cancel+market-exit path;
-      * ``equity_base()`` — broker net-liq (retained for back-compat; the tiered
-        drawdown brake now measures against the configured ALLOCATION, not net-liq).
+      * ``equity_base()`` — broker net-liq; PR #169 reuses it as the drawdown
+        denominator FALLBACK when ``KILL_SWITCH_ALLOCATION_USD`` is unset (no new
+        broker call), so the % brake is always armed.
 
     PR A — tiered: a 6–9 losing streak NOTIFIES once (Telegram) without pausing;
     only ≥10 consecutive losses or ≥33% realized drawdown of the configured
@@ -312,7 +316,7 @@ class KillSwitch:
         self._is_halted = is_halted
         self._raise_halt = raise_halt
         self._flatten = flatten
-        self._equity_base = equity_base  # retained for back-compat (unused by tiers)
+        self._equity_base = equity_base  # PR #169 — drawdown denominator fallback (net_liq)
         self._p = params
         # Drawdown epoch: env override, else construction time (≈ deploy time).
         self._pnl_epoch = _resolve_pnl_epoch(
@@ -321,6 +325,10 @@ class KillSwitch:
         )
         # Idempotency: the warn-tier alert fires once per losing streak crossing.
         self._warn_notified = False
+        # Idempotency: the net_liq-fallback INFO line fires once (not every 30s poll)
+        # while ALLOCATION_USD is unset, so the drawdown base source is recoverable
+        # without flooding the log.
+        self._fallback_logged = False
         # Consecutive transient (network) evaluator faults — reset on any clean
         # poll; a fail-safe halt fires only when it reaches the configured max.
         self._consec_eval_errors = 0
@@ -418,6 +426,40 @@ class KillSwitch:
         LOGGER.info("[ALERT] kill_switch_tripped: reason=evaluator_error")
         return KillVerdict("pause", "error", str(exc))
 
+    async def _drawdown_base(self) -> tuple[float | None, bool]:
+        """Resolve the % drawdown denominator — ALWAYS-ARMED policy (PR #169).
+
+        Returns ``(base, used_net_liq_fallback)``:
+          * ``KILL_SWITCH_ALLOCATION_USD`` set + positive → ``(allocation, False)``.
+          * unset/≤0 → fall back to live broker net-liq via the injected
+            ``equity_base`` provider → ``(net_liq, True)`` so the brake is NEVER
+            silently inert just because the env is missing.
+          * base unavailable (net-liq fetch failed or non-positive) → ``(None, True)``
+            so the drawdown tier is skipped for THIS poll only — never crashing the
+            poll loop into the fail-safe halt, and never touching the
+            consecutive-loss tier, which is independent.
+        """
+        alloc = self._p.kill_switch_allocation_usd
+        if alloc is not None and alloc > 0:
+            return float(alloc), False
+        try:
+            net_liq = await self._equity_base()
+        except Exception as exc:  # noqa: BLE001 — a net-liq blip must not halt; skip DD this poll
+            LOGGER.warning(
+                "[KILL] allocation: net_liq base unavailable — %s: %s "
+                "(drawdown skipped this poll; consecutive-loss halt still active)",
+                type(exc).__name__,
+                exc,
+            )
+            return None, True
+        if net_liq <= 0:
+            LOGGER.warning(
+                "[KILL] allocation: net_liq base non-positive (%.0f) — drawdown skipped this poll",
+                net_liq,
+            )
+            return None, True
+        return float(net_liq), True
+
     async def _evaluate(self) -> KillVerdict:
         rows = await self._db.select(
             "lifecycles",
@@ -445,10 +487,21 @@ class KillSwitch:
         # cluster collapse operates on live data WHEN later enabled. With the flag OFF
         # (today's default) evaluate_triggers ignores entry_bars entirely ⇒ supplying
         # them vs None is byte-identical; this changes NO live behavior.
+        # PR #169 — resolve the drawdown denominator with a net_liq fallback so the
+        # brake is never inert when ALLOCATION_USD is unset. The consecutive-loss
+        # tiers below are UNAFFECTED by this (they ignore allocation entirely).
+        drawdown_base, used_fallback = await self._drawdown_base()
+        if used_fallback and drawdown_base is not None and not self._fallback_logged:
+            LOGGER.info(
+                "[KILL] allocation: fallback — using net_liq=$%.0f as drawdown base "
+                "(ALLOCATION_USD unset)",
+                drawdown_base,
+            )
+            self._fallback_logged = True
         return evaluate_triggers(
             pnls,
             realized_since_epoch,
-            self._p.kill_switch_allocation_usd,
+            drawdown_base,
             warn_consec_losses=self._p.kill_switch_warn_consec_losses,
             halt_consec_losses=self._p.kill_switch_halt_consec_losses,
             max_drawdown_pct=self._p.kill_switch_max_drawdown_pct,
@@ -474,14 +527,31 @@ class KillSwitch:
             ),
             self._pnl_epoch.isoformat(),
         )
-        if self._p.kill_switch_allocation_usd is None:
-            # Loud startup warning — the % drawdown brake can't compute without an
-            # allocation, so it is INERT until the operator sets KILL_SWITCH_ALLOCATION_USD.
-            LOGGER.warning(
-                "[KILL] ALLOCATION_USD UNSET — the %.0f%% drawdown brake is INERT; "
-                "the >=%d consecutive-loss halt is the active hard brake",
+        # PR #169 — the % drawdown brake is ALWAYS ARMED: ALLOCATION_USD if set,
+        # else a live net_liq fallback. Resolve + log the armed base/trip at boot so
+        # the brake can never silently report INERT again. A net-liq fetch failure at
+        # boot is non-fatal — the brake arms on the first successful poll instead.
+        base, used_fallback = await self._drawdown_base()
+        if base is not None:
+            trip = self._p.kill_switch_max_drawdown_pct / 100.0 * base
+            if used_fallback:
+                LOGGER.info(
+                    "[KILL] allocation: fallback — using net_liq=$%.0f as drawdown base "
+                    "(ALLOCATION_USD unset)",
+                    base,
+                )
+                self._fallback_logged = True
+            LOGGER.info(
+                "[KILL] drawdown brake ARMED — base=$%.0f threshold=%.0f%% trip=$%.0f (source=%s)",
+                base,
                 self._p.kill_switch_max_drawdown_pct,
-                self._p.kill_switch_halt_consec_losses,
+                trip,
+                "net_liq" if used_fallback else "ALLOCATION_USD",
+            )
+        else:
+            LOGGER.warning(
+                "[KILL] drawdown brake — base unavailable at startup (net_liq fetch failed); "
+                "arms on the first successful poll. Consecutive-loss halt active meanwhile",
             )
         while not stop_event.is_set():
             await self.poll_once()
