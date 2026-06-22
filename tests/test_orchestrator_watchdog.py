@@ -96,16 +96,20 @@ def test_watchdog_alerts_when_stale_during_session(caplog, monkeypatch):
     )
     orch._watchdog_check_bar_liveness()
 
-    warn = [r for r in caplog.records if "[WATCHDOG] no live bar" in r.getMessage()]
-    alert = [r for r in caplog.records if "[ALERT] watchdog_stale_bars" in r.getMessage()]
-    assert len(warn) == 1, "expected one [WATCHDOG] WARN line"
-    assert len(alert) == 1, "expected one [ALERT] line for telegram"
+    # First stale observation OPENS the episode and emits exactly one Telegram
+    # alert (feed_episode_open) — not the per-cycle "no live bar" heartbeat.
+    opened = [r for r in caplog.records if "opening feed episode" in r.getMessage()]
+    alert = [r for r in caplog.records if "[ALERT] feed_episode_open" in r.getMessage()]
+    assert len(opened) == 1, "expected one episode-open WARN line"
+    assert len(alert) == 1, "expected one [ALERT] feed_episode_open for telegram"
+    assert orch._feed_episode.open is True
     assert orch._last_bar_alert_at == _IN_SESSION
 
 
-def test_watchdog_cooldown_suppresses_second_alert(caplog, monkeypatch):
+def test_watchdog_heartbeat_suppressed_within_cooldown_while_episode_open(caplog, monkeypatch):
     caplog.set_level(logging.INFO)
     orch = _make_orch()
+    orch._feed_episode.open = True  # episode already open — no re-open alert
     orch._last_bar_at = _IN_SESSION - timedelta(seconds=_WATCHDOG_STALE_THRESHOLD_SEC + 60)
     orch._last_bar_alert_at = _IN_SESSION - timedelta(seconds=60)
     monkeypatch.setattr(
@@ -113,12 +117,15 @@ def test_watchdog_cooldown_suppresses_second_alert(caplog, monkeypatch):
         _FrozenDatetime(_IN_SESSION),
     )
     orch._watchdog_check_bar_liveness()
+    # Within cooldown + already open → no log heartbeat AND no second open alert.
     assert not any("[WATCHDOG]" in r.getMessage() for r in caplog.records)
+    assert not any("[ALERT] feed_episode_open" in r.getMessage() for r in caplog.records)
 
 
-def test_watchdog_re_alerts_after_cooldown(caplog, monkeypatch):
+def test_watchdog_heartbeat_logonly_after_cooldown_no_repeat_alert(caplog, monkeypatch):
     caplog.set_level(logging.INFO)
     orch = _make_orch()
+    orch._feed_episode.open = True  # episode already open
     orch._last_bar_at = _IN_SESSION - timedelta(hours=1)
     orch._last_bar_alert_at = _IN_SESSION - timedelta(seconds=_WATCHDOG_ALERT_COOLDOWN_SEC + 60)
     monkeypatch.setattr(
@@ -126,8 +133,10 @@ def test_watchdog_re_alerts_after_cooldown(caplog, monkeypatch):
         _FrozenDatetime(_IN_SESSION),
     )
     orch._watchdog_check_bar_liveness()
+    # Cooldown elapsed → one LOG-ONLY heartbeat, and NO repeat Telegram alert.
     warn = [r for r in caplog.records if "[WATCHDOG] no live bar" in r.getMessage()]
     assert len(warn) == 1
+    assert not any("[ALERT]" in r.getMessage() for r in caplog.records)
 
 
 # --------------------------------------------------------- on_new_bar
@@ -151,6 +160,7 @@ def test_on_new_bar_logs_recovery_when_was_alerted(caplog, monkeypatch):
     orch = _make_orch()
     orch._strategy = MagicMock()
     orch._strategy.on_new_bar = MagicMock(return_value=None)
+    orch._feed_episode.open = True  # an episode is open → a real bar recovers it
     orch._last_bar_alert_at = _IN_SESSION - timedelta(minutes=10)
     monkeypatch.setattr(
         "src.orchestrator.datetime",
@@ -158,8 +168,9 @@ def test_on_new_bar_logs_recovery_when_was_alerted(caplog, monkeypatch):
     )
     orch._on_new_bar({"close": 100.0})
     recovery = [r for r in caplog.records if "[WATCHDOG] bar feed recovered" in r.getMessage()]
-    alert = [r for r in caplog.records if "[ALERT] watchdog_bar_recovered" in r.getMessage()]
+    alert = [r for r in caplog.records if "[ALERT] feed_episode_recovered" in r.getMessage()]
     assert recovery and alert
+    assert orch._feed_episode.open is False
     assert orch._last_bar_alert_at is None
 
 
@@ -286,7 +297,10 @@ async def test_maybe_heal_resubscribes_when_stale(caplog, monkeypatch):
     orch._start_bar_subscription.assert_awaited_once()
     assert orch._last_feed_heal_at == _IN_SESSION
     assert any("[FEED] stale-feed self-heal" in r.getMessage() for r in caplog.records)
-    assert any("[ALERT] feed_self_heal_resubscribe" in r.getMessage() for r in caplog.records)
+    # Demoted to log-only [FEED] (Fix 3) — the resubscribe heartbeat must NOT
+    # carry the [ALERT] prefix that routes to Telegram.
+    assert any("[FEED] feed_self_heal_resubscribe" in r.getMessage() for r in caplog.records)
+    assert not any("[ALERT]" in r.getMessage() for r in caplog.records)
 
 
 async def test_maybe_heal_respects_cooldown(monkeypatch):
@@ -344,9 +358,10 @@ async def test_maybe_heal_escalates_to_reconnect_after_threshold(caplog, monkeyp
     orch._ib.disconnect.assert_called_once()
     orch._resilient_reconnect.assert_awaited_once()
     orch._start_bar_subscription.assert_not_awaited()
-    assert any("ESCALATING to socket reconnect" in r.getMessage() for r in caplog.records)
+    assert any("forced socket reconnect" in r.getMessage() for r in caplog.records)
+    # Demoted to log-only [FEED] (Fix 3) — per-cycle escalation must not Telegram.
     assert any(
-        "[ALERT] feed_self_heal_reconnect_escalation" in r.getMessage() for r in caplog.records
+        "[FEED] feed_self_heal_reconnect_escalation" in r.getMessage() for r in caplog.records
     )
 
 

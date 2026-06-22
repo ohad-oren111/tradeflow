@@ -618,8 +618,12 @@ class IBClient:
             "[ORCH] bar_subscription auto-resubscribed after farm-flap — elapsed_sec=%.1f",
             elapsed,
         )
+        # Log-only (no [ALERT]) — a routine farm-flap auto-resubscribe is not an
+        # operator-facing event. If it fails to restore bars the orchestrator's
+        # feed-episode watchdog opens an episode + alerts. The host watchdog still
+        # parses this line as a flap canary for the daily report.
         LOGGER.info(
-            "[ALERT] bar_sub_resubscribed_after_farm_flap: elapsed_sec=%.1f",
+            "[FEED] bar_sub_resubscribed_after_farm_flap: elapsed_sec=%.1f",
             elapsed,
         )
 

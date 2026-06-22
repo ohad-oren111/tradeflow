@@ -90,6 +90,12 @@ ALERT_DASHBOARD_DOWN = "dashboard_unreachable"
 ALERT_DISK_HIGH = "disk_usage_high"
 ALERT_MEM_HIGH = "memory_usage_high"
 ALERT_MANUAL_INTERVENTION = "manual_intervention_needed"
+# Bar feed went dark with the IB socket still UP (the silent-feed-leak class the
+# probe_ib_api path misses entirely). The orchestrator's in-process self-heal
+# ladder logs a `feed_episode_gateway_restart_needed` handoff marker once its own
+# resubscribe+reconnect rungs are exhausted; the watchdog (which has docker
+# perms) detects that marker and drives the gateway-restart auto-heal ladder.
+ALERT_BAR_FEED_STALE = "bar_feed_stale"
 
 
 def now_utc() -> datetime:
@@ -523,6 +529,74 @@ def _parse_last_bar_age(text: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+# Markers the orchestrator emits for the feed-episode handoff (kept in sync with
+# src/orchestrator.py — the watchdog must NOT import src.*).
+_FEED_HANDOFF_MARKER = "feed_episode_gateway_restart_needed"
+_FEED_RECOVERED_MARKER = "feed_episode_recovered"
+
+
+def detect_feed_gateway_restart_needed(log_text: str) -> bool:
+    """True iff the app's most recent feed-episode signal is a gateway-restart
+    handoff with no later recovery (i.e. an episode is still open and the app's
+    own self-heal ladder is exhausted).
+
+    Pure string scan over a docker-log tail — no I/O. Ordering disambiguates a
+    still-open episode from a resolved one: a ``feed_episode_recovered`` AFTER the
+    last handoff marker means the feed already came back, so do not restart.
+    """
+    handoff_idx = log_text.rfind(_FEED_HANDOFF_MARKER)
+    if handoff_idx == -1:
+        return False
+    recovered_idx = log_text.rfind(_FEED_RECOVERED_MARKER)
+    return recovered_idx < handoff_idx
+
+
+def handle_feed_stale_episode(
+    state: dict,
+    log_text: str,
+    *,
+    auto_heal: Callable[[dict], tuple[bool, str]],
+    send: Callable[[str], bool],
+    now_fn: Callable[[], datetime] = now_utc,
+) -> str:
+    """Drive the gateway-restart ladder when the app hands off a dark feed.
+
+    Triggered only when the IB socket is UP (the silent-feed-leak the
+    ``probe_ib_api`` path cannot see) and the app has logged the
+    gateway-restart handoff marker with no later recovery. Reuses the existing
+    ``attempt_auto_heal`` ladder (docker restart, capped 3/hr) + the
+    ``MANUAL INTERVENTION`` page when exhausted.
+
+    Side effects are injected (``auto_heal``, ``send``) so the routing is unit-
+    testable with explicit args and no real docker/Telegram. Returns a short
+    status string. The app owns the ``feed_episode_recovered`` Telegram, so on
+    recovery this only clears the watchdog's stale-alert state (no duplicate).
+    """
+    if not detect_feed_gateway_restart_needed(log_text):
+        if ALERT_BAR_FEED_STALE in state.get("alert_history", {}):
+            clear_alert(state, ALERT_BAR_FEED_STALE)
+            return "feed_recovered_cleared"
+        return "feed_ok"
+    if should_send_alert(state, ALERT_BAR_FEED_STALE, now_fn):
+        send(
+            "ALERT: bar feed dark while IB socket is UP — app self-heals exhausted. "
+            "Restarting ib-gateway."
+        )
+        record_alert(state, ALERT_BAR_FEED_STALE, now_fn)
+    heal_ok, heal_msg = auto_heal(state)
+    LOGGER.info("[WATCHDOG] feed_auto_heal: %s", heal_msg)
+    if not heal_ok and "max attempts exceeded" in heal_msg:
+        if should_send_alert(state, ALERT_MANUAL_INTERVENTION, now_fn):
+            send(
+                "MANUAL INTERVENTION NEEDED: bar feed dark and gateway-restart auto-heal "
+                "exhausted. Likely a wedged gateway OR an expired/rolled contract "
+                "(check the INSTRUMENT env). Run: docker restart tradeflow-ib-gateway"
+            )
+            record_alert(state, ALERT_MANUAL_INTERVENTION, now_fn)
+        return "manual_intervention"
+    return "gateway_restart_issued" if heal_ok else "gateway_restart_failed"
+
+
 def send_telegram(
     message: str,
     token: str | None = None,
@@ -706,6 +780,19 @@ def run_monitor() -> int:
             clear_alert(state, ALERT_IB_API_DOWN)
             clear_alert(state, ALERT_MANUAL_INTERVENTION)
             LOGGER.info("[WATCHDOG] recovery: ib_api_down — sending Telegram message")
+
+    # Silent-feed-leak escalation: when the IB socket is healthy but the app has
+    # logged the feed-episode gateway-restart handoff (its own resubscribe+
+    # reconnect ladder exhausted), restart the gateway here — the app can't.
+    # Guarded on ok_ib: if the API is down the block above already auto-heals.
+    if ok_ib:
+        feed_status = handle_feed_stale_episode(
+            state,
+            _app_recent_logs(tail=400),
+            auto_heal=attempt_auto_heal,
+            send=send_telegram,
+        )
+        LOGGER.info("[WATCHDOG] feed_episode_check: %s", feed_status)
 
     ok_app, app_detail = probe_container("tradeflow-app")
     LOGGER.info(
@@ -1154,8 +1241,11 @@ def _count_reconnect_events(log_text: str) -> tuple[int, int]:
     Best-effort: the json-file driver keeps ~3×10m, so this is 'recent', not
     all-time-since-boot. Surfaced as a flap canary, not an exact metric.
     """
-    reconnects = log_text.count("[ALERT] reconnect_recovered")
-    flaps = log_text.count("[ALERT] bar_sub_resubscribed_after_farm_flap")
+    # These lines were demoted from [ALERT] to [FEED] (episode-scoped alerting,
+    # 2026-06-22) so they no longer flood Telegram; the daily-report canary still
+    # counts them from the log tail.
+    reconnects = log_text.count("[FEED] reconnect_recovered")
+    flaps = log_text.count("[FEED] bar_sub_resubscribed_after_farm_flap")
     return reconnects, flaps
 
 
