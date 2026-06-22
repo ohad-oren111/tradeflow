@@ -119,6 +119,15 @@ services:
       # Literal (not ${...}) so .env cannot shadow it (§0.5.159). Reversible: set
       # "true" or delete this line + force-recreate.
       SB_TRIGGER_ENABLED: "false"
+      # Front-month MNQ contract. There is NO auto-roll (orchestrator
+      # _build_contract: "PR #11 will add contract-roll awareness" — never
+      # built), so the traded contract must be rolled here every quarter ~a few
+      # days after the prior front month's 3rd-Friday expiry. MNQM6 (Jun 2026)
+      # expired 2026-06-19; pinning to MNQU6 (Sep 2026, expiry 2026-09-18)
+      # restored the bar feed that had gone dark for ~3 days on the dead
+      # contract. NEXT ROLL: set MNQZ6 ~late Sep 2026. Literal (not ${...}) so
+      # .env cannot shadow it (§0.5.159). main.py defaults to MNQM6 if unset.
+      INSTRUMENT: MNQU6
     depends_on:
       - ib-gateway
     ports:

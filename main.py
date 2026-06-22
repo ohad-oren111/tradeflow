@@ -46,6 +46,12 @@ def _build_orchestrator_from_env() -> Orchestrator:
             "DB writes will fail when state machine (PR #9+) calls .upsert/.insert. "
             "Populate SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env before then."
         )
+    # Front-month contract. No auto-roll yet (orchestrator _build_contract:
+    # "PR #11 will add contract-roll awareness" — unbuilt), so the traded
+    # contract is pinned here and must be rolled by the operator each quarter
+    # via the compose INSTRUMENT env. Default preserves the historical
+    # hard-coded value so an unset env is a no-op.
+    instrument = os.environ.get("INSTRUMENT", "MNQM6")
     interval = float(os.environ.get("ORCH_HEALTHCHECK_INTERVAL_SEC", "60"))
     reconnect_max_attempts = int(os.environ.get("IBKR_RECONNECT_MAX_ATTEMPTS", "30"))
     reconnect_backoff_initial = float(os.environ.get("IBKR_RECONNECT_BACKOFF_INITIAL_SEC", "2.0"))
@@ -58,6 +64,7 @@ def _build_orchestrator_from_env() -> Orchestrator:
         ib,
         db,
         paper_account=paper_account,
+        instrument=instrument,
         healthcheck_interval=interval,
         reconnect_max_attempts=reconnect_max_attempts,
         reconnect_backoff_initial_sec=reconnect_backoff_initial,
