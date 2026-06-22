@@ -146,6 +146,40 @@ async def test_alert_handler_enqueues_alert_records():
     assert "[ALERT] halt_raised: symbol=MNQM6" in msg
 
 
+async def test_demoted_feed_chatter_routes_to_logs_not_telegram():
+    """Episode-scoped alerting (2026-06-22): the per-5-min feed self-heal /
+    reconnect / stale-heartbeat lines were demoted to [FEED] so they stay in the
+    logs and NEVER reach the Telegram queue. Only the bounded episode bookends
+    ([ALERT] feed_episode_open / feed_episode_recovered) route to Telegram."""
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    handler = TelegramAlertHandler(queue, loop)
+
+    log_only = [
+        "[FEED] watchdog_stale_bars: stale_min=20",
+        "[FEED] feed_self_heal_resubscribe",
+        "[FEED] feed_self_heal_reconnect_escalation",
+        "[FEED] reconnect_recovered: elapsed_sec=0.4 (socket only — bars unconfirmed)",
+        "[FEED] bar_sub_resubscribed_after_farm_flap: elapsed_sec=2.0",
+        "[FEED] feed_episode_gateway_restart_needed — app self-heals exhausted (5 cycles)",
+    ]
+    for msg in log_only:
+        handler.emit(logging.LogRecord("x", logging.INFO, "p", 0, msg, None, None))
+    await asyncio.sleep(0)
+    assert queue.empty(), "demoted [FEED] chatter must not reach Telegram"
+
+    # The two episode bookends DO route to Telegram.
+    for msg in ("[ALERT] feed_episode_open: stale_min=6", "[ALERT] feed_episode_recovered"):
+        handler.emit(logging.LogRecord("x", logging.WARNING, "p", 0, msg, None, None))
+    await asyncio.sleep(0)
+    delivered = []
+    while not queue.empty():
+        delivered.append(queue.get_nowait())
+    assert any("feed_episode_open" in m for m in delivered)
+    assert any("feed_episode_recovered" in m for m in delivered)
+    assert len(delivered) == 2
+
+
 async def test_alert_handler_drops_oldest_when_queue_full(caplog):
     caplog.set_level(logging.WARNING)
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)

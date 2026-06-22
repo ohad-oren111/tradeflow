@@ -309,7 +309,8 @@ async def test_orchestrator_survives_transient_disconnect_in_healthcheck(caplog)
 
     Healthcheck raises TimeoutError once (mid-loop). Orchestrator MUST
     NOT exit; instead, it calls connect_with_resilience to recover,
-    emits the [ALERT] reconnect_recovered line, and keeps looping until
+    emits the [FEED] reconnect_recovered line (socket-only, log-only since the
+    2026-06-22 episode-scoped alerting change), and keeps looping until
     stop_event is set.
     """
     caplog.set_level(logging.INFO)
@@ -348,8 +349,8 @@ async def test_orchestrator_survives_transient_disconnect_in_healthcheck(caplog)
         r for r in caplog.records if "[ORCH] healthcheck: transient_disconnect" in r.getMessage()
     ]
     assert transient_logs, "expected transient_disconnect log line"
-    recovered_logs = [r for r in caplog.records if "[ALERT] reconnect_recovered" in r.getMessage()]
-    assert recovered_logs, "expected [ALERT] reconnect_recovered alert line"
+    recovered_logs = [r for r in caplog.records if "[FEED] reconnect_recovered" in r.getMessage()]
+    assert recovered_logs, "expected [FEED] reconnect_recovered (socket-only) log line"
 
 
 async def test_resilient_reconnect_rearms_bar_subscription(caplog):
@@ -372,7 +373,7 @@ async def test_resilient_reconnect_rearms_bar_subscription(caplog):
         "[ORCH] bar_subscription re-armed after socket reconnect" in r.getMessage()
         for r in caplog.records
     )
-    assert any("[ALERT] reconnect_recovered" in r.getMessage() for r in caplog.records)
+    assert any("[FEED] reconnect_recovered" in r.getMessage() for r in caplog.records)
 
 
 async def test_resilient_reconnect_skips_rearm_when_strategy_disabled():

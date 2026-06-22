@@ -45,6 +45,12 @@ from src.execution.force_close import EodForceClose
 from src.execution.kill_switch import KillSwitch
 from src.execution.reconciler import Reconciler
 from src.execution.router import CloseResult, OrderRouter
+from src.feed_episode import (
+    RESUBSCRIBE_MAX_CYCLES,
+    FeedEpisode,
+    FeedHealAction,
+    next_heal_action,
+)
 from src.journal_rotation import rotate_jsonl_if_large
 from src.state_machine import ExitReason, InvariantViolationError, Lifecycle, State, StateMachine
 
@@ -76,8 +82,10 @@ _WATCHDOG_FEED_HEAL_COOLDOWN_SEC = 5 * 60
 # peer-close forced a reconnect, 5.5h late). After this many CONSECUTIVE stale
 # self-heal attempts fail to restore bars, escalate to a forced socket reconnect
 # (the evidence-proven recovery). At the 5-min heal cooldown this caps the dark
-# window at ~15 min instead of waiting hours for an external drop.
-_FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS = 3
+# window at ~15 min instead of waiting hours for an external drop. The full
+# ladder (resubscribe -> reconnect -> gateway-restart handoff) lives in
+# src/feed_episode.py; this mirror is the reconnect rung, derived to avoid drift.
+_FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS = RESUBSCRIBE_MAX_CYCLES + 1
 _BAR_TIMESTAMP_RING_MAXLEN = 4096
 
 # Track 3 — decision journal. Bounded in-memory ring of the most recent
@@ -272,6 +280,12 @@ class Orchestrator:
         # a forced socket reconnect once a resubscribe-over-live-socket is proven not
         # to be clearing the wedge.
         self._consecutive_feed_heals: int = 0
+        # Episode-scoped feed alerting. One continuous stale period = one episode;
+        # Telegram sees `feed_episode_open` once + `feed_episode_recovered` once
+        # (on a REAL bar), not the per-5-min watchdog/self-heal chatter (now
+        # log-only). The 2026-06-20 outage emitted ~800 alerts because every cycle
+        # re-alerted + reported a false `reconnect_recovered`.
+        self._feed_episode = FeedEpisode()
         self._bar_timestamps: deque[datetime] = deque(maxlen=_BAR_TIMESTAMP_RING_MAXLEN)
         # PR C — bar-gap detection after reconnect/resubscribe. _start_bar_subscription
         # arms _pending_gap_check on any RE-subscribe (not the initial boot one); the
@@ -393,8 +407,12 @@ class Orchestrator:
             connect_timeout_sec=self._reconnect_connect_timeout_sec,
         )
         elapsed = time.monotonic() - started
+        # Log-only (NOT [ALERT]): a socket reconnect proves the SOCKET recovered,
+        # not that BARS flow. Telegram recovery is emitted only when a real bar
+        # arrives (_on_new_bar -> feed_episode_recovered). Reporting recovery here
+        # is exactly the false-positive that looped ~800 alerts on 2026-06-20.
         LOGGER.info(
-            "[ALERT] reconnect_recovered: elapsed_sec=%.1f",
+            "[FEED] reconnect_recovered: elapsed_sec=%.1f (socket only — bars unconfirmed)",
             elapsed,
         )
         # The keepUpToDate bar subscription is bound to the socket that just
@@ -696,9 +714,12 @@ class Orchestrator:
                 self._consecutive_feed_heals,
             )
             self._consecutive_feed_heals = 0
-        if self._last_bar_alert_at is not None:
-            LOGGER.warning("[WATCHDOG] bar feed recovered — first bar after stale window")
-            LOGGER.info("[ALERT] watchdog_bar_recovered")
+        # Recovery is gated on this REAL live bar (Fix 1) — the only honest
+        # recovery signal. A socket reconnect that restores no bars is NOT a
+        # recovery (the old false `reconnect_recovered` is demoted to log-only).
+        if self._feed_episode.on_recovered():
+            LOGGER.warning("[WATCHDOG] bar feed recovered — first live bar after stale window")
+            LOGGER.warning("[ALERT] feed_episode_recovered")
             self._last_bar_alert_at = None
         # PR C — never feed a gapped/invalidated buffer into the strategy.
         if self._reseed_in_progress:
@@ -854,13 +875,31 @@ class Orchestrator:
             self._last_bar_alert_at is not None
             and (now - self._last_bar_alert_at).total_seconds() < _WATCHDOG_ALERT_COOLDOWN_SEC
         )
-        if not alert_suppressed:
+        # Episode-scoped alerting: the FIRST stale observation opens the episode
+        # and emits ONE Telegram alert (feed_episode_open). Every subsequent stale
+        # cycle is log-only (throttled by the cooldown) — a multi-day outage is
+        # ~1 Telegram message, not ~1 per 5 min. Recovery is declared in
+        # _on_new_bar against a REAL bar, never against a socket reconnect.
+        opened = self._feed_episode.on_stale()
+        if opened:
             stale_min = int(stale_sec // 60)
             LOGGER.warning(
-                "[WATCHDOG] no live bar in %dm during session — feed delayed/dead",
+                "[WATCHDOG] feed went stale during session — opening feed episode "
+                "(stale_min=%d)",
                 stale_min,
             )
-            LOGGER.info("[ALERT] watchdog_stale_bars: stale_min=%d", stale_min)
+            LOGGER.warning("[ALERT] feed_episode_open: stale_min=%d", stale_min)
+            self._last_bar_alert_at = now
+        elif not alert_suppressed:
+            stale_min = int(stale_sec // 60)
+            # Log-only (no [ALERT]) heartbeat while the episode is already open —
+            # NOT a Telegram message. The watchdog can still parse this line.
+            LOGGER.warning(
+                "[WATCHDOG] no live bar in %dm during session — feed delayed/dead "
+                "(episode open)",
+                stale_min,
+            )
+            LOGGER.info("[FEED] watchdog_stale_bars: stale_min=%d", stale_min)
             self._last_bar_alert_at = now
         return True
 
@@ -874,15 +913,23 @@ class Orchestrator:
         ONE bounded resubscribe via the existing tested ``_start_bar_subscription``
         path, rate-limited to once per ``_WATCHDOG_FEED_HEAL_COOLDOWN_SEC``.
 
-        FEED-GAP FIX — a resubscribe over a live socket cannot clear a wedged
-        keepUpToDate stream once the gateway has stopped delivering (2026-06-07
-        reopen: 5.5h dark, every same-socket resubscribe returned seeded=0 +
-        Error 162; recovery came ONLY from an external peer-close → reconnect). So
-        after ``_FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS`` consecutive resubscribes
-        fail to restore bars, ESCALATE to a forced socket reconnect — the
-        evidence-proven recovery — reusing the existing tested
-        ``_resilient_reconnect`` (no new reconnection logic). The counter is reset
-        in ``_on_new_bar`` when a live bar arrives.
+        Escalation ladder (``src.feed_episode.next_heal_action``), keyed on the
+        count of consecutive heal cycles NOT cleared by a real bar (reset in
+        ``_on_new_bar``):
+
+          * cycles 1-2  → RESUBSCRIBE (soft re-request over the live socket).
+          * cycles 3-4  → RECONNECT (force the socket down + ``_resilient_reconnect``
+            — the evidence-proven recovery; a resubscribe over a live-but-wedged
+            socket is a no-op, Error 162, 2026-06-07 5.5h-dark reopen).
+          * cycle  5+   → GATEWAY_RESTART_HANDOFF: the app cannot restart the
+            ib-gateway container, so it logs ``feed_episode_gateway_restart_needed``
+            (once per episode) for the host watchdog to act on, and keeps trying a
+            reconnect as a fallback.
+
+        Recovery is NEVER declared here — only a real bar in ``_on_new_bar`` closes
+        the episode (Fix 1: a socket reconnect proves the socket, not the feed).
+        Per-cycle heal lines are log-only (no [ALERT]); Telegram sees just the one
+        ``feed_episode_open`` and one ``feed_episode_recovered`` per episode.
 
         Bounded + low-risk: only acts when the socket is healthy + feed stale + in
         session; composes with PR C (the resubscribe arms the gap check, so a gapped
@@ -897,39 +944,66 @@ class Orchestrator:
             return
         self._last_feed_heal_at = now
         self._consecutive_feed_heals += 1
-        # Escalate once plain resubscribes have demonstrably failed to clear the
-        # wedge — a resubscribe over a live-but-wedged socket is a no-op (Error 162).
-        if self._consecutive_feed_heals >= _FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS:
+        action = next_heal_action(self._consecutive_feed_heals)
+
+        if action is FeedHealAction.GATEWAY_RESTART_HANDOFF:
+            # The app's own ladder (resubscribe -> reconnect) has demonstrably
+            # failed to restore bars. The app cannot restart the ib-gateway
+            # container (no docker socket), so log a machine-readable handoff
+            # marker — ONCE per episode — that the host watchdog
+            # (scripts/tradeflow_watchdog.py) detects and acts on by restarting
+            # the gateway. Log-only (no [ALERT]): the watchdog owns the
+            # gateway-restart + MANUAL INTERVENTION Telegram alerts. Still attempt
+            # a reconnect as a best-effort fallback if the watchdog is not running.
+            if self._feed_episode.should_emit_handoff():
+                LOGGER.error(
+                    "[FEED] feed_episode_gateway_restart_needed — app self-heals exhausted "
+                    "(%d consecutive failed cycles); host watchdog should restart ib-gateway",
+                    self._consecutive_feed_heals,
+                )
+            await self._reconnect_to_heal_feed()
+            return
+
+        if action is FeedHealAction.RECONNECT:
+            # Log-only (no [ALERT]) — episode-scoped alerting already fired the one
+            # feed_episode_open; per-cycle escalation must not reach Telegram.
             LOGGER.warning(
-                "[FEED] stale-feed self-heal ESCALATING to socket reconnect — "
-                "%d consecutive resubscribes did not restore bars (wedged keepUpToDate)",
+                "[FEED] stale-feed self-heal — forced socket reconnect "
+                "(%d consecutive resubscribes did not restore bars; wedged keepUpToDate)",
                 self._consecutive_feed_heals,
             )
-            LOGGER.info("[ALERT] feed_self_heal_reconnect_escalation")
-            try:
-                # Force the wedged socket down so connect_with_resilience rebuilds it
-                # fresh — the only action proven to clear a gateway-side wedge. The
-                # bar subscription is re-armed inside _resilient_reconnect.
-                self._ib.disconnect()
-                await self._resilient_reconnect()
-            except Exception as exc:  # noqa: BLE001 — escalation must never crash the loop
-                LOGGER.warning(
-                    "[FEED] stale-feed reconnect escalation failed — type=%s msg=%s",
-                    type(exc).__name__,
-                    exc,
-                )
+            LOGGER.info("[FEED] feed_self_heal_reconnect_escalation")
+            await self._reconnect_to_heal_feed()
             return
+
+        # RESUBSCRIBE — soft re-request of keepUpToDate over the live socket.
         LOGGER.warning(
-            "[FEED] stale-feed self-heal — resubscribing bar feed (socket healthy, attempt %d/%d)",
+            "[FEED] stale-feed self-heal — resubscribing bar feed (socket healthy, attempt %d)",
             self._consecutive_feed_heals,
-            _FEED_HEAL_RECONNECT_ESCALATION_ATTEMPTS,
         )
-        LOGGER.info("[ALERT] feed_self_heal_resubscribe")
+        LOGGER.info("[FEED] feed_self_heal_resubscribe")
         try:
             await self._start_bar_subscription()
         except Exception as exc:  # noqa: BLE001 — self-heal must never crash the loop
             LOGGER.warning(
                 "[FEED] stale-feed self-heal failed — type=%s msg=%s",
+                type(exc).__name__,
+                exc,
+            )
+
+    async def _reconnect_to_heal_feed(self) -> None:
+        """Force the wedged socket down + reconnect — best-effort feed heal.
+
+        Reuses the tested ``_resilient_reconnect`` (which re-arms the bar sub on
+        the fresh connection). Never raises into the healthcheck loop. Recovery is
+        NOT declared here — only a real bar in ``_on_new_bar`` closes the episode.
+        """
+        try:
+            self._ib.disconnect()
+            await self._resilient_reconnect()
+        except Exception as exc:  # noqa: BLE001 — heal must never crash the loop
+            LOGGER.warning(
+                "[FEED] stale-feed reconnect heal failed — type=%s msg=%s",
                 type(exc).__name__,
                 exc,
             )

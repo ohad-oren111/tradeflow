@@ -1096,14 +1096,142 @@ def test_parse_digest_readiness_no_digest_placeholder():
 
 
 def test_count_reconnect_events_counts_both_markers():
+    # Lines were demoted from [ALERT] to [FEED] (episode-scoped alerting); the
+    # daily-report canary now counts the [FEED] variants.
     logs = (
-        "[ALERT] reconnect_recovered: elapsed_sec=3.1\n"
+        "[FEED] reconnect_recovered: elapsed_sec=3.1 (socket only — bars unconfirmed)\n"
         "noise\n"
-        "[ALERT] reconnect_recovered: elapsed_sec=5.0\n"
-        "[ALERT] bar_sub_resubscribed_after_farm_flap: elapsed_sec=2.0\n"
+        "[FEED] reconnect_recovered: elapsed_sec=5.0 (socket only — bars unconfirmed)\n"
+        "[FEED] bar_sub_resubscribed_after_farm_flap: elapsed_sec=2.0\n"
     )
     assert wd._count_reconnect_events(logs) == (2, 1)
 
 
 def test_count_reconnect_events_none():
     assert wd._count_reconnect_events("quiet logs\n") == (0, 0)
+
+
+# ============================================================================
+# feed-episode gateway-restart handoff (silent-feed-leak escalation)
+# ============================================================================
+
+
+def test_detect_feed_gateway_restart_needed_true_when_handoff_open():
+    logs = (
+        "some app noise\n"
+        "[FEED] feed_episode_gateway_restart_needed — app self-heals exhausted (5 cycles)\n"
+        "more noise\n"
+    )
+    assert wd.detect_feed_gateway_restart_needed(logs) is True
+
+
+def test_detect_feed_gateway_restart_needed_false_when_recovered_after():
+    logs = (
+        "[FEED] feed_episode_gateway_restart_needed — exhausted\n"
+        "[ALERT] feed_episode_recovered\n"  # recovery AFTER the handoff → resolved
+    )
+    assert wd.detect_feed_gateway_restart_needed(logs) is False
+
+
+def test_detect_feed_gateway_restart_needed_false_when_no_marker():
+    assert wd.detect_feed_gateway_restart_needed("nothing relevant here\n") is False
+
+
+def test_detect_feed_reopened_after_recovery_is_true():
+    # open -> recovered -> open again + handoff again => still needs restart.
+    logs = (
+        "[FEED] feed_episode_gateway_restart_needed — first episode\n"
+        "[ALERT] feed_episode_recovered\n"
+        "[FEED] feed_episode_gateway_restart_needed — second episode\n"
+    )
+    assert wd.detect_feed_gateway_restart_needed(logs) is True
+
+
+def _handoff_logs() -> str:
+    return "[FEED] feed_episode_gateway_restart_needed — app self-heals exhausted (5 cycles)\n"
+
+
+def test_handle_feed_stale_triggers_gateway_restart_exactly_once():
+    """A detected handoff issues exactly one gateway-restart auto-heal + one alert."""
+    state: dict = {}
+    auto_heal = MagicMock(return_value=(True, "docker restart issued (attempt 1/3)"))
+    send = MagicMock(return_value=True)
+
+    status = wd.handle_feed_stale_episode(
+        state,
+        _handoff_logs(),
+        auto_heal=auto_heal,
+        send=send,
+        now_fn=_fixed_now(),
+    )
+
+    assert status == "gateway_restart_issued"
+    auto_heal.assert_called_once_with(state)
+    # Exactly one Telegram message (the stale/restarting alert).
+    assert send.call_count == 1
+    assert "Restarting ib-gateway" in send.call_args[0][0]
+    assert wd.ALERT_BAR_FEED_STALE in state["alert_history"]
+
+
+def test_handle_feed_stale_dedupes_alert_but_still_heals():
+    """A second cycle within the dedup window must NOT re-alert, but still heals
+    (the 3/hr auto-heal cap — not the alert — bounds restarts)."""
+    now = _fixed_now()
+    state: dict = {"alert_history": {wd.ALERT_BAR_FEED_STALE: now().isoformat()}}
+    auto_heal = MagicMock(return_value=(True, "docker restart issued (attempt 2/3)"))
+    send = MagicMock(return_value=True)
+
+    status = wd.handle_feed_stale_episode(
+        state, _handoff_logs(), auto_heal=auto_heal, send=send, now_fn=now
+    )
+
+    assert status == "gateway_restart_issued"
+    auto_heal.assert_called_once()
+    send.assert_not_called()  # deduped within ALERT_DEDUP_MINUTES
+
+
+def test_handle_feed_stale_pages_manual_when_auto_heal_exhausted():
+    state: dict = {}
+    auto_heal = MagicMock(
+        return_value=(False, "max attempts exceeded (3/3 in last 60min) — manual intervention")
+    )
+    send = MagicMock(return_value=True)
+
+    status = wd.handle_feed_stale_episode(
+        state, _handoff_logs(), auto_heal=auto_heal, send=send, now_fn=_fixed_now()
+    )
+
+    assert status == "manual_intervention"
+    # Two messages: the restart alert + the MANUAL INTERVENTION page.
+    assert send.call_count == 2
+    assert any("MANUAL INTERVENTION" in c[0][0] for c in send.call_args_list)
+    assert wd.ALERT_MANUAL_INTERVENTION in state["alert_history"]
+
+
+def test_handle_feed_stale_clears_state_on_recovery_no_telegram():
+    """When the marker is gone (episode resolved) prior stale state is cleared
+    silently — the app owns the feed_episode_recovered Telegram."""
+    state: dict = {"alert_history": {wd.ALERT_BAR_FEED_STALE: _fixed_now()().isoformat()}}
+    send = MagicMock(return_value=True)
+    auto_heal = MagicMock()
+
+    status = wd.handle_feed_stale_episode(
+        state, "healthy logs, no marker\n", auto_heal=auto_heal, send=send, now_fn=_fixed_now()
+    )
+
+    assert status == "feed_recovered_cleared"
+    auto_heal.assert_not_called()
+    send.assert_not_called()
+    assert wd.ALERT_BAR_FEED_STALE not in state.get("alert_history", {})
+
+
+def test_handle_feed_stale_noop_when_feed_healthy():
+    state: dict = {}
+    send = MagicMock()
+    auto_heal = MagicMock()
+    status = wd.handle_feed_stale_episode(
+        state, "all good\n", auto_heal=auto_heal, send=send, now_fn=_fixed_now()
+    )
+    assert status == "feed_ok"
+    auto_heal.assert_not_called()
+    send.assert_not_called()

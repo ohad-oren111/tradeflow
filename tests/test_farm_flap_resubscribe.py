@@ -81,7 +81,9 @@ async def test_resubscribe_emits_info_and_alert_logs(mock_ib_factory, monkeypatc
     assert any(
         m.startswith("[ORCH] bar_subscription auto-resubscribed after farm-flap") for m in msgs
     )
-    assert any(m.startswith("[ALERT] bar_sub_resubscribed_after_farm_flap") for m in msgs)
+    # Demoted from [ALERT] to [FEED] (episode-scoped alerting, 2026-06-22): a
+    # routine farm-flap auto-resubscribe is log-only, not a Telegram message.
+    assert any(m.startswith("[FEED] bar_sub_resubscribed_after_farm_flap") for m in msgs)
 
 
 # C3 — two trios inside the 30s guard collapse to a single resubscribe.
