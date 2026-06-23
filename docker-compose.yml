@@ -127,15 +127,16 @@ services:
       # inert), but this literal is the explicit, retunable risk budget. The one
       # knob the owner may change. Literal so .env cannot shadow it (§0.5.159).
       KILL_SWITCH_ALLOCATION_USD: "25000"
-      # Front-month MNQ contract. There is NO auto-roll (orchestrator
-      # _build_contract: "PR #11 will add contract-roll awareness" — never
-      # built), so the traded contract must be rolled here every quarter ~a few
-      # days after the prior front month's 3rd-Friday expiry. MNQM6 (Jun 2026)
-      # expired 2026-06-19; pinning to MNQU6 (Sep 2026, expiry 2026-09-18)
-      # restored the bar feed that had gone dark for ~3 days on the dead
-      # contract. NEXT ROLL: set MNQZ6 ~late Sep 2026. Literal (not ${...}) so
-      # .env cannot shadow it (§0.5.159). main.py defaults to MNQM6 if unset.
-      INSTRUMENT: MNQU6
+      # Front-month MNQ contract is now resolved DYNAMICALLY from the live IB
+      # chain at boot + on a daily timer (PR #170) and rolls automatically
+      # (FLAT-only, via a graceful restart that re-resolves + re-seeds). No static
+      # pin needed — the Jun-2026 dead-contract outage is structurally gone.
+      # ROLL_BUFFER_DAYS: skip a contract within this many days of expiry and pick
+      # the next (the ~8-day roll window). INSTRUMENT is now an OPTIONAL manual
+      # override / escape hatch — set it to pin a specific contract and disable
+      # auto-roll; leave it UNSET so resolution is authoritative.
+      ROLL_BUFFER_DAYS: "8"
+      # INSTRUMENT: MNQU6   # uncomment to pin manually + disable auto-roll
     depends_on:
       - ib-gateway
     ports:
