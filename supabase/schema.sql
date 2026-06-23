@@ -1,3 +1,14 @@
+-- ⚠️⚠️⚠️ STALE / ASPIRATIONAL — DO NOT TRUST FOR THE LIVE SCHEMA ⚠️⚠️⚠️
+-- (Q2 DB-completeness audit, 2026-06-23.) This Phase-0 "v1" design was NEVER
+-- deployed. The tables below — trades, positions, daily_summary,
+-- kill_switch_events, signals — DO NOT EXIST in production (verified: all
+-- return HTTP 404) and NO code reads or writes them. The live persistence
+-- model is lifecycles + lifecycle_events (one row per trade, UUID identity),
+-- plus halt_acks / seanbot_signals / signal_reconciliations / strategy_decisions.
+-- GROUND TRUTH = the applied files in supabase/migrations/, NOT this file.
+-- Kept only for historical reference; do not extend it. See
+-- docs/audits/Q2_db_completeness_audit_2026-06-23.md.
+--
 -- TradeFlow Supabase schema v1
 -- Defined in Phase 0 PR 1. Modify via migrations (PR > schema.sql diff).
 -- DO NOT reference columns not present in this file (§0.5.96 carry-over from Botty).
