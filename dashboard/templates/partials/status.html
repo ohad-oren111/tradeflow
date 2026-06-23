@@ -25,14 +25,6 @@
         <dd class="col-7 col-md-8">{{ panel.front_month_symbol }}</dd>
         <dt class="col-5 col-md-4">server_version</dt>
         <dd class="col-7 col-md-8">{{ panel.server_version if panel.server_version else "unknown" }}</dd>
-        <dt class="col-5 col-md-4">last_heartbeat_at</dt>
-        <dd class="col-7 col-md-8">
-          {% if panel.last_heartbeat_at %}
-            {{ panel.last_heartbeat_at.strftime("%Y-%m-%d %H:%M:%S UTC") }}
-          {% else %}
-            <span class="text-muted">n/a</span>
-          {% endif %}
-        </dd>
       </dl>
     {% elif not errors.status %}
       <div class="text-muted">no status</div>

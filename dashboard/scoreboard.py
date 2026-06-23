@@ -85,6 +85,9 @@ class Scoreboard:
     headline: str
     chart: ChartData | None = None
     has_estimate: bool = False  # any day used the estimate fallback
+    estimate_day_count: int = 0  # how many displayed days fell back to the estimate
+    latest_anchor_day: str | None = None  # newest operator-trusted SeanBot anchor
+    headline_trustworthy: bool = True  # False → comparison leans on lossy estimates
     caveat: str = SCOREBOARD_CAVEAT
     error: str | None = None
 
@@ -220,6 +223,8 @@ def _build_scoreboard(
     tf_cum = 0.0
     sb_cum = 0.0
     has_estimate = False
+    estimate_day_count = 0
+    sb_estimate_cum = 0.0  # cumulative $ from estimate days only (trust weighting)
     all_days = set(tf_by_day) | set(sb_estimate_by_day) | set(AUTHORITATIVE_SEANBOT_DAILY_PNL)
     for day in sorted(all_days):  # oldest first for cumulatives
         tf_p = round(tf_by_day.get(day, 0.0), 2)
@@ -231,6 +236,8 @@ def _build_scoreboard(
             sb_p = round(sb_estimate_by_day.get(day, 0.0), 2)
             is_estimate = True
             has_estimate = True
+            estimate_day_count += 1
+            sb_estimate_cum += sb_p
         tf_cum = round(tf_cum + tf_p, 2)
         sb_cum = round(sb_cum + sb_p, 2)
         delta = round(tf_p - sb_p, 2)
@@ -250,15 +257,24 @@ def _build_scoreboard(
     rows.reverse()  # newest day first for display
     delta_total = round(tf_cum - sb_cum, 2)
     leader = _winner(delta_total)
+    latest_anchor_day = (
+        max(AUTHORITATIVE_SEANBOT_DAILY_PNL) if AUTHORITATIVE_SEANBOT_DAILY_PNL else None
+    )
+    # The cumulative comparison is only authoritative if EVERY SeanBot day is an
+    # operator anchor. Any estimate day taints "leads by $X" (§0.5.197) — surface it.
+    headline_trustworthy = not has_estimate
     return Scoreboard(
         rows=rows,
         tf_total=tf_cum,
         sb_total=sb_cum,
         delta_total=delta_total,
         leader=leader,
-        headline=_headline(leader, delta_total),
+        headline=_headline(leader, delta_total, headline_trustworthy),
         chart=_build_chart(rows),
         has_estimate=has_estimate,
+        estimate_day_count=estimate_day_count,
+        latest_anchor_day=latest_anchor_day,
+        headline_trustworthy=headline_trustworthy,
     )
 
 
@@ -342,10 +358,17 @@ def _winner(delta: float) -> str:
     return "tie"
 
 
-def _headline(leader: str, delta_total: float) -> str:
+def _headline(leader: str, delta_total: float, trustworthy: bool = True) -> str:
     if leader == "tie":
-        return "TF and SeanBot are even"
-    return f"{leader} leads by ${abs(delta_total):,.2f}"
+        base = "TF and SeanBot are even"
+    else:
+        # "leads" implies a confident verdict; only use it when every SeanBot day
+        # is an operator anchor. Otherwise hedge to "is ahead in this estimate".
+        verb = "leads by" if trustworthy else "is ahead by"
+        base = f"{leader} {verb} ${abs(delta_total):,.2f}"
+    if not trustworthy:
+        base += " — ⚠ not authoritative (includes lossy SeanBot estimates)"
+    return base
 
 
 def _error_board(msg: str) -> Scoreboard:
