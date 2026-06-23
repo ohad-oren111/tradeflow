@@ -250,7 +250,11 @@ def test_main_module_smoke():
 
     fake_orch = MagicMock(name="Orchestrator")
     fake_orch.run = AsyncMock(return_value=0)
+    # PR #170 — main() now resolves the front month from the live chain at boot.
+    # Stub that out so the smoke test never opens a real IB connection (it must be
+    # hermetic; the resolver itself is covered by tests/test_front_month.py).
     with (
+        patch.object(main_module, "_resolve_boot_instrument", new=AsyncMock(return_value="MNQU6")),
         patch.object(main_module, "_build_orchestrator_from_env", return_value=fake_orch),
         patch.object(main_module, "load_dotenv", return_value=False),
     ):
