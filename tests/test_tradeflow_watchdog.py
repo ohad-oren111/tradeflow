@@ -1190,22 +1190,79 @@ def test_handle_feed_stale_dedupes_alert_but_still_heals():
     send.assert_not_called()  # deduped within ALERT_DEDUP_MINUTES
 
 
-def test_handle_feed_stale_pages_manual_when_auto_heal_exhausted():
-    state: dict = {}
-    auto_heal = MagicMock(
+def _exhausted_auto_heal() -> MagicMock:
+    return MagicMock(
         return_value=(False, "max attempts exceeded (3/3 in last 60min) — manual intervention")
     )
+
+
+def test_handle_feed_stale_pages_expiry_suspected_when_gateway_healthy():
+    # PR #171 (a): stale + gateway healthy + restart exhausted → the terminal page
+    # NAMES contract expiry as the suspected cause (a restart can't fix that).
+    state: dict = {}
+    auto_heal = _exhausted_auto_heal()
     send = MagicMock(return_value=True)
 
     status = wd.handle_feed_stale_episode(
-        state, _handoff_logs(), auto_heal=auto_heal, send=send, now_fn=_fixed_now()
+        state,
+        _handoff_logs(),
+        auto_heal=auto_heal,
+        send=send,
+        gateway_healthy=True,
+        now_fn=_fixed_now(),
+    )
+
+    assert status == "manual_intervention_expiry"
+    # Two messages: the restart alert + the MANUAL INTERVENTION page.
+    assert send.call_count == 2
+    manual = [c[0][0] for c in send.call_args_list if "MANUAL INTERVENTION" in c[0][0]]
+    assert len(manual) == 1
+    assert "contract expiry suspected" in manual[0]
+    assert "front-month" in manual[0]
+    assert wd.ALERT_MANUAL_INTERVENTION in state["alert_history"]
+
+
+def test_handle_feed_stale_generic_manual_when_gateway_not_healthy():
+    # PR #171 (b): a different terminal cause (gateway not healthy) → GENERIC page,
+    # NOT the expiry-suspected hint (false hints erode channel trust).
+    state: dict = {}
+    auto_heal = _exhausted_auto_heal()
+    send = MagicMock(return_value=True)
+
+    status = wd.handle_feed_stale_episode(
+        state,
+        _handoff_logs(),
+        auto_heal=auto_heal,
+        send=send,
+        gateway_healthy=False,
+        now_fn=_fixed_now(),
     )
 
     assert status == "manual_intervention"
-    # Two messages: the restart alert + the MANUAL INTERVENTION page.
-    assert send.call_count == 2
-    assert any("MANUAL INTERVENTION" in c[0][0] for c in send.call_args_list)
-    assert wd.ALERT_MANUAL_INTERVENTION in state["alert_history"]
+    manual = [c[0][0] for c in send.call_args_list if "MANUAL INTERVENTION" in c[0][0]]
+    assert len(manual) == 1
+    assert "contract expiry suspected" not in manual[0]
+
+
+def test_handle_feed_stale_terminal_page_deduped_once_per_episode():
+    # PR #171 (c): the terminal page is de-duped — a second cycle within the dedup
+    # window must NOT re-page (one terminal alert per episode).
+    now = _fixed_now()
+    state: dict = {
+        "alert_history": {
+            wd.ALERT_BAR_FEED_STALE: now().isoformat(),
+            wd.ALERT_MANUAL_INTERVENTION: now().isoformat(),
+        }
+    }
+    auto_heal = _exhausted_auto_heal()
+    send = MagicMock(return_value=True)
+
+    status = wd.handle_feed_stale_episode(
+        state, _handoff_logs(), auto_heal=auto_heal, send=send, gateway_healthy=True, now_fn=now
+    )
+
+    assert status == "manual_intervention_expiry"
+    send.assert_not_called()  # both stale + manual alerts already deduped this episode
 
 
 def test_handle_feed_stale_clears_state_on_recovery_no_telegram():
