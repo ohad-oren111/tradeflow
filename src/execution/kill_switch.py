@@ -32,9 +32,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -42,6 +44,51 @@ import httpx
 from config.risk_params import RISK, RiskParams
 
 LOGGER = logging.getLogger(__name__)
+
+# PR #173 — durable drawdown-epoch persistence. The % drawdown brake measures
+# realized loss since ``pnl_epoch``; that epoch USED to reset to process-start on
+# every container boot, and #170 rolls the contract BY restarting, so each
+# auto-roll (~4×/year) + every redeploy silently zeroed the drawdown accumulator
+# the armed brake measures against. The epoch is now written once to a small file
+# on a durable Docker named volume (``KILL_SWITCH_STATE_DIR``, default
+# ``/var/lib/tradeflow``, mounted as ``tradeflow-state`` in docker-compose.yml) and
+# RESTORED on every subsequent boot — so routine restarts and rolls keep the
+# original baseline. ``KILL_SWITCH_PNL_EPOCH`` (env) still overrides for a manual
+# reset. Supabase was the §13-preferred backend but there is no key-value table and
+# DDL cannot be applied autonomously from here (no Postgres creds); a named volume
+# is durable across ``--force-recreate``/roll, queryless, and needs zero operator
+# migration — see the PR "What I got wrong" note.
+_DEFAULT_STATE_DIR = "/var/lib/tradeflow"
+_EPOCH_FILENAME = "pnl_epoch"
+
+
+def _state_epoch_path() -> Path:
+    """Path to the persisted drawdown-epoch file (env-overridable for tests/ops)."""
+    return Path(os.environ.get("KILL_SWITCH_STATE_DIR", _DEFAULT_STATE_DIR)) / _EPOCH_FILENAME
+
+
+def _read_stored_epoch(path: Path) -> datetime | None:
+    """Read + parse the persisted epoch; None if absent/empty/corrupt/unreadable.
+
+    A corrupt or unreadable file is treated as ABSENT (returns None) so boot falls
+    through to create-a-fresh-epoch rather than crashing the kill switch."""
+    try:
+        raw = path.read_text().strip()
+    except OSError:
+        return None
+    parsed = _parse_ts(raw)
+    if parsed is None:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _write_stored_epoch(path: Path, epoch: datetime) -> None:
+    """Persist the epoch atomically (tmp-write + os.replace). Raises OSError on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(epoch.isoformat())
+    tmp.replace(path)
+
 
 # Transient/network faults that a brief retry-window can clear. The evaluator
 # tolerates up to ``KILL_SWITCH_MAX_CONSEC_EVAL_ERRORS`` of these IN A ROW before
@@ -272,18 +319,6 @@ def _sum_pnl_since(rows: list[dict], since: datetime) -> float:
     return total
 
 
-def _resolve_pnl_epoch(raw: str, *, fallback: datetime) -> datetime:
-    """Drawdown epoch from ``KILL_SWITCH_PNL_EPOCH`` (ISO), else ``fallback``.
-
-    Default fallback is the kill switch's construction time (≈ deploy time), so a
-    fresh deploy's drawdown counter starts at 0 and pre-deploy / bug-contaminated
-    losses never count toward the % drawdown brake."""
-    parsed = _parse_ts(raw)
-    if parsed is None:
-        return fallback
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-
-
 class KillSwitch:
     """Polls the triggers and, on a trip, halts + flattens via injected callables.
 
@@ -318,11 +353,11 @@ class KillSwitch:
         self._flatten = flatten
         self._equity_base = equity_base  # PR #169 — drawdown denominator fallback (net_liq)
         self._p = params
-        # Drawdown epoch: env override, else construction time (≈ deploy time).
-        self._pnl_epoch = _resolve_pnl_epoch(
-            getattr(params, "kill_switch_pnl_epoch", "") or "",
-            fallback=datetime.now(UTC),
-        )
+        # Drawdown epoch: PR #173 — env override, else a previously-PERSISTED epoch
+        # (durable across restarts/rolls), else create + persist a fresh one. This
+        # replaces the old "reset to construction time on every boot" behaviour that
+        # silently zeroed the drawdown baseline on each #170 roll-restart/redeploy.
+        self._pnl_epoch = self._load_or_create_epoch()
         # Idempotency: the warn-tier alert fires once per losing streak crossing.
         self._warn_notified = False
         # Idempotency: the net_liq-fallback INFO line fires once (not every 30s poll)
@@ -332,6 +367,63 @@ class KillSwitch:
         # Consecutive transient (network) evaluator faults — reset on any clean
         # poll; a fail-safe halt fires only when it reaches the configured max.
         self._consec_eval_errors = 0
+
+    def _persist_epoch(self, path: Path, epoch: datetime, *, source: str) -> bool:
+        """Best-effort persist of the epoch — never raises (an unwritable state dir
+        must not crash the kill switch). Returns True on success, False otherwise."""
+        try:
+            _write_stored_epoch(path, epoch)
+            return True
+        except OSError as exc:
+            LOGGER.warning(
+                "[KILL] epoch: persist failed (source=%s, path=%s) — %s: %s",
+                source,
+                path,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+
+    def _load_or_create_epoch(self) -> datetime:
+        """Resolve the drawdown epoch with durable, read-then-write-once semantics.
+
+        Order (PR #173):
+          1. ``KILL_SWITCH_PNL_EPOCH`` env set + parseable → use it (manual reset/pin)
+             and persist it so the reset sticks if the env is later removed.
+          2. A previously-persisted epoch on the state volume → RESTORE it verbatim;
+             NEVER overwrite it on a routine restart (overwriting is the whole bug).
+          3. Neither → create ``now()``, persist once, so the baseline is durable
+             from here on. If the state dir is unwritable, fall back to a fresh
+             (non-persisted) epoch and warn loudly — same as the pre-#173 behaviour,
+             never a crash.
+        """
+        path = _state_epoch_path()
+        now = datetime.now(UTC)
+        override_raw = (getattr(self._p, "kill_switch_pnl_epoch", "") or "").strip()
+        parsed_override = _parse_ts(override_raw) if override_raw else None
+        if parsed_override is not None:
+            epoch = (
+                parsed_override if parsed_override.tzinfo else parsed_override.replace(tzinfo=UTC)
+            )
+            self._persist_epoch(path, epoch, source="override")
+            LOGGER.info(
+                "[KILL] epoch: override — %s (KILL_SWITCH_PNL_EPOCH set)", epoch.isoformat()
+            )
+            return epoch
+        stored = _read_stored_epoch(path)
+        if stored is not None:
+            age_h = (now - stored).total_seconds() / 3600.0
+            LOGGER.info("[KILL] epoch: restored — %s (age %.1fh)", stored.isoformat(), age_h)
+            return stored  # read-then-write-once: do NOT re-persist a valid stored epoch
+        if self._persist_epoch(path, now, source="created"):
+            LOGGER.info("[KILL] epoch: created — %s (persisted to %s)", now.isoformat(), path)
+        else:
+            LOGGER.warning(
+                "[KILL] epoch: created (NOT persisted — state dir unwritable) — %s "
+                "(drawdown baseline will reset on next restart until persistence works)",
+                now.isoformat(),
+            )
+        return now
 
     async def poll_once(self) -> KillVerdict:
         """Evaluate once; pause+flatten on a PAUSE, alert-once on a NOTIFY. Never raises."""

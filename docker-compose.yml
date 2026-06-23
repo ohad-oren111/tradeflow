@@ -127,6 +127,19 @@ services:
       # inert), but this literal is the explicit, retunable risk budget. The one
       # knob the owner may change. Literal so .env cannot shadow it (§0.5.159).
       KILL_SWITCH_ALLOCATION_USD: "25000"
+      # Drawdown-epoch persistence (PR #173). The % drawdown brake measures realized
+      # loss since `pnl_epoch`. That epoch is now written ONCE to the durable
+      # `tradeflow-state` named volume (mounted below at KILL_SWITCH_STATE_DIR,
+      # default /var/lib/tradeflow) and RESTORED on every subsequent boot — so the
+      # baseline survives routine restarts AND #170 roll-restarts/redeploys instead
+      # of silently resetting to boot time each start. No knob needed for normal op.
+      #   KILL_SWITCH_PNL_EPOCH (optional, UNSET by default): ISO-8601 manual override
+      #   — pin/reset the epoch deliberately (e.g. "2026-06-23T00:00:00Z"). When set it
+      #   wins over the stored value AND is persisted, so the reset sticks if you later
+      #   remove it. To force a fresh epoch instead, clear the volume's pnl_epoch file.
+      #   Leave UNSET so the persisted value is authoritative.
+      # KILL_SWITCH_PNL_EPOCH: "2026-06-23T00:00:00Z"  # uncomment to pin/reset manually
+      KILL_SWITCH_STATE_DIR: /var/lib/tradeflow
       # Front-month MNQ contract is now resolved DYNAMICALLY from the live IB
       # chain at boot + on a daily timer (PR #170) and rolls automatically
       # (FLAT-only, via a graceful restart that re-resolves + re-seeds). No static
@@ -141,6 +154,13 @@ services:
       - ib-gateway
     ports:
       - "127.0.0.1:8080:8080"
+    # PR #173 — durable kill-switch state. The drawdown epoch (pnl_epoch) is written
+    # here and restored on every boot, so the brake's baseline survives restarts and
+    # #170 roll-restarts. A NAMED volume survives `docker compose up -d
+    # --force-recreate` and `build` (only `down -v` / explicit volume rm clears it —
+    # which is a legitimate "give me a fresh epoch" action).
+    volumes:
+      - tradeflow-state:/var/lib/tradeflow
     # W-S14.2 Track 6a — cap container log growth (preventive disk hygiene).
     logging:
       driver: json-file
@@ -187,3 +207,9 @@ services:
 networks:
   tradeflow-net:
     driver: bridge
+
+# PR #173 — durable named volume for kill-switch persistence (the drawdown epoch).
+# Survives container recreation/rebuild; only an explicit `down -v` / volume rm
+# clears it. Managed by Docker (local driver) on the VPS host.
+volumes:
+  tradeflow-state:

@@ -679,3 +679,101 @@ def test_entry_bar_minutes_unit_and_none_fallback():
     assert abs(b - a) == pytest.approx(0.5)
     assert _entry_bar_minutes(None) is None
     assert _entry_bar_minutes("not-a-timestamp") is None
+
+
+# --------------------------------------------- PR #173: durable pnl_epoch persistence
+# The drawdown epoch must survive container restarts/rolls (it used to reset to boot
+# time on every start, and #170 rolls by restarting → the armed brake's baseline was
+# silently zeroed ~4×/year + every redeploy). Boot now: env override > restore stored
+# > create+persist once. Read-then-write-once: a valid stored epoch is NEVER
+# overwritten on a routine restart (overwriting IS the bug). State dir is env-driven
+# (KILL_SWITCH_STATE_DIR) so tests pin it to tmp_path; default /var/lib/tradeflow is a
+# durable Docker named volume in prod. Unwritable dir → graceful non-persisted fallback.
+
+
+def test_epoch_restored_from_state_file_not_overwritten(tmp_path, monkeypatch):
+    # (a) A stored epoch is restored verbatim on boot and NOT rewritten — the core
+    # read-then-write-once guarantee that makes the baseline durable across restarts.
+    monkeypatch.setenv("KILL_SWITCH_STATE_DIR", str(tmp_path))
+    stored = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    epoch_file = tmp_path / "pnl_epoch"
+    epoch_file.write_text(stored.isoformat())
+    ks, _raised, _flat = _build(params=replace(RISK, kill_switch_pnl_epoch=""))
+    assert ks._pnl_epoch == stored
+    # Untouched: same content, no overwrite on this routine boot.
+    assert epoch_file.read_text() == stored.isoformat()
+
+
+def test_epoch_created_and_persisted_once_then_restored(tmp_path, monkeypatch):
+    # (b) No stored epoch → created + persisted; a SECOND construction (a "restart")
+    # restores the SAME epoch rather than minting a fresh now() — proves durability.
+    monkeypatch.setenv("KILL_SWITCH_STATE_DIR", str(tmp_path))
+    epoch_file = tmp_path / "pnl_epoch"
+    assert not epoch_file.exists()
+    ks1, _r1, _f1 = _build(params=replace(RISK, kill_switch_pnl_epoch=""))
+    assert epoch_file.exists()
+    persisted = datetime.fromisoformat(epoch_file.read_text())
+    assert ks1._pnl_epoch == persisted
+    ks2, _r2, _f2 = _build(params=replace(RISK, kill_switch_pnl_epoch=""))
+    assert ks2._pnl_epoch == ks1._pnl_epoch  # restored, not recreated
+
+
+def test_epoch_env_override_wins_over_stored_and_persists(tmp_path, monkeypatch):
+    # (c) An explicit KILL_SWITCH_PNL_EPOCH override beats the stored value (manual
+    # reset) AND is persisted, so the reset sticks if the env is later removed.
+    monkeypatch.setenv("KILL_SWITCH_STATE_DIR", str(tmp_path))
+    stored = datetime(2026, 6, 1, tzinfo=UTC)
+    epoch_file = tmp_path / "pnl_epoch"
+    epoch_file.write_text(stored.isoformat())
+    override = datetime(2026, 6, 20, 9, 30, tzinfo=UTC)
+    ks, _raised, _flat = _build(params=replace(RISK, kill_switch_pnl_epoch=override.isoformat()))
+    assert ks._pnl_epoch == override
+    assert datetime.fromisoformat(epoch_file.read_text()) == override
+
+
+async def test_restored_epoch_drives_drawdown_and_trip_value_unchanged(tmp_path, monkeypatch):
+    # (d) The restored epoch feeds the drawdown window, and the trip value is
+    # UNCHANGED ($25k base × 33% = $8,250 → a -$9,000 realized loss still PAUSES).
+    # Proves persistence didn't alter the brake math or the consecutive-loss path.
+    monkeypatch.setenv("KILL_SWITCH_STATE_DIR", str(tmp_path))
+    epoch = datetime.now(UTC) - timedelta(hours=2)
+    (tmp_path / "pnl_epoch").write_text(epoch.isoformat())
+    params = replace(
+        RISK,
+        kill_switch_allocation_usd=25_000.0,
+        kill_switch_max_drawdown_pct=33.0,
+        kill_switch_pnl_epoch="",
+    )
+    rows = [{"pnl_net": -9_000.0, "exit_filled_at": datetime.now(UTC).isoformat()}]
+    ks, raised, flat = _build(db=_db(rows), params=params)
+    assert ks._pnl_epoch == epoch  # came from the file, not boot time
+    v = await ks.poll_once()
+    assert v.action == "pause" and v.reason == "drawdown"
+    assert raised == ["kill_switch:drawdown"]
+    assert flat == [True]
+
+
+def test_epoch_created_not_persisted_when_state_dir_unwritable(tmp_path, monkeypatch, caplog):
+    # Robustness: an unwritable state dir must NOT crash construction — it falls back
+    # to a fresh (non-persisted) epoch and warns distinctly (the pre-#173 behaviour).
+    import logging
+
+    not_a_dir = tmp_path / "afile"
+    not_a_dir.write_text("x")  # a FILE where the state dir should be → mkdir fails
+    monkeypatch.setenv("KILL_SWITCH_STATE_DIR", str(not_a_dir))
+    with caplog.at_level(logging.WARNING):
+        ks, _raised, _flat = _build(params=replace(RISK, kill_switch_pnl_epoch=""))
+    assert ks._pnl_epoch is not None  # still functions
+    assert any("NOT persisted" in r.getMessage() for r in caplog.records)
+
+
+def test_epoch_corrupt_state_file_treated_as_absent(tmp_path, monkeypatch):
+    # A garbage/corrupt epoch file is treated as ABSENT → a fresh epoch is created and
+    # the file is rewritten with a valid value, rather than crashing the kill switch.
+    monkeypatch.setenv("KILL_SWITCH_STATE_DIR", str(tmp_path))
+    epoch_file = tmp_path / "pnl_epoch"
+    epoch_file.write_text("not-a-timestamp")
+    ks, _raised, _flat = _build(params=replace(RISK, kill_switch_pnl_epoch=""))
+    assert ks._pnl_epoch is not None
+    # Rewritten with a parseable value.
+    assert datetime.fromisoformat(epoch_file.read_text()) == ks._pnl_epoch
