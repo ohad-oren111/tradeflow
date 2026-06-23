@@ -180,6 +180,46 @@ async def test_demoted_feed_chatter_routes_to_logs_not_telegram():
     assert len(delivered) == 2
 
 
+async def test_hourly_digest_log_only_daily_summary_routes():
+    """Q3 (signal-only Telegram): the HOURLY session digest was demoted to a
+    [DIGEST] prefix so it stays in the logs and NEVER reaches Telegram, while the
+    once-per-UTC-day [ALERT] daily_summary card remains the one digest that routes."""
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    handler = TelegramAlertHandler(queue, loop)
+
+    # hourly digest is now [DIGEST], not [ALERT] -> must stay in logs
+    handler.emit(
+        logging.LogRecord(
+            "x",
+            logging.INFO,
+            "p",
+            0,
+            "[DIGEST] hourly_session_digest: pos=FLAT evals=59 regime=59 feed OK",
+            None,
+            None,
+        )
+    )
+    await asyncio.sleep(0)
+    assert queue.empty(), "demoted [DIGEST] hourly digest must not reach Telegram"
+
+    # the daily summary card still routes (the single daily digest)
+    handler.emit(
+        logging.LogRecord(
+            "x",
+            logging.INFO,
+            "p",
+            0,
+            "[ALERT] daily_summary: day=2026-06-22 wins=0 losses=0 net=0.00",
+            None,
+            None,
+        )
+    )
+    await asyncio.sleep(0)
+    msg = await asyncio.wait_for(queue.get(), timeout=0.5)
+    assert "daily_summary" in msg
+
+
 async def test_alert_handler_drops_oldest_when_queue_full(caplog):
     caplog.set_level(logging.WARNING)
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)

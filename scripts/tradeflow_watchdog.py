@@ -1243,8 +1243,11 @@ def _parse_digest_readiness(log_text: str) -> str:
     """Extract the readiness fragment from the most recent hourly digest line.
 
     The orchestrator appends ``warmup=… last_bar=… commit=…`` (W-S15.3 Track E)
-    to ``[ALERT] hourly_session_digest``. Returns a placeholder when no digest is
-    present (e.g. fresh boot) or the digest predates this feature.
+    to ``[DIGEST] hourly_session_digest`` (Q3 demoted it from ``[ALERT]`` to
+    log-only for a signal-only Telegram channel; this parser keys on the
+    ``hourly_session_digest:`` substring, so the prefix change is transparent).
+    Returns a placeholder when no digest is present (e.g. fresh boot) or the
+    digest predates this feature.
     """
     latest = ""
     for line in log_text.splitlines():
