@@ -28,6 +28,7 @@ from src.execution.dirty_set import DirtySet
 from src.execution.reconciler import (
     ReconcileAction,
     Reconciler,
+    _broker_pnl_for_orders,
     _exit_price_for,
     _fill_price_for_order,
     _filled_order_id_for,
@@ -1094,6 +1095,75 @@ def test_fill_price_for_order_no_match_returns_none():
     fills = [_exec_fill(99, 2, 30310.0)]
     assert _fill_price_for_order(fills, 20) is None
     assert _fill_price_for_order([], 20) is None
+
+
+def _exec_fill_cr(order_id: int, shares: float, price: float, commission: float, realized: float):
+    """Fill with a populated commissionReport (Q4b broker-truth capture)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        execution=SimpleNamespace(orderId=order_id, shares=shares, price=price, avgPrice=price),
+        commissionReport=SimpleNamespace(commission=commission, realizedPNL=realized),
+    )
+
+
+def test_broker_pnl_for_orders_sums_commission_roundtrip_and_realized_on_exit():
+    # entry order 10 (commission 0.62, no realized), exit order 20 (commission 0.62,
+    # realizedPNL +598.76). Commission is the round-trip over {10,20}; realized is
+    # the exit leg only.
+    fills = [
+        _exec_fill_cr(10, 2, 30000.0, commission=0.62, realized=0.0),
+        _exec_fill_cr(20, 2, 30300.0, commission=0.62, realized=598.76),
+    ]
+    commission, realized = _broker_pnl_for_orders(fills, {10, 20}, {20})
+    assert commission == pytest.approx(1.24)
+    assert realized == pytest.approx(598.76)
+
+
+def test_broker_pnl_for_orders_none_until_commission_report_arrives():
+    # commissionReport is zero-filled until IBKR reports it async → treat as absent.
+    fills = [_exec_fill_cr(20, 2, 30300.0, commission=0.0, realized=0.0)]
+    commission, realized = _broker_pnl_for_orders(fills, {10, 20}, {20})
+    assert commission is None and realized is None
+    # no fills at all
+    assert _broker_pnl_for_orders([], {20}, {20}) == (None, None)
+
+
+async def test_backfill_broker_pnl_patches_closed_lifecycle():
+    ib = _make_mock_ib()
+    ib.get_fills = AsyncMock(
+        return_value=[
+            _exec_fill_cr(10, 2, 30000.0, commission=0.62, realized=0.0),
+            _exec_fill_cr(20, 2, 30300.0, commission=0.62, realized=598.76),
+        ]
+    )
+    db = _make_mock_db()
+    db.select = AsyncMock(
+        return_value=[{"lifecycle_id": "lc-1", "entry_order_id": 10, "exit_order_id": 20}]
+    )
+    rec, *_ = _build_reconciler(ib=ib, db=db)
+    patched = await rec._backfill_broker_pnl()
+    assert patched == 1
+    db.update_lifecycle.assert_awaited_once()
+    lc_id, updates = db.update_lifecycle.await_args.args
+    assert lc_id == "lc-1"
+    assert updates["commission_broker"] == pytest.approx(1.24)
+    assert updates["realized_pnl_broker"] == pytest.approx(598.76)
+
+
+async def test_backfill_broker_pnl_noop_when_report_not_arrived():
+    ib = _make_mock_ib()
+    ib.get_fills = AsyncMock(
+        return_value=[_exec_fill_cr(20, 2, 30300.0, commission=0.0, realized=0.0)]
+    )
+    db = _make_mock_db()
+    db.select = AsyncMock(
+        return_value=[{"lifecycle_id": "lc-1", "entry_order_id": 10, "exit_order_id": 20}]
+    )
+    rec, *_ = _build_reconciler(ib=ib, db=db)
+    patched = await rec._backfill_broker_pnl()
+    assert patched == 0
+    db.update_lifecycle.assert_not_awaited()
 
 
 def test_filled_order_id_for_attribution():

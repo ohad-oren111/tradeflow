@@ -38,6 +38,7 @@ class TradeRow:
     exit_price: float | None
     qty: int | None
     pnl_net: float | None
+    realized_pnl_broker: float | None  # Q4b — IBKR realizedPNL when captured, else None
     exit_reason: str | None
     state: str
     is_open: bool
@@ -86,7 +87,7 @@ class TradesAggregator:
                 filters={"order": "created_at.desc", "limit": str(limit)},
                 columns=(
                     "lifecycle_id,direction,symbol,entry_price,exit_price,entry_qty,"
-                    "pnl_net,exit_reason,state,entry_filled_at,exit_filled_at"
+                    "pnl_net,realized_pnl_broker,exit_reason,state,entry_filled_at,exit_filled_at"
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — surface as a view error, never 500
@@ -120,6 +121,7 @@ def _to_trade_row(row: dict[str, Any]) -> TradeRow:
         exit_price=None if is_open else _f(row.get("exit_price")),
         qty=_i(row.get("entry_qty")),
         pnl_net=None if is_open else _f(row.get("pnl_net")),
+        realized_pnl_broker=None if is_open else _f(row.get("realized_pnl_broker")),
         exit_reason=None if is_open else (row.get("exit_reason") or None),
         state=state,
         is_open=is_open,

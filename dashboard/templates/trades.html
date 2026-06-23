@@ -22,7 +22,8 @@
           <th class="text-end">Entry</th>
           <th class="text-end">Exit</th>
           <th class="text-end">Qty</th>
-          <th class="text-end">P&amp;L net</th>
+          <th class="text-end" title="DB estimate — pnl_gross minus fixed-rate commission (not IBKR)">P&amp;L net <span class="text-muted">(est.)</span></th>
+          <th class="text-end" title="IBKR commissionReport.realizedPNL, backfilled by the reconciler; — until the broker reports it (semantics pending live verification)">Broker P&amp;L</th>
           <th>Reason</th>
           <th>State</th>
         </tr>
@@ -42,6 +43,9 @@
           <td class="text-end">{{ t.qty if t.qty is not none else "—" }}</td>
           <td class="text-end {% if t.pnl_net is not none and t.pnl_net < 0 %}text-danger{% elif t.pnl_net is not none and t.pnl_net > 0 %}text-success{% endif %}">
             {% if t.pnl_net is not none %}{{ "%.2f"|format(t.pnl_net) }}{% else %}—{% endif %}
+          </td>
+          <td class="text-end {% if t.realized_pnl_broker is not none and t.realized_pnl_broker < 0 %}text-danger{% elif t.realized_pnl_broker is not none and t.realized_pnl_broker > 0 %}text-success{% endif %}">
+            {% if t.realized_pnl_broker is not none %}{{ "%.2f"|format(t.realized_pnl_broker) }}{% else %}<span class="text-muted">—</span>{% endif %}
           </td>
           <td>{{ t.exit_reason or "—" }}</td>
           <td><span class="badge bg-secondary">{{ t.state }}</span></td>

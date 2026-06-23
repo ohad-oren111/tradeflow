@@ -776,6 +776,72 @@ class Reconciler:
                 )
         return _exit_price_for(lifecycle, exit_reason)
 
+    async def _backfill_broker_pnl(self, *, limit: int = 50) -> int:
+        """Q4b — patch IBKR broker-truth P&L onto recently-CLOSED lifecycles.
+
+        ADDITIVE + best-effort: writes ``commission_broker`` (Σ round-trip
+        commissionReport.commission over entry+exit fills) and
+        ``realized_pnl_broker`` (Σ commissionReport.realizedPNL over the exit
+        fills) for CLOSED lifecycles that don't have them yet. ``commissionReport``
+        is delivered asynchronously *after* the fill (it is zero-filled inline), so
+        capturing it here on the periodic scan — rather than at close time — is
+        what makes it reliable. ``IB.fills()`` is an in-session cache, so rows
+        whose fills predate a reconnect stay NULL (the dashboard then falls back to
+        the computed estimate). NEVER touches pnl_net / the kill-switch input, and
+        never raises into the scan loop.
+        """
+        try:
+            rows = await self._db.select(
+                "lifecycles",
+                filters={
+                    "state": "eq.CLOSED",
+                    "realized_pnl_broker": "is.null",
+                    "exit_order_id": "not.is.null",
+                    "order": "updated_at.desc",
+                    "limit": str(limit),
+                },
+                columns="lifecycle_id,entry_order_id,exit_order_id",
+            )
+        except Exception as exc:  # noqa: BLE001 — observability, never break the scan
+            LOGGER.debug("[RECON] broker_pnl backfill: select skipped — %r", exc)
+            return 0
+        if not rows:
+            return 0
+        try:
+            fills = await self._ib.get_fills()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("[RECON] broker_pnl backfill: get_fills skipped — %r", exc)
+            return 0
+        patched = 0
+        for row in rows:
+            exit_id = row.get("exit_order_id")
+            if exit_id is None:
+                continue
+            entry_id = row.get("entry_order_id")
+            commission_ids = {int(x) for x in (entry_id, exit_id) if x is not None}
+            commission, realized = _broker_pnl_for_orders(fills, commission_ids, {int(exit_id)})
+            if commission is None and realized is None:
+                continue  # commissionReport not arrived / fill not in session cache
+            updates: dict[str, Any] = {}
+            if commission is not None:
+                updates["commission_broker"] = round(commission, 4)
+            if realized is not None:
+                updates["realized_pnl_broker"] = round(realized, 4)
+            try:
+                await self._db.update_lifecycle(str(row["lifecycle_id"]), updates)
+                patched += 1
+                LOGGER.info(
+                    "[RECON] broker_pnl backfilled — id=%s commission=%s realized=%s",
+                    row.get("lifecycle_id"),
+                    updates.get("commission_broker"),
+                    updates.get("realized_pnl_broker"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug(
+                    "[RECON] broker_pnl patch skipped — id=%s %r", row.get("lifecycle_id"), exc
+                )
+        return patched
+
     async def _cancel_open_legs(
         self,
         lifecycle: Lifecycle,
@@ -893,10 +959,17 @@ class Reconciler:
         if swept:
             counts[ReconcileAction.ORPHAN_SWEPT] += swept
 
+        # Q4b — additive broker-truth P&L backfill (best-effort, off the order
+        # path). commissionReport arrives async after the fill, so we patch the
+        # broker columns onto recently-CLOSED lifecycles here, where the fill
+        # cache has had time to populate. Never touches pnl_net / the kill switch.
+        backfilled = await self._backfill_broker_pnl()
+
         LOGGER.info(
-            "[RECON] tick: full_scan_complete — non_closed=%s actions=%s",
+            "[RECON] tick: full_scan_complete — non_closed=%s actions=%s broker_pnl_backfilled=%s",
             len(non_closed),
             dict(counts),
+            backfilled,
         )
         # Self-heal summary (proves the missing-leg recovery path ran this scan).
         active = sum(1 for lc in non_closed if lc.state == State.ACTIVE.value)
@@ -1530,6 +1603,44 @@ def _fill_price_for_order(fills: list[Any], order_id: int) -> float | None:
     if total_qty > 0:
         return total_notional / total_qty
     return None
+
+
+def _broker_pnl_for_orders(
+    fills: list[Any],
+    commission_order_ids: set[int],
+    realized_order_ids: set[int],
+) -> tuple[float | None, float | None]:
+    """Q4b — sum IBKR ``commissionReport`` over matching fills (pure, testable).
+
+    ``commission`` is summed over fills whose ``execution.orderId`` is in
+    ``commission_order_ids`` (entry+exit → true round-trip commission, reported as
+    a positive cost); ``realizedPNL`` over ``realized_order_ids`` (the exit/closing
+    leg). Returns ``(None, None)`` for whichever number the broker has not yet
+    reported — ``commissionReport`` is zero-filled until it arrives asynchronously,
+    so a zero is treated as "not yet populated" (a genuine break-even round-trip
+    therefore stays NULL and falls back to the computed estimate — acceptable).
+    """
+    commission = 0.0
+    realized = 0.0
+    saw_commission = False
+    saw_realized = False
+    for fill in fills:
+        execution = getattr(fill, "execution", None)
+        report = getattr(fill, "commissionReport", None)
+        if execution is None or report is None:
+            continue
+        oid = getattr(execution, "orderId", None)
+        if oid in commission_order_ids:
+            c = getattr(report, "commission", None)
+            if c:  # non-zero ⇒ broker has reported this fill's commission
+                commission += abs(float(c))
+                saw_commission = True
+        if oid in realized_order_ids:
+            r = getattr(report, "realizedPNL", None)
+            if r is not None and float(r) != 0.0:
+                realized += float(r)
+                saw_realized = True
+    return (commission if saw_commission else None, realized if saw_realized else None)
 
 
 def _filled_qty_for_order(fills: list[Any], order_id: int) -> int | None:

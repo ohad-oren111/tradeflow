@@ -92,6 +92,13 @@ class Lifecycle:
     pnl_gross: float | None = None
     pnl_net: float | None = None
 
+    # Q4b — ADDITIVE broker-truth columns, backfilled by the reconciler from the
+    # fills' commissionReport (async-arriving). NOT part of _PNL_FIELDS, so they
+    # are unconstrained in every state and never gate an invariant. The kill-switch
+    # still consumes pnl_net only — these never change its input.
+    commission_broker: float | None = None
+    realized_pnl_broker: float | None = None
+
     metadata: dict[str, Any] = field(default_factory=dict)
 
     created_at: str | None = None
