@@ -1082,7 +1082,16 @@ class Orchestrator:
                 )
 
     async def _emit_hourly_digest(self) -> None:
-        """Build + log the [ALERT] hourly session-status line. Edge-suppressed."""
+        """Build + log the hourly session-status line (LOG-ONLY). Edge-suppressed.
+
+        Q3 (signal-only Telegram): this line is emitted with a ``[DIGEST]`` prefix,
+        NOT ``[ALERT]``, so the TelegramAlertHandler (which routes on the ``[ALERT]``
+        substring) skips it — the hourly rollup stays in the logs and no longer spams
+        the operator channel. The loop itself is kept: it still flushes the durable
+        decision journal and drives the once-per-UTC-day ``daily_summary`` card, which
+        remains the ONE digest that reaches Telegram. Mirrors the ``[FEED]`` demotion
+        of per-5-min feed self-heal chatter.
+        """
         now = datetime.now(UTC)
         if _in_session_edge_window(now, edge_minutes=0):
             LOGGER.debug("[ORCH] hourly_digest: suppressed — session edge window")
@@ -1124,7 +1133,9 @@ class Orchestrator:
             suppressed_count=suppressed,
             readiness=readiness,
         )
-        LOGGER.info("[ALERT] hourly_session_digest: %s", line)
+        # Q3 — LOG-ONLY ([DIGEST], not [ALERT]) so the Telegram channel stays
+        # signal-only; the daily_summary card below is the one digest that posts.
+        LOGGER.info("[DIGEST] hourly_session_digest: %s", line)
 
         # PR-D3c — flush the durable decision journal on the same hourly tick
         # (Constraint 5a default B). flush never raises; a write failure leaves

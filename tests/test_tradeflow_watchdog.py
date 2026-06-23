@@ -1070,7 +1070,7 @@ def test_deployed_commit_from_env_missing_returns_unknown():
 
 def test_parse_digest_readiness_extracts_fragment():
     logs = (
-        "2026-05-29 18:00 INFO [ALERT] hourly_session_digest: \U0001f4ca TradeFlow hourly "
+        "2026-05-29 18:00 INFO [DIGEST] hourly_session_digest: \U0001f4ca TradeFlow hourly "
         "17:00-18:00Z | pos=FLAT | evals=60 | feed OK | "
         "warmup=ready (120 bars) last_bar=4s commit=94245ad1\n"
         "2026-05-29 18:01 INFO [STRAT] eval decision=noop_warmup\n"
@@ -1082,9 +1082,9 @@ def test_parse_digest_readiness_extracts_fragment():
 
 def test_parse_digest_readiness_takes_latest_digest():
     logs = (
-        "[ALERT] hourly_session_digest: ... "
+        "[DIGEST] hourly_session_digest: ... "
         "warmup=warming 10/100 bars (~90m) last_bar=2s commit=aaa\n"
-        "[ALERT] hourly_session_digest: ... warmup=ready (110 bars) last_bar=1s commit=bbb\n"
+        "[DIGEST] hourly_session_digest: ... warmup=ready (110 bars) last_bar=1s commit=bbb\n"
     )
     out = wd._parse_digest_readiness(logs)
     assert "ready (110 bars)" in out
