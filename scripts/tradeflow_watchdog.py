@@ -557,6 +557,7 @@ def handle_feed_stale_episode(
     *,
     auto_heal: Callable[[dict], tuple[bool, str]],
     send: Callable[[str], bool],
+    gateway_healthy: bool = True,
     now_fn: Callable[[], datetime] = now_utc,
 ) -> str:
     """Drive the gateway-restart ladder when the app hands off a dark feed.
@@ -566,6 +567,12 @@ def handle_feed_stale_episode(
     gateway-restart handoff marker with no later recovery. Reuses the existing
     ``attempt_auto_heal`` ladder (docker restart, capped 3/hr) + the
     ``MANUAL INTERVENTION`` page when exhausted.
+
+    PR #171 — when the terminal page is reached AND the expiry signature holds
+    (stale feed + gateway healthy + a gateway restart did NOT restore bar flow),
+    the page names its likely cause: a contract expiry / missed roll (the exact
+    failure a gateway restart cannot fix — the original 2026-06 outage). Any other
+    terminal cause keeps the generic message.
 
     Side effects are injected (``auto_heal``, ``send``) so the routing is unit-
     testable with explicit args and no real docker/Telegram. Returns a short
@@ -586,14 +593,26 @@ def handle_feed_stale_episode(
     heal_ok, heal_msg = auto_heal(state)
     LOGGER.info("[WATCHDOG] feed_auto_heal: %s", heal_msg)
     if not heal_ok and "max attempts exceeded" in heal_msg:
+        # Expiry signature: the feed is still dark AFTER the gateway-restart ladder
+        # was exhausted, yet the gateway itself is healthy/reachable — a gateway
+        # restart fixes a wedge, NOT an expired/rolled contract. Name that cause.
+        expiry_suspected = gateway_healthy
+        LOGGER.info("[FEED] episode terminal — expiry_suspected=%s", expiry_suspected)
         if should_send_alert(state, ALERT_MANUAL_INTERVENTION, now_fn):
-            send(
-                "MANUAL INTERVENTION NEEDED: bar feed dark and gateway-restart auto-heal "
-                "exhausted. Likely a wedged gateway OR an expired/rolled contract "
-                "(check the INSTRUMENT env). Run: docker restart tradeflow-ib-gateway"
-            )
+            if expiry_suspected:
+                send(
+                    "MANUAL INTERVENTION NEEDED — contract expiry suspected: bar feed dark "
+                    "while the gateway is HEALTHY and a gateway restart did NOT restore "
+                    "bars. A restart cannot fix an expired/rolled contract — check "
+                    "front-month resolution (the auto-roll) / the INSTRUMENT override."
+                )
+            else:
+                send(
+                    "MANUAL INTERVENTION NEEDED: bar feed dark and gateway-restart auto-heal "
+                    "exhausted. Run: docker restart tradeflow-ib-gateway"
+                )
             record_alert(state, ALERT_MANUAL_INTERVENTION, now_fn)
-        return "manual_intervention"
+        return "manual_intervention_expiry" if expiry_suspected else "manual_intervention"
     return "gateway_restart_issued" if heal_ok else "gateway_restart_failed"
 
 
@@ -786,11 +805,15 @@ def run_monitor() -> int:
     # reconnect ladder exhausted), restart the gateway here — the app can't.
     # Guarded on ok_ib: if the API is down the block above already auto-heals.
     if ok_ib:
+        # ok_ib is True here, so the gateway is healthy/reachable — a dark feed
+        # that survives the gateway-restart ladder in this branch is the
+        # expiry-suspected signature (PR #171).
         feed_status = handle_feed_stale_episode(
             state,
             _app_recent_logs(tail=400),
             auto_heal=attempt_auto_heal,
             send=send_telegram,
+            gateway_healthy=True,
         )
         LOGGER.info("[WATCHDOG] feed_episode_check: %s", feed_status)
 
