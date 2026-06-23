@@ -111,18 +111,17 @@ def test_panel_working_orders_handles_empty(_env):
     assert "No working orders" in r.text
 
 
-def test_healthz_requires_auth(_env):
-    """Default behavior: /healthz inherits the global auth dependency.
-
-    Docker HEALTHCHECK can supply auth via curl -u; we accept the small
-    Docker overhead for the simpler "all routes gated" guarantee.
-    """
+def test_healthz_is_public_liveness_probe(_env):
+    """Q4: /healthz is exempt from the global auth dependency so Docker/uptime can
+    probe liveness WITHOUT the operator's basic-auth creds. Everything else stays
+    gated (asserted by the per-route *_requires_auth tests)."""
     client = TestClient(create_app(_make_orch()))
-    r = client.get("/healthz")
-    assert r.status_code == 401
+    r = client.get("/healthz")  # no auth
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+    # auth supplied is still fine (probe is path-exempt, not creds-dependent)
     r2 = client.get("/healthz", auth=(_TEST_USER, _TEST_PASS))
     assert r2.status_code == 200
-    assert r2.json() == {"status": "ok"}
 
 
 def test_no_mutation_endpoints_exist(_env):
@@ -327,7 +326,10 @@ def test_scoreboard_seanbot_dollars_from_points(_env):
     body = r.text
     assert "192.00" in body  # 48pt × $2 × 2ct
     assert "2026-05-31" in body
-    assert "SeanBot leads" in body  # TF 0 vs SeanBot +192 → SeanBot ahead
+    # 05-31 has no operator anchor → estimate day → headline is hedged + flagged
+    # not authoritative (Q4 honesty pass), not the confident "leads by".
+    assert "SeanBot is ahead by" in body  # TF 0 vs SeanBot +192 → SeanBot ahead
+    assert "not authoritative" in body  # untrusted-comparison banner/headline
     assert "Different books" in body  # caveat
 
 
@@ -350,6 +352,30 @@ def test_scoreboard_compares_two_days_with_winner_and_cumulative():
     assert d31.delta == 10.0 and d31.winner == "TF"  # lost less → TF +10
     # cumulative delta advances by 05-31's daily delta from the prior day
     assert d31.delta_cum - d30.delta_cum == pytest.approx(10.0, abs=0.005)
+
+
+def test_scoreboard_headline_honest_about_estimates():
+    """Q4 honesty pass: the cumulative 'leads by $X' headline is only authoritative
+    when EVERY SeanBot day is an operator anchor. An estimate day hedges the verb
+    and flags it 'not authoritative', and the staleness fields are populated."""
+    from dashboard.scoreboard import _build_scoreboard
+    from dashboard.seanbot_authoritative import AUTHORITATIVE_SEANBOT_DAILY_PNL
+
+    # All-anchor scoreboard (no estimate day): confident "leads by", trustworthy.
+    anchored = _build_scoreboard(tf_by_day={}, sb_estimate_by_day={})
+    assert anchored.has_estimate is False
+    assert anchored.headline_trustworthy is True
+    assert "leads by" in anchored.headline
+    assert "not authoritative" not in anchored.headline
+    assert anchored.latest_anchor_day == max(AUTHORITATIVE_SEANBOT_DAILY_PNL)
+
+    # Add an un-anchored estimate day → headline must hedge + flag.
+    estimated = _build_scoreboard(tf_by_day={}, sb_estimate_by_day={"2026-06-20": 500.0})
+    assert estimated.has_estimate is True
+    assert estimated.headline_trustworthy is False
+    assert estimated.estimate_day_count == 1
+    assert "is ahead by" in estimated.headline
+    assert "not authoritative" in estimated.headline
 
 
 def test_scoreboard_one_sided_day_renders_other_side_zero(_env):

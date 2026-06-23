@@ -25,7 +25,6 @@ class PanelStatus:
     paper_mode: bool
     account: str
     server_version: str | None
-    last_heartbeat_at: datetime | None
     front_month_symbol: str
 
 
@@ -121,7 +120,6 @@ class DashboardAggregator:
             paper_mode=paper_mode,
             account=account_raw[:3] if account_raw else "?",
             server_version=sv,
-            last_heartbeat_at=None,
             front_month_symbol=instrument,
         )
 

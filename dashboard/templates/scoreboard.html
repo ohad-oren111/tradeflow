@@ -11,6 +11,19 @@
   {% elif not board.rows %}
     <div class="text-muted">No realized P&amp;L yet.</div>
   {% else %}
+    {% if board.has_estimate %}
+    <div class="alert alert-warning py-2 mb-3" role="alert">
+      <strong>⚠ Untrusted comparison (§0.5.197).</strong>
+      SeanBot has operator-trusted anchors only through
+      <strong>{{ board.latest_anchor_day if board.latest_anchor_day else "—" }}</strong>;
+      <strong>{{ board.estimate_day_count }}</strong> displayed day{{ "s" if board.estimate_day_count != 1 else "" }}
+      use a lossy per-exit <em>estimate</em> (SeanBot posts no daily-summary line and re-announces
+      exits at drifting prices). The cumulative SeanBot total and the “{{ board.leader }} … by $…”
+      headline are therefore <strong>not authoritative</strong> — treat the SeanBot column and any
+      “lead” as indicative only. TF’s column is its own DB-computed P&amp;L (fixed-commission estimate,
+      not IBKR-realized).
+    </div>
+    {% endif %}
     <div class="d-flex gap-4 mb-3 align-items-baseline flex-wrap">
       <span class="h4 mb-0
         {% if board.leader == 'TF' %}text-success{% elif board.leader == 'SeanBot' %}text-danger{% endif %}">

@@ -33,7 +33,12 @@ LOGGER = logging.getLogger(__name__)
 
 _DASHBOARD_DIR = Path(__file__).parent
 _TEMPLATES = Jinja2Templates(directory=str(_DASHBOARD_DIR / "templates"))
-_security = HTTPBasic()
+# auto_error=False so the app-wide dependency can exempt /healthz (an
+# unauthenticated liveness probe) instead of 401-ing it before verify runs.
+_security = HTTPBasic(auto_error=False)
+
+# Q4 — unauthenticated liveness probe path. Everything else stays auth-gated.
+_PUBLIC_PATHS = frozenset({"/healthz"})
 
 
 def load_credentials() -> tuple[str, str]:
@@ -53,16 +58,26 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     user_b = username.encode("utf-8")
     pass_b = password.encode("utf-8")
 
-    def verify(credentials: Annotated[HTTPBasicCredentials, Depends(_security)]) -> str:
+    def verify(
+        request: Request,
+        credentials: Annotated[HTTPBasicCredentials | None, Depends(_security)],
+    ) -> str:
+        # Liveness probe is intentionally unauthenticated so Docker/uptime checks
+        # can hit it without the operator's basic-auth creds.
+        if request.url.path in _PUBLIC_PATHS:
+            return "public"
+        unauthorized = HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+        if credentials is None:
+            raise unauthorized
         u_ok = secrets.compare_digest(credentials.username.encode("utf-8"), user_b)
         p_ok = secrets.compare_digest(credentials.password.encode("utf-8"), pass_b)
         if not (u_ok and p_ok):
             LOGGER.warning("[DASH] auth: failed — username=%s", credentials.username)
-            raise HTTPException(
-                status_code=401,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Basic"},
-            )
+            raise unauthorized
         return credentials.username
 
     app = FastAPI(
