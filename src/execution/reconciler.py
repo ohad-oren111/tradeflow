@@ -800,7 +800,7 @@ class Reconciler:
                     "order": "updated_at.desc",
                     "limit": str(limit),
                 },
-                columns="lifecycle_id,entry_order_id,exit_order_id",
+                columns="lifecycle_id,entry_order_id,exit_order_id,pnl_net",
             )
         except Exception as exc:  # noqa: BLE001 — observability, never break the scan
             LOGGER.debug("[RECON] broker_pnl backfill: select skipped — %r", exc)
@@ -836,6 +836,23 @@ class Reconciler:
                     updates.get("commission_broker"),
                     updates.get("realized_pnl_broker"),
                 )
+                # Q-E watcher (3): on the FIRST real round-trip that backfills a broker
+                # realized P&L, auto-compare it to the fixed-rate estimate and log the
+                # realizedPNL-semantics verdict — discharges the #179 live-verification
+                # without anyone polling. Log-only; never affects pnl_net / kill-switch.
+                if "realized_pnl_broker" in updates:
+                    verdict, detail = broker_pnl_semantics_verdict(
+                        updates["realized_pnl_broker"], row.get("pnl_net")
+                    )
+                    LOGGER.info(
+                        "[WATCH] broker_pnl_semantics: id=%s realized_broker=%s pnl_net_est=%s "
+                        "%s — verdict=%s",
+                        row.get("lifecycle_id"),
+                        updates["realized_pnl_broker"],
+                        row.get("pnl_net"),
+                        detail,
+                        verdict,
+                    )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.debug(
                     "[RECON] broker_pnl patch skipped — id=%s %r", row.get("lifecycle_id"), exc
@@ -1641,6 +1658,32 @@ def _broker_pnl_for_orders(
                 realized += float(r)
                 saw_realized = True
     return (commission if saw_commission else None, realized if saw_realized else None)
+
+
+def broker_pnl_semantics_verdict(
+    realized_broker: float | None, pnl_net_est: float | None
+) -> tuple[str, str]:
+    """Q-E watcher (3): classify IBKR realizedPNL vs the fixed-rate pnl_net estimate.
+
+    Returns ``(verdict, detail)``. The verdict discharges the #179 owed live-
+    verification on the next real round-trip: if the broker's realized P&L tracks the
+    estimate closely, the fixed-commission model is faithful; a consistent gap tells
+    the operator which way realizedPNL's semantics diverge (e.g. it's gross vs net of
+    commission, or carries a fee the estimate omits). Pure — no IO.
+    """
+    if realized_broker is None or pnl_net_est is None:
+        return "INDETERMINATE", "missing one side"
+    rb = float(realized_broker)
+    est = float(pnl_net_est)
+    abs_delta = rb - est
+    denom = max(abs(rb), abs(est), 1.0)
+    rel = abs_delta / denom
+    detail = f"abs_delta={abs_delta:+.2f} rel={rel*100:+.1f}%"
+    if abs(abs_delta) <= 2.0 or abs(rel) <= 0.02:
+        return "ESTIMATE-FAITHFUL", detail  # within ~1 commission tick / 2%
+    if rb > est:
+        return "BROKER-HIGHER", detail  # estimate is conservative (over-charges cost)
+    return "BROKER-LOWER", detail  # estimate too rosy — realized pays more cost/slippage
 
 
 def _filled_qty_for_order(fills: list[Any], order_id: int) -> int | None:
