@@ -154,18 +154,32 @@ def evaluate(tape, slip: Slippage, costs: CostModel) -> list[VariantResult]:
         tg = check_train(s_tr)
         results.append(
             VariantResult(
-                name=name, stop=stop, lock=lock, trail=trail,
-                n=n, win_rate=win_rate, avg_win_pts=avg_win, avg_loss_pts=avg_loss,
-                breakeven_win_rate=breakeven, gap=gap,
-                full_pf=_pf(s_full.profit_factor), full_exp=round(s_full.expectancy_usd, 2),
-                train_n=s_tr.n_trades, train_pf=_pf(s_tr.profit_factor),
+                name=name,
+                stop=stop,
+                lock=lock,
+                trail=trail,
+                n=n,
+                win_rate=win_rate,
+                avg_win_pts=avg_win,
+                avg_loss_pts=avg_loss,
+                breakeven_win_rate=breakeven,
+                gap=gap,
+                full_pf=_pf(s_full.profit_factor),
+                full_exp=round(s_full.expectancy_usd, 2),
+                train_n=s_tr.n_trades,
+                train_pf=_pf(s_tr.profit_factor),
                 train_exp=round(s_tr.expectancy_usd, 2),
-                train_each_year=all(v > 0 for v in s_tr.per_year.values()) if s_tr.per_year else False,
+                train_each_year=(
+                    all(v > 0 for v in s_tr.per_year.values()) if s_tr.per_year else False
+                ),
                 train_pass=tg.passed,
-                hold_n=s_ho.n_trades, hold_pf=_pf(s_ho.profit_factor),
+                hold_n=s_ho.n_trades,
+                hold_pf=_pf(s_ho.profit_factor),
                 hold_exp=round(s_ho.expectancy_usd, 2),
                 train_sr=s_tr.sr_per_trade,
-                holdout_pass=False, dsr=0.0, clears=False,
+                holdout_pass=False,
+                dsr=0.0,
+                clears=False,
             )
         )
     return results
@@ -202,71 +216,91 @@ def apply_deflation(results: list[VariantResult], tape, slip, costs, *, prior_tr
     )
     champ = max(results, key=lambda r: (-1.0 if r.train_pf == float("inf") else r.train_pf))
     return {
-        "n_trials": n_trials, "sr_variance_pool": round(sr_var, 6),
-        "sr0_expected_max": round(sr0, 5), "bonferroni_p": haircut_p, "champion": champ.name,
+        "n_trials": n_trials,
+        "sr_variance_pool": round(sr_var, 6),
+        "sr0_expected_max": round(sr0, 5),
+        "bonferroni_p": haircut_p,
+        "champion": champ.name,
     }
 
 
 def build_report(results: list[VariantResult], defl: dict, span, bars: int, sigs: int) -> str:
-    L: list[str] = []
-    w = L.append
+    lines: list[str] = []
+    w = lines.append
     w("=" * 100)
     w("Q-C — MNQ EXIT-GEOMETRY EXPERIMENT (real strategy + real exit; modeled fills)")
     w("=" * 100)
-    w(f"tape: {span[0]} -> {span[1]}  ({bars:,} 1-min NQ bars, roll-adjusted; {sigs:,} gate signals)")
-    w("entry = REAL src.strategy gate stream (regime ON, live config); exit = REAL trail_manager.")
-    w(f"deflation: {defl['n_trials']} trials (prior + {len(VARIANTS)} variants), "
-      f"sr_var_pool={defl['sr_variance_pool']}, SR0={defl['sr0_expected_max']}, "
-      f"bonferroni_p={defl['bonferroni_p']:.3g}")
+    w(f"tape: {span[0]} -> {span[1]}  ({bars:,} 1-min NQ bars, roll-adjusted; {sigs:,} signals)")
+    w("entry = REAL src.strategy gate stream (regime ON); exit = REAL trail_manager.")
+    w(
+        f"deflation: {defl['n_trials']} trials (prior + {len(VARIANTS)} variants), "
+        f"sr_var_pool={defl['sr_variance_pool']}, SR0={defl['sr0_expected_max']}, "
+        f"bonferroni_p={defl['bonferroni_p']:.3g}"
+    )
     w("")
-    w("-- (A) WIN/LOSS POINT ASYMMETRY (gross pts) — the owed decomposition -------------------------------")
-    w(f"  {'variant':<22}{'n':>5}{'win%':>7}{'avgWin':>8}{'avgLoss':>9}{'R:R':>6}{'breakeven%':>11}{'gap':>7}")
+    w("-- (A) WIN/LOSS POINT ASYMMETRY (gross pts) — the owed decomposition " + "-" * 24)
+    w(
+        f"  {'variant':<22}{'n':>5}{'win%':>7}{'avgWin':>8}{'avgLoss':>9}{'R:R':>6}"
+        f"{'breakeven%':>11}{'gap':>7}"
+    )
     for r in results:
         rr = (r.avg_win_pts / r.avg_loss_pts) if r.avg_loss_pts > 0 else float("inf")
         rr_s = "inf" if rr == float("inf") else f"{rr:.2f}"
-        w(f"  {r.name:<22}{r.n:>5}{r.win_rate*100:>6.1f}%{r.avg_win_pts:>8.1f}{r.avg_loss_pts:>9.1f}"
-          f"{rr_s:>6}{r.breakeven_win_rate*100:>10.1f}%{r.gap*100:>+6.1f}")
-    w("  (gap = actual win% − breakeven win%; >0 means the geometry's R:R is self-sustaining)")
+        w(
+            f"  {r.name:<22}{r.n:>5}{r.win_rate*100:>6.1f}%{r.avg_win_pts:>8.1f}"
+            f"{r.avg_loss_pts:>9.1f}{rr_s:>6}{r.breakeven_win_rate*100:>10.1f}%{r.gap*100:>+6.1f}"
+        )
+    w("  (gap = actual win% − breakeven win%; >0 means the R:R is self-sustaining)")
     w("")
-    w("-- (B) PHASE-16 GATE (1 ct, pessimistic costs; TRAIN 2024-03..2025-08 / HOLDOUT 2025-09..2026-06) --")
-    w(f"  {'variant':<22}{'fullPF':>7}{'trainPF':>8}{'tr.exp$':>8}{'tr.n':>6}{'yr+':>5}"
-      f"{'holdPF':>8}{'ho.exp$':>8}{'DSR':>7}{'CLEARS':>8}")
+    w(
+        "-- (B) PHASE-16 GATE (1 ct, pessimistic costs; TRAIN 2024-03..2025-08 / "
+        "HOLDOUT 2025-09..2026-06) --"
+    )
+    w(
+        f"  {'variant':<22}{'fullPF':>7}{'trainPF':>8}{'tr.exp$':>8}{'tr.n':>6}{'yr+':>5}"
+        f"{'holdPF':>8}{'ho.exp$':>8}{'DSR':>7}{'CLEARS':>8}"
+    )
     for r in results:
-        w(f"  {r.name:<22}{r.full_pf:>7}{r.train_pf:>8}{r.train_exp:>8.2f}{r.train_n:>6}"
-          f"{('Y' if r.train_each_year else 'n'):>5}{r.hold_pf:>8}{r.hold_exp:>8.2f}"
-          f"{r.dsr:>7}{('YES' if r.clears else 'no'):>8}")
+        w(
+            f"  {r.name:<22}{r.full_pf:>7}{r.train_pf:>8}{r.train_exp:>8.2f}{r.train_n:>6}"
+            f"{('Y' if r.train_each_year else 'n'):>5}{r.hold_pf:>8}{r.hold_exp:>8.2f}"
+            f"{r.dsr:>7}{('YES' if r.clears else 'no'):>8}"
+        )
     w("")
-    w(f"  pre-registered bar: PF>={PF_MIN} train+holdout, exp/ct>=${EXP_PER_CT_MIN:.0f}, "
-      f"n>={N_TRADES_MIN}, each-year+, holdout PF>=0.75*train, DSR>={DSR_MIN}")
+    w(
+        f"  pre-registered bar: PF>={PF_MIN} train+holdout, exp/ct>=${EXP_PER_CT_MIN:.0f}, "
+        f"n>={N_TRADES_MIN}, each-year+, holdout PF>=0.75*train, DSR>={DSR_MIN}"
+    )
     w("")
     clears = [r for r in results if r.clears]
     base = results[0]
-    w("-- VERDICT ----------------------------------------------------------------------------------------")
+    w("-- VERDICT " + "-" * 88)
     if clears:
         w(f"  {len(clears)} variant(s) CLEAR the full phase16 bar: {[r.name for r in clears]}")
         w("  -> a prod exit-geometry change is JUSTIFIED; PR the best clearing variant.")
     else:
-        w("  NO variant clears the full phase16 bar (PF>=1.30 train+holdout / exp/ct>=$5 / n>=200 /")
-        w("  each-year+ / DSR>=0.95). SMA-bounce exit-geometry does NOT clear the harness; the")
-        w("  negative expectancy is STRUCTURAL — it is in the ENTRY, not recoverable by re-cutting")
-        w("  the stop/trail/lock. The hypothesis (trail clips winners while losers run) is")
-        w("  CONFIRMED as a description (see the breakeven-win% column) but NOT FIXABLE by geometry:")
-        w(f"    baseline avg winner {base.avg_win_pts:.0f}pt vs avg loser {base.avg_loss_pts:.0f}pt "
-          f"-> needs {base.breakeven_win_rate*100:.0f}% wins, actual {base.win_rate*100:.0f}% "
-          f"(gap {base.gap*100:+.0f}pts).")
-        w("    Cutting losers raises win% but shrinks avg-winner in lockstep; letting winners run")
-        w("    lowers win% — the R:R/win-rate tradeoff stays on the same break-even locus. PIVOT:")
-        w("    the MNQ SMA-bounce edge question is CLOSED negative; pursue a different signal, not")
-        w("    a different exit. (Forward edge in the live regime remains unprovable here.)")
+        w("  NO variant clears the full phase16 bar (PF>=1.30 train+holdout / exp/ct>=$5 /")
+        w("  n>=200 / each-year+ / DSR>=0.95). SMA-bounce exit-geometry does NOT clear the")
+        w("  harness; the negative expectancy is STRUCTURAL — in the ENTRY, not recoverable")
+        w("  by re-cutting the stop/trail/lock. The hypothesis (trail clips winners while")
+        w("  losers run) is CONFIRMED as a description (see breakeven-win%) but NOT FIXABLE:")
+        w(
+            f"    baseline avg winner {base.avg_win_pts:.0f}pt vs avg loser "
+            f"{base.avg_loss_pts:.0f}pt -> needs {base.breakeven_win_rate*100:.0f}% wins, "
+            f"actual {base.win_rate*100:.0f}% (gap {base.gap*100:+.0f}pts)."
+        )
+        w("    Cutting losers raises win% but shrinks avg-winner in lockstep; letting winners")
+        w("    run lowers win% — the R:R/win-rate tradeoff stays on the same break-even locus.")
+        w("    PIVOT: the MNQ SMA-bounce edge question is CLOSED negative; pursue a different")
+        w("    signal, not a different exit. (Forward edge in the live regime unprovable here.)")
     w("=" * 100)
-    return "\n".join(L)
+    return "\n".join(lines)
 
 
 def run_study(*, prior_trials: int, rebuild_tape: bool) -> tuple[str, bool]:
     slip = Slippage()
     costs = CostModel()
     df = data.load_history()
-    span = (df["time"].iloc[0], df["time"].iloc[-1])
     df, _info = data.roll_adjust(df)
     seg = data.to_segments(df)[0]
     tape = None
@@ -289,8 +323,12 @@ def run_study(*, prior_trials: int, rebuild_tape: bool) -> tuple[str, bool]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--prior-trials", type=int, default=88,
-                    help="cumulative prior exit-config trials (phase18 1 + PR#122 ~60 + margin)")
+    ap.add_argument(
+        "--prior-trials",
+        type=int,
+        default=88,
+        help="cumulative prior exit-config trials (phase18 1 + PR#122 ~60 + margin)",
+    )
     ap.add_argument("--rebuild-tape", action="store_true")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()

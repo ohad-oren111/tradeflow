@@ -1,11 +1,11 @@
 ====================================================================================================
 Q-C — MNQ EXIT-GEOMETRY EXPERIMENT (real strategy + real exit; modeled fills)
 ====================================================================================================
-tape: 2024-03-13 00:01:00+00:00 -> 2026-06-02 23:43:00+00:00  (786,236 1-min NQ bars, roll-adjusted; 47,698 gate signals)
-entry = REAL src.strategy gate stream (regime ON, live config); exit = REAL trail_manager.
+tape: 2024-03-13 00:01:00+00:00 -> 2026-06-02 23:43:00+00:00  (786,236 1-min NQ bars, roll-adjusted; 47,698 signals)
+entry = REAL src.strategy gate stream (regime ON); exit = REAL trail_manager.
 deflation: 100 trials (prior + 12 variants), sr_var_pool=0.000188, SR0=0.03466, bonferroni_p=0.052
 
--- (A) WIN/LOSS POINT ASYMMETRY (gross pts) — the owed decomposition -------------------------------
+-- (A) WIN/LOSS POINT ASYMMETRY (gross pts) — the owed decomposition ------------------------
   variant                   n   win%  avgWin  avgLoss   R:R breakeven%    gap
   baseline_s75_l50_t150  1486  62.8%    53.3     73.8  0.72      58.1%  +4.7
   cutloss_s60            1667  57.3%    53.9     59.4  0.91      52.4%  +4.9
@@ -19,7 +19,7 @@ deflation: 100 trials (prior + 12 variants), sr_var_pool=0.000188, SR0=0.03466, 
   cut50_run250           1754  52.7%    54.2     49.6  1.09      47.8%  +4.9
   cut40_run300           2298  59.0%    33.8     39.8  0.85      54.1%  +4.9
   cut50_nolock_run300    5800   0.8%   261.7     50.0  5.23      16.0% -15.3
-  (gap = actual win% − breakeven win%; >0 means the geometry's R:R is self-sustaining)
+  (gap = actual win% − breakeven win%; >0 means the R:R is self-sustaining)
 
 -- (B) PHASE-16 GATE (1 ct, pessimistic costs; TRAIN 2024-03..2025-08 / HOLDOUT 2025-09..2026-06) --
   variant                fullPF trainPF tr.exp$  tr.n  yr+  holdPF ho.exp$    DSR  CLEARS
@@ -39,14 +39,14 @@ deflation: 100 trials (prior + 12 variants), sr_var_pool=0.000188, SR0=0.03466, 
   pre-registered bar: PF>=1.3 train+holdout, exp/ct>=$5, n>=200, each-year+, holdout PF>=0.75*train, DSR>=0.95
 
 -- VERDICT ----------------------------------------------------------------------------------------
-  NO variant clears the full phase16 bar (PF>=1.30 train+holdout / exp/ct>=$5 / n>=200 /
-  each-year+ / DSR>=0.95). SMA-bounce exit-geometry does NOT clear the harness; the
-  negative expectancy is STRUCTURAL — it is in the ENTRY, not recoverable by re-cutting
-  the stop/trail/lock. The hypothesis (trail clips winners while losers run) is
-  CONFIRMED as a description (see the breakeven-win% column) but NOT FIXABLE by geometry:
+  NO variant clears the full phase16 bar (PF>=1.30 train+holdout / exp/ct>=$5 /
+  n>=200 / each-year+ / DSR>=0.95). SMA-bounce exit-geometry does NOT clear the
+  harness; the negative expectancy is STRUCTURAL — in the ENTRY, not recoverable
+  by re-cutting the stop/trail/lock. The hypothesis (trail clips winners while
+  losers run) is CONFIRMED as a description (see breakeven-win%) but NOT FIXABLE:
     baseline avg winner 53pt vs avg loser 74pt -> needs 58% wins, actual 63% (gap +5pts).
-    Cutting losers raises win% but shrinks avg-winner in lockstep; letting winners run
-    lowers win% — the R:R/win-rate tradeoff stays on the same break-even locus. PIVOT:
-    the MNQ SMA-bounce edge question is CLOSED negative; pursue a different signal, not
-    a different exit. (Forward edge in the live regime remains unprovable here.)
+    Cutting losers raises win% but shrinks avg-winner in lockstep; letting winners
+    run lowers win% — the R:R/win-rate tradeoff stays on the same break-even locus.
+    PIVOT: the MNQ SMA-bounce edge question is CLOSED negative; pursue a different
+    signal, not a different exit. (Forward edge in the live regime unprovable here.)
 ====================================================================================================
