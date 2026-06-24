@@ -1,0 +1,52 @@
+====================================================================================================
+Q-C — MNQ EXIT-GEOMETRY EXPERIMENT (real strategy + real exit; modeled fills)
+====================================================================================================
+tape: 2024-03-13 00:01:00+00:00 -> 2026-06-02 23:43:00+00:00  (786,236 1-min NQ bars, roll-adjusted; 47,698 gate signals)
+entry = REAL src.strategy gate stream (regime ON, live config); exit = REAL trail_manager.
+deflation: 100 trials (prior + 12 variants), sr_var_pool=0.000188, SR0=0.03466, bonferroni_p=0.052
+
+-- (A) WIN/LOSS POINT ASYMMETRY (gross pts) — the owed decomposition -------------------------------
+  variant                   n   win%  avgWin  avgLoss   R:R breakeven%    gap
+  baseline_s75_l50_t150  1486  62.8%    53.3     73.8  0.72      58.1%  +4.7
+  cutloss_s60            1667  57.3%    53.9     59.4  0.91      52.4%  +4.9
+  cutloss_s50            1795  52.9%    53.9     49.6  1.09      47.9%  +4.9
+  cutloss_s40            2029  46.1%    53.9     39.8  1.35      42.5%  +3.6
+  runwin_t200            1452  62.7%    53.5     73.7  0.73      58.0%  +4.8
+  runwin_t250            1445  62.7%    53.5     73.7  0.73      58.0%  +4.7
+  runwin_t300            1437  62.6%    53.7     73.9  0.73      57.9%  +4.7
+  nolock_t150            6438   1.2%   145.2     75.0  1.94      34.1% -32.8
+  nolock_t300            5800   0.8%   261.7     75.0  3.49      22.3% -21.5
+  cut50_run250           1754  52.7%    54.2     49.6  1.09      47.8%  +4.9
+  cut40_run300           2298  59.0%    33.8     39.8  0.85      54.1%  +4.9
+  cut50_nolock_run300    5800   0.8%   261.7     50.0  5.23      16.0% -15.3
+  (gap = actual win% − breakeven win%; >0 means the geometry's R:R is self-sustaining)
+
+-- (B) PHASE-16 GATE (1 ct, pessimistic costs; TRAIN 2024-03..2025-08 / HOLDOUT 2025-09..2026-06) --
+  variant                fullPF trainPF tr.exp$  tr.n  yr+  holdPF ho.exp$    DSR  CLEARS
+  baseline_s75_l50_t150   1.176   1.126    7.33   894    Y   1.258   13.51    0.0      no
+  cutloss_s60             1.174   1.109    5.83  1009    Y   1.282   13.78    0.0      no
+  cutloss_s50             1.166   1.105    5.18  1097    Y   1.271   12.32    0.0      no
+  cutloss_s40             1.102   1.035    1.60  1256    Y   1.221    9.25    0.0      no
+  runwin_t200             1.178   1.122    7.13   879    Y   1.275   14.26    0.0      no
+  runwin_t250             1.176   1.121    7.11   875    Y   1.271   13.96    0.0      no
+  runwin_t300             1.176   1.118    6.94   875    Y   1.278   14.44    0.0      no
+  nolock_t150             1.545   1.414    0.93  4290    Y   1.804    1.83    0.0      no
+  nolock_t300             1.738   1.473    1.07  3866    Y   2.259    2.90    0.0      no
+  cut50_run250            1.164   1.106    5.26  1074    Y   1.263   11.94    0.0      no
+  cut40_run300             1.15   1.118    4.08  1426    Y   1.206    6.56    0.0      no
+  cut50_nolock_run300     1.738   1.464    1.06  3866    Y   2.284    2.92    0.0      no
+
+  pre-registered bar: PF>=1.3 train+holdout, exp/ct>=$5, n>=200, each-year+, holdout PF>=0.75*train, DSR>=0.95
+
+-- VERDICT ----------------------------------------------------------------------------------------
+  NO variant clears the full phase16 bar (PF>=1.30 train+holdout / exp/ct>=$5 / n>=200 /
+  each-year+ / DSR>=0.95). SMA-bounce exit-geometry does NOT clear the harness; the
+  negative expectancy is STRUCTURAL — it is in the ENTRY, not recoverable by re-cutting
+  the stop/trail/lock. The hypothesis (trail clips winners while losers run) is
+  CONFIRMED as a description (see the breakeven-win% column) but NOT FIXABLE by geometry:
+    baseline avg winner 53pt vs avg loser 74pt -> needs 58% wins, actual 63% (gap +5pts).
+    Cutting losers raises win% but shrinks avg-winner in lockstep; letting winners run
+    lowers win% — the R:R/win-rate tradeoff stays on the same break-even locus. PIVOT:
+    the MNQ SMA-bounce edge question is CLOSED negative; pursue a different signal, not
+    a different exit. (Forward edge in the live regime remains unprovable here.)
+====================================================================================================
